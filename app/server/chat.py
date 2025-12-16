@@ -1074,39 +1074,56 @@ async def create_response(
 
     response_contents: list[ResponseOutputContent] = []
     image_call_items: list[ResponseImageGenerationCall] = []
-    for image in images:
+
+    # Parallel processing of images (optimization)
+    async def process_single_image(image: Image):
+        """Process a single image: download, convert to base64, and create response objects"""
         try:
             image_base64, width, height, filename = await _image_to_base64(image, image_store)
-        except Exception as exc:
-            logger.warning(f"Failed to download generated image: {exc}")
-            continue
+            img_format = "png" if isinstance(image, GeneratedImage) else "jpeg"
 
-        img_format = "png" if isinstance(image, GeneratedImage) else "jpeg"
+            # Use static URL for compatibility
+            image_url = (
+                f"![{filename}]({request.base_url}images/{filename}?token={get_image_token(filename)})"
+            )
 
-        # Use static URL for compatibility
-        image_url = (
-            f"![{filename}]({request.base_url}images/{filename}?token={get_image_token(filename)})"
-        )
-
-        image_call_items.append(
-            ResponseImageGenerationCall(
+            image_call = ResponseImageGenerationCall(
                 id=f"img_{uuid.uuid4().hex}",
                 status="completed",
                 result=image_base64,
                 output_format=img_format,
                 size=f"{width}x{height}" if width and height else None,
             )
-        )
-        # Add as output_text content for compatibility
-        response_contents.append(
-            ResponseOutputContent(type="output_text", text=image_url, annotations=[])
-        )
 
-    # Process extracted URLs from assistant_text (fallback)
+            content = ResponseOutputContent(type="output_text", text=image_url, annotations=[])
+
+            return image_call, content
+
+        except Exception as exc:
+            logger.warning(f"Failed to download generated image: {exc}")
+            return None, None
+
+    # Process all images in parallel
+    if images:
+        logger.info(f"🔄 Processing {len(images)} image(s) in parallel...")
+        tasks = [process_single_image(img) for img in images]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # Collect successful results
+        for image_call, content in results:
+            if image_call is not None and content is not None:
+                image_call_items.append(image_call)
+                response_contents.append(content)
+
+        logger.info(f"✅ Successfully processed {len(image_call_items)}/{len(images)} image(s)")
+
+    # Process extracted URLs from assistant_text (fallback) - parallel processing
     if extracted_image_urls:
-        logger.info(f"✅ Processing {len(extracted_image_urls)} extracted URL(s) as image generation result")
+        logger.info(f"🔄 Processing {len(extracted_image_urls)} extracted URL(s) in parallel...")
         import httpx
-        for idx, url in enumerate(extracted_image_urls):
+
+        async def process_extracted_url(idx: int, url: str):
+            """Process a single extracted URL: download and convert to base64"""
             try:
                 # Download image from URL
                 async with httpx.AsyncClient(timeout=30.0) as http_client:
@@ -1128,23 +1145,34 @@ async def create_response(
                     f"![{random_name}]({request.base_url}images/{random_name}?token={get_image_token(random_name)})"
                 )
 
-                image_call_items.append(
-                    ResponseImageGenerationCall(
-                        id=f"img_{uuid.uuid4().hex}",
-                        status="completed",
-                        result=image_base64,
-                        output_format="png",
-                        size=f"{width}x{height}" if width and height else None,
-                    )
+                image_call = ResponseImageGenerationCall(
+                    id=f"img_{uuid.uuid4().hex}",
+                    status="completed",
+                    result=image_base64,
+                    output_format="png",
+                    size=f"{width}x{height}" if width and height else None,
                 )
-                response_contents.append(
-                    ResponseOutputContent(type="output_text", text=image_url, annotations=[])
-                )
-                logger.info(f"✅ Successfully processed extracted URL {idx+1}/{len(extracted_image_urls)}")
+
+                content = ResponseOutputContent(type="output_text", text=image_url, annotations=[])
+
+                logger.debug(f"✅ Successfully processed extracted URL {idx+1}/{len(extracted_image_urls)}")
+                return image_call, content
 
             except Exception as exc:
                 logger.warning(f"Failed to download/process extracted URL {url}: {exc}")
-                continue
+                return None, None
+
+        # Process all extracted URLs in parallel
+        tasks = [process_extracted_url(idx, url) for idx, url in enumerate(extracted_image_urls)]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+        # Collect successful results
+        for image_call, content in results:
+            if image_call is not None and content is not None:
+                image_call_items.append(image_call)
+                response_contents.append(content)
+
+        logger.info(f"✅ Successfully processed {len([r for r in results if r[0] is not None])}/{len(extracted_image_urls)} extracted URL(s)")
 
     tool_call_items: list[ResponseToolCall] = []
     if detected_tool_calls:
