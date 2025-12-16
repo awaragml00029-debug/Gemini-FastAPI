@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import httpx
 import orjson
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
@@ -16,6 +17,9 @@ from gemini_webapi.constants import Model
 from gemini_webapi.exceptions import APIError
 from gemini_webapi.types.image import GeneratedImage, Image
 from loguru import logger
+
+# Global variable to store raw Gemini responses for debugging
+_last_raw_gemini_response: dict | None = None
 
 from ..models import (
     ChatCompletionRequest,
@@ -904,6 +908,25 @@ async def create_response(
             f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
         )
         model_output = await _send_with_split(session, model_input, files=files)
+
+        # Debug: Log raw model_output for image generation debugging (always log when files are present)
+        if files:
+            logger.info(f"🔍 DEBUG: Raw model_output after _send_with_split:")
+            logger.info(f"🔍 DEBUG: model_output type: {type(model_output)}")
+            if hasattr(model_output, 'model_dump'):
+                try:
+                    logger.info(f"🔍 DEBUG: model_output.model_dump(): {model_output.model_dump()}")
+                except Exception as e:
+                    logger.warning(f"Failed to dump model_output: {e}")
+
+            # Try to access session's last response for debugging
+            if hasattr(session, '_last_response'):
+                logger.info(f"🔍 DEBUG: session._last_response available")
+            if hasattr(session, 'client'):
+                logger.info(f"🔍 DEBUG: session has client attribute")
+                if hasattr(session.client, '_last_response'):
+                    logger.info(f"🔍 DEBUG: session.client._last_response available")
+
     except APIError as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"Gemini API returned invalid response for client {client_id}: {exc}")
@@ -976,7 +999,63 @@ async def create_response(
         f"Gemini returned {len(images)} image(s) for /v1/responses "
         f"(expects_image={expects_image}, instruction_applied={bool(image_instruction)})."
     )
+
+    # Fallback: extract real image URLs from model_output raw content
+    # This is a workaround for gemini-webapi bug (see https://github.com/HanaokaYuzu/Gemini-API/issues/194)
+    extracted_image_urls = []
     if expects_image and not images:
+        # Debug: log the model_output structure
+        logger.info(f"🔍 DEBUG: model_output type: {type(model_output)}")
+
+        # Check metadata, candidates, and chosen fields
+        if hasattr(model_output, 'metadata'):
+            logger.info(f"🔍 DEBUG: model_output.metadata type: {type(model_output.metadata)}")
+            logger.info(f"🔍 DEBUG: model_output.metadata: {model_output.metadata}")
+
+        if hasattr(model_output, 'candidates'):
+            logger.info(f"🔍 DEBUG: model_output.candidates type: {type(model_output.candidates)}")
+            logger.info(f"🔍 DEBUG: model_output.candidates length: {len(model_output.candidates) if model_output.candidates else 0}")
+            if model_output.candidates:
+                candidate = model_output.candidates[0]
+                logger.info(f"🔍 DEBUG: model_output.candidates[0] type: {type(candidate)}")
+                logger.info(f"🔍 DEBUG: model_output.candidates[0] value: {candidate}")
+
+                # If candidate is an object, explore its attributes
+                if hasattr(candidate, '__dict__'):
+                    logger.info(f"🔍 DEBUG: candidate.__dict__: {candidate.__dict__}")
+                if hasattr(candidate, 'text'):
+                    logger.info(f"🔍 DEBUG: candidate.text: {candidate.text}")
+                if hasattr(candidate, 'images'):
+                    logger.info(f"🔍 DEBUG: candidate.images: {candidate.images}")
+
+                # Try to extract rcid and use it to fetch generated images
+                if hasattr(candidate, 'rcid') and hasattr(candidate, 'generated_images'):
+                    if candidate.rcid and isinstance(candidate.generated_images, list) and len(candidate.generated_images) == 0:
+                        logger.info(f"🔍 DEBUG: Found rcid={candidate.rcid} but generated_images is empty, this confirms gemini-webapi parsing bug")
+
+        if hasattr(model_output, 'chosen'):
+            logger.info(f"🔍 DEBUG: model_output.chosen type: {type(model_output.chosen)}")
+            logger.info(f"🔍 DEBUG: model_output.chosen: {model_output.chosen}")
+
+        # Try to extract from text_with_think (raw output before processing)
+        url_pattern = r'(https?://(?:lh\d+\.)?googleusercontent\.com/gg/[^\s\'"<>]+)'
+
+        # Search in multiple possible locations
+        search_texts = [
+            text_with_think,
+            text_without_think,
+            assistant_text,
+        ]
+
+        for idx, text in enumerate(search_texts):
+            if text:
+                matches = re.findall(url_pattern, text)
+                if matches:
+                    logger.info(f"🔍 Found {len(matches)} real googleusercontent.com URL(s) in search_texts[{idx}]")
+                    extracted_image_urls = matches
+                    break
+
+    if expects_image and not images and not extracted_image_urls:
         summary = assistant_text.strip() if assistant_text else ""
         if summary:
             summary = re.sub(r"\s+", " ", summary)
@@ -1021,6 +1100,50 @@ async def create_response(
         response_contents.append(
             ResponseOutputContent(type="output_text", text=image_url, annotations=[])
         )
+
+    # Process extracted URLs from assistant_text (fallback)
+    if extracted_image_urls:
+        logger.info(f"✅ Processing {len(extracted_image_urls)} extracted URL(s) as image generation result")
+        import httpx
+        for idx, url in enumerate(extracted_image_urls):
+            try:
+                # Download image from URL
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    img_response = await http_client.get(url)
+                    img_response.raise_for_status()
+                    image_bytes = img_response.content
+
+                # Save to temp storage
+                random_name = f"img_{uuid.uuid4().hex}.png"
+                file_path = image_store / random_name
+                file_path.write_bytes(image_bytes)
+
+                # Convert to base64
+                width, height = _extract_image_dimensions(image_bytes)
+                image_base64 = base64.b64encode(image_bytes).decode("ascii")
+
+                # Use static URL for compatibility
+                image_url = (
+                    f"![{random_name}]({request.base_url}images/{random_name}?token={get_image_token(random_name)})"
+                )
+
+                image_call_items.append(
+                    ResponseImageGenerationCall(
+                        id=f"img_{uuid.uuid4().hex}",
+                        status="completed",
+                        result=image_base64,
+                        output_format="png",
+                        size=f"{width}x{height}" if width and height else None,
+                    )
+                )
+                response_contents.append(
+                    ResponseOutputContent(type="output_text", text=image_url, annotations=[])
+                )
+                logger.info(f"✅ Successfully processed extracted URL {idx+1}/{len(extracted_image_urls)}")
+
+            except Exception as exc:
+                logger.warning(f"Failed to download/process extracted URL {url}: {exc}")
+                continue
 
     tool_call_items: list[ResponseToolCall] = []
     if detected_tool_calls:
@@ -1176,6 +1299,235 @@ async def _find_reusable_session(
     return None, None, messages
 
 
+async def _fetch_generated_images_from_raw_response() -> list[str]:
+    """
+    Extract image URLs from the raw Gemini response that was captured before gemini-webapi parsed it.
+    Returns list of googleusercontent.com URLs.
+    """
+    global _last_raw_gemini_response
+
+    if not _last_raw_gemini_response:
+        logger.warning("No raw Gemini response captured")
+        return []
+
+    try:
+        # Get the text to search
+        if isinstance(_last_raw_gemini_response, dict):
+            if '_raw_text' in _last_raw_gemini_response:
+                # Response was saved as raw text
+                search_text = _last_raw_gemini_response['_raw_text']
+                logger.info(f"🔍 Searching in raw text ({len(search_text)} bytes)")
+            else:
+                # Response was parsed as JSON
+                search_text = json.dumps(_last_raw_gemini_response)
+                logger.info(f"🔍 Searching in JSON dump")
+        else:
+            search_text = str(_last_raw_gemini_response)
+            logger.info(f"🔍 Searching in string representation")
+
+        # Search for googleusercontent.com URLs in the raw response
+        # Note: Generated images use /gg-dl/ path, while reference images use /gg/ path
+        # We want to prioritize /gg-dl/ URLs (generated images) over /gg/ URLs (reference images)
+        url_pattern_generated = r'(https?://(?:lh\d+\.)?googleusercontent\.com/gg-dl/[^\s\'"<>\\]+)'
+        url_pattern_reference = r'(https?://(?:lh\d+\.)?googleusercontent\.com/gg/[^\s\'"<>\\]+)'
+
+        # First try to find generated image URLs (gg-dl)
+        matches = re.findall(url_pattern_generated, search_text)
+
+        # If no generated images found, fall back to reference images (gg) - this maintains backward compatibility
+        if not matches:
+            matches = re.findall(url_pattern_reference, search_text)
+            logger.info("⚠️ No /gg-dl/ URLs found, using /gg/ URLs instead")
+
+        if matches:
+            # Remove duplicates while preserving order
+            unique_urls = list(dict.fromkeys(matches))
+            logger.info(f"✅ Found {len(unique_urls)} image URL(s) in raw Gemini response")
+            for idx, url in enumerate(unique_urls[:3]):  # Log first 3 URLs
+                logger.info(f"  URL {idx+1}: {url[:100]}...")
+            return unique_urls
+        else:
+            logger.warning("⚠️ No googleusercontent.com URLs found in raw response")
+            # Log a sample of the text for debugging
+            sample = search_text[:500] if len(search_text) > 500 else search_text
+            logger.info(f"🔍 Sample of search text: {sample}")
+            return []
+
+    except Exception as e:
+        logger.exception(f"Error extracting images from raw response: {e}")
+        return []
+
+
+async def _fetch_generated_images_workaround(session: ChatSession, rcid: str) -> list[GeneratedImage]:
+    """
+    Workaround for gemini-webapi bug where generated_images is empty.
+    Extract image URLs from the raw Gemini response.
+
+    Based on GitHub Issue: https://github.com/HanaokaYuzu/Gemini-API/issues/194
+    """
+    try:
+        # Try to extract URLs from raw response
+        image_urls = await _fetch_generated_images_from_raw_response()
+
+        if not image_urls:
+            return []
+
+        # Get cookies from the session's client for authenticated requests
+        cookies = None
+        if hasattr(session, 'geminiclient') and hasattr(session.geminiclient, 'cookies'):
+            cookies = session.geminiclient.cookies
+            logger.info(f"🔧 Using Gemini client cookies for image download")
+
+        # Validate that we have cookies (required by GeneratedImage)
+        if not cookies:
+            logger.warning("No cookies available from session, cannot create GeneratedImage objects")
+            return []
+
+        # Download images and convert to GeneratedImage objects
+        generated_images = []
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, cookies=cookies) as http_client:
+            for idx, url in enumerate(image_urls):
+                try:
+                    logger.info(f"🔄 Downloading image {idx+1}/{len(image_urls)} from {url[:80]}...")
+                    response = await http_client.get(url)
+                    response.raise_for_status()
+
+                    # Create GeneratedImage object with required cookies field
+                    img = GeneratedImage(
+                        url=url,
+                        title=f"Generated Image {idx+1}",
+                        alt=f"Image generated by Gemini",
+                        cookies=cookies
+                    )
+                    generated_images.append(img)
+                    logger.info(f"✅ Successfully downloaded image {idx+1}")
+
+                except Exception as e:
+                    logger.warning(f"Failed to download image from {url}: {e}")
+                    continue
+
+        return generated_images
+
+    except Exception as e:
+        logger.exception(f"Error in _fetch_generated_images_workaround: {e}")
+        return []
+
+
+async def _monkey_patch_http_client_for_raw_response(session: ChatSession):
+    """
+    Monkey patch the HTTP client to capture raw responses before gemini-webapi parses them.
+    """
+    global _last_raw_gemini_response
+
+    try:
+        logger.info(f"🔧 Attempting to monkey patch session for raw response capture")
+        logger.info(f"🔧 Session type: {type(session)}")
+        logger.info(f"🔧 Session attributes: {dir(session)}")
+
+        # Try different attribute names
+        client = None
+        if hasattr(session, 'geminiclient'):
+            client = session.geminiclient
+            logger.info(f"🔧 Found geminiclient attribute")
+        elif hasattr(session, '_client'):
+            client = session._client
+            logger.info(f"🔧 Found _client attribute")
+        elif hasattr(session, 'client'):
+            client = session.client
+            logger.info(f"🔧 Found client attribute")
+        else:
+            logger.warning(f"⚠️ Session has no geminiclient, _client or client attribute")
+            return
+
+        logger.info(f"🔧 Got client: {type(client)}")
+        logger.info(f"🔧 Client attributes: {dir(client)}")
+
+        # Try to find HTTP client - GeminiClientWrapper has a 'client' attribute
+        http_client = None
+        if hasattr(client, 'client'):
+            # This is for app.services.client.GeminiClientWrapper
+            inner_client = client.client
+            logger.info(f"🔧 Found client attribute, type: {type(inner_client)}")
+
+            # Check if inner_client itself is an httpx.AsyncClient
+            if isinstance(inner_client, httpx.AsyncClient):
+                http_client = inner_client
+                logger.info(f"🔧 Inner client IS httpx.AsyncClient, using it directly")
+            # Otherwise try to get the HTTP session from the inner client
+            elif hasattr(inner_client, '_session'):
+                http_client = inner_client._session
+                logger.info(f"🔧 Found _session in inner client")
+            elif hasattr(inner_client, 'session'):
+                http_client = inner_client.session
+                logger.info(f"🔧 Found session in inner client")
+            else:
+                logger.warning(f"⚠️ Inner client is not httpx.AsyncClient and has no _session or session attribute")
+                logger.info(f"⚠️ Inner client type: {type(inner_client)}")
+                return
+        elif hasattr(client, '_session'):
+            http_client = client._session
+            logger.info(f"🔧 Found _session attribute")
+        elif hasattr(client, 'session'):
+            http_client = client.session
+            logger.info(f"🔧 Found session attribute")
+        else:
+            logger.warning(f"⚠️ Client has no recognized HTTP client attribute")
+            logger.info(f"🔧 Client attributes for reference: {[a for a in dir(client) if not a.startswith('__')]}")
+            return
+
+        logger.info(f"🔧 Got HTTP client: {type(http_client)}")
+
+        if not isinstance(http_client, httpx.AsyncClient):
+            logger.warning(f"⚠️ HTTP client is not httpx.AsyncClient, it's {type(http_client)}")
+            # Try anyway, maybe it has compatible methods
+            logger.info(f"🔧 Attempting to patch anyway...")
+
+        # Save original post method
+        if not hasattr(http_client, '_original_post'):
+            http_client._original_post = http_client.post
+            logger.info(f"🔧 Saved original post method")
+
+        # Create wrapper that captures responses
+        async def post_wrapper(*args, **kwargs):
+            global _last_raw_gemini_response  # IMPORTANT: Need global to modify the module-level variable
+
+            logger.info(f"🔧 POST wrapper called! Args: {args[0] if args else 'none'}")
+            response = await http_client._original_post(*args, **kwargs)
+
+            # Try to capture and parse the response JSON
+            try:
+                logger.info(f"🔧 Response status: {response.status_code}, content-type: {response.headers.get('content-type')}")
+                if response.status_code == 200:
+                    # Get response text
+                    response_text = response.text
+                    logger.info(f"🔧 Response text length: {len(response_text)}")
+
+                    # Save raw response text for extraction
+                    if response_text:
+                        try:
+                            _last_raw_gemini_response = json.loads(response_text)
+                            logger.info(f"✅ Captured raw Gemini response (JSON parsed successfully)")
+                        except Exception as parse_err:
+                            # Maybe it's not JSON, save as-is
+                            logger.info(f"⚠️ Could not parse as JSON: {parse_err}, saving raw text")
+                            _last_raw_gemini_response = {'_raw_text': response_text}
+                            logger.info(f"✅ Saved response as raw text")
+                            # Debug: log first 2000 chars to see structure
+                            logger.info(f"🔍 DEBUG: First 2000 chars of response:\n{response_text[:2000]}")
+
+            except Exception as e:
+                logger.exception(f"❌ Could not capture raw response: {e}")
+
+            return response
+
+        # Apply the monkey patch
+        http_client.post = post_wrapper
+        logger.info("✅ Applied monkey patch to HTTP client successfully")
+
+    except Exception as e:
+        logger.exception(f"❌ Could not monkey patch HTTP client: {e}")
+
+
 async def _send_with_split(session: ChatSession, text: str, files: list[Path | str] | None = None):
     """Send text to Gemini, automatically splitting into multiple batches if it is
     longer than ``MAX_CHARS_PER_REQUEST``.
@@ -1185,10 +1537,31 @@ async def _send_with_split(session: ChatSession, text: str, files: list[Path | s
     "ok". The final batch carries any file uploads and the real user prompt so
     that Gemini can produce the actual answer.
     """
+    # Apply monkey patch to capture raw responses (only for image generation requests)
+    if files:
+        await _monkey_patch_http_client_for_raw_response(session)
+
     if len(text) <= MAX_CHARS_PER_REQUEST:
         # No need to split - a single request is fine.
         try:
-            return await session.send_message(text, files=files)
+            result = await session.send_message(text, files=files)
+
+            # Workaround for gemini-webapi bug #194: manually fetch generated images if empty
+            if files and hasattr(result, 'candidates') and result.candidates:
+                candidate = result.candidates[result.chosen] if hasattr(result, 'chosen') else result.candidates[0]
+                if hasattr(candidate, 'generated_images') and hasattr(candidate, 'rcid'):
+                    if isinstance(candidate.generated_images, list) and len(candidate.generated_images) == 0:
+                        logger.info(f"🔧 Applying workaround for gemini-webapi bug: generated_images is empty, attempting manual fetch with rcid={candidate.rcid}")
+                        # Try to manually fetch generated images using the session's client
+                        try:
+                            fetched_images = await _fetch_generated_images_workaround(session, candidate.rcid)
+                            if fetched_images:
+                                logger.info(f"✅ Successfully fetched {len(fetched_images)} generated image(s) via workaround")
+                                candidate.generated_images = fetched_images
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch generated images via workaround: {e}")
+
+            return result
         except Exception as e:
             logger.exception(f"Error sending message to Gemini: {e}")
             raise
