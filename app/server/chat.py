@@ -58,6 +58,39 @@ TOOL_BLOCK_RE = re.compile(r"```xml\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 TOOL_CALL_RE = re.compile(
     r"<tool_call\s+name=\"([^\"]+)\">(.*?)</tool_call>", re.DOTALL | re.IGNORECASE
 )
+# Default model when using "gemini-gems-{id}" format
+DEFAULT_GEM_MODEL = "gemini-2.5-flash"
+GEMINI_GEMS_PREFIX = "gemini-gems-"
+GEMS_SEPARATOR = "-gems-"
+
+
+def _parse_model_with_gem(model_name: str) -> tuple[str, str | None]:
+    """
+    Parse model name to extract gem ID if present.
+
+    Formats:
+    - "gemini-gems-{gem_id}" → (DEFAULT_GEM_MODEL, gem_id)
+    - "{model}-gems-{gem_id}" → (model, gem_id)
+    - "{model}" → (model, None)
+
+    Returns:
+        tuple of (actual_model_name, gem_id or None)
+    """
+    # Check "gemini-gems-{id}" format first
+    if model_name.startswith(GEMINI_GEMS_PREFIX):
+        gem_id = model_name[len(GEMINI_GEMS_PREFIX):]
+        return DEFAULT_GEM_MODEL, gem_id
+
+    # Check "{model}-gems-{id}" format
+    if GEMS_SEPARATOR in model_name:
+        parts = model_name.rsplit(GEMS_SEPARATOR, 1)
+        if len(parts) == 2:
+            return parts[0], parts[1]
+
+    # No gem in model name
+    return model_name, None
+
+
 JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 CONTROL_TOKEN_RE = re.compile(r"<\|im_(?:start|end)\|>")
 XML_HINT_STRIPPED = XML_WRAP_HINT.strip()
@@ -597,7 +630,12 @@ async def create_chat_completion(
 ):
     pool = GeminiClientPool()
     db = LMDBConversationStore()
-    model = Model.from_name(request.model)
+
+    # Parse gem from model name if present (e.g., "gemini-3.0-pro-gems-xxx" or "gemini-gems-xxx")
+    actual_model_name, gem_from_model = _parse_model_with_gem(request.model)
+    # Use gem from request body first, fallback to gem from model name
+    gem_id = request.gem or gem_from_model
+    model = Model.from_name(actual_model_name)
 
     if len(request.messages) == 0:
         raise HTTPException(
@@ -646,7 +684,7 @@ async def create_chat_completion(
         # Start a new session and concat messages into a single string
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=model, gem=gem_id)
             messages_to_send = _prepare_messages_for_model(
                 request.messages, request.tools, request.tool_choice, extra_instructions
             )
@@ -746,6 +784,7 @@ async def create_chat_completion(
             client_id=client.id,
             metadata=session.metadata,
             messages=[*cleaned_history, last_message],
+            gem=gem_id,
         )
         key = db.store(conv)
         logger.debug(f"Conversation saved to LMDB with key: {key}")
@@ -853,8 +892,13 @@ async def create_response(
     pool = GeminiClientPool()
     db = LMDBConversationStore()
 
+    # Parse gem from model name if present (e.g., "gemini-3.0-pro-gems-xxx" or "gemini-gems-xxx")
+    actual_model_name, gem_from_model = _parse_model_with_gem(request_data.model)
+    # Use gem from request body first, fallback to gem from model name
+    gem_id = request_data.gem or gem_from_model
+
     try:
-        model = Model.from_name(request_data.model)
+        model = Model.from_name(actual_model_name)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -890,7 +934,7 @@ async def create_response(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=model, gem=gem_id)
             payload_messages = messages
             model_input, files = await _build_payload(payload_messages, _reuse_session=False)
         except ValueError as e:
@@ -1245,6 +1289,7 @@ async def create_response(
             client_id=client.id,
             metadata=session.metadata,
             messages=[*cleaned_history, last_message],
+            gem=gem_id,
         )
         key = db.store(conv)
         logger.debug(f"Conversation saved to LMDB with key: {key}")
@@ -1315,7 +1360,7 @@ async def _find_reusable_session(
             try:
                 if conv := db.find(model.model_name, search_history):
                     client = await pool.acquire(conv.client_id)
-                    session = client.start_chat(metadata=conv.metadata, model=model)
+                    session = client.start_chat(metadata=conv.metadata, model=model, gem=conv.gem)
                     remain = messages[search_end:]
                     return session, client, remain
             except Exception as e:

@@ -116,6 +116,7 @@ class ChatCompletionRequest(BaseModel):
         Union[Literal["none"], Literal["auto"], Literal["required"], "ToolChoiceFunction"]
     ] = None
     response_format: Optional[Dict[str, Any]] = None
+    gem: Optional[str] = None  # Gemini Gem ID for custom assistant
 
 
 class ChatCompletionResponse(BaseModel):
@@ -158,6 +159,7 @@ class ConversationInStore(BaseModel):
         ..., description="Metadata for Gemini API to locate the conversation"
     )
     messages: list[Message] = Field(..., description="Message contents in the conversation")
+    gem: Optional[str] = Field(default=None, description="Gemini Gem ID for custom assistant")
 
 
 class ResponseInputContent(BaseModel):
@@ -220,6 +222,7 @@ class ResponseCreateRequest(BaseModel):
     user: Optional[str] = None
     response_format: Optional[Dict[str, Any]] = None
     metadata: Optional[Dict[str, Any]] = None
+    gem: Optional[str] = None  # Gemini Gem ID for custom assistant
 
 
 class ResponseUsage(BaseModel):
