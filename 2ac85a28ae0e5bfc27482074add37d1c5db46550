@@ -1,0 +1,1 @@
+perf: This change also significantly improves streaming response speed for reused sessions. By skipping code hint injection, remaining_messages stays as a single bare user message (process_message, untagged) instead of two tagged messages (process_conversation). Reuse path input drops from ~700 bytes to under 30 bytes, and the response starts noticeably faster.
