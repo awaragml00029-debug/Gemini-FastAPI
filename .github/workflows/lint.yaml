@@ -2,8 +2,6 @@ name: Lint and Type Check
 
 on:
   push:
-    branches:
-      - main
     paths:
       - "**.py"
       - "pyproject.toml"
@@ -32,6 +30,9 @@ jobs:
 
       - name: Run Ruff
         run: uv run ruff check .
+
+      - name: Run Ruff Format
+        run: uv run ruff format . --check
 
       - name: Run Ty Check
         run: uv run ty check
