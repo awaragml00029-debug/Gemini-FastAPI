@@ -22,9 +22,9 @@ Repository = "https://github.com/Nativu5/Gemini-FastAPI"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0.2",
-    "ruff>=0.15.7",
-    "ty>=0.0.24",
+    "pytest",
+    "ruff",
+    "ty",
 ]
 
 [dependency-groups]
@@ -65,4 +65,4 @@ quote-style = "double"
 indent-style = "space"
 
 [tool.uv.sources]
-gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git", rev = "retrieve-dynamic-models" }
+gemini-webapi = { git = "https://github.com/HanaokaYuzu/Gemini-API.git" }
