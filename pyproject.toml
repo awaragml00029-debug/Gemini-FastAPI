@@ -6,12 +6,12 @@ readme = "README.md"
 requires-python = "==3.13.*"
 dependencies = [
     "curl-cffi>=0.14.0",
-    "fastapi>=0.135.2",
+    "fastapi>=0.135.3",
     "gemini-webapi>=1.21.0",
     "httptools>=0.7.1",
-    "lmdb>=2.1.1",
+    "lmdb>=2.2.0",
     "loguru>=0.7.3",
-    "orjson>=3.11.7",
+    "orjson>=3.11.8",
     "pydantic-settings[yaml]>=2.13.1",
     "uvicorn>=0.42.0",
     "uvloop>=0.22.1; sys_platform != 'win32'",

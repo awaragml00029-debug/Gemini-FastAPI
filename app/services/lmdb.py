@@ -200,10 +200,11 @@ class LMDBConversationStore(metaclass=Singleton):
             raise
 
     @staticmethod
-    def _decode_index_value(data: bytes) -> list[str]:
+    def _decode_index_value(data: bytes | memoryview) -> list[str]:
         """Decode index value, handling both legacy single-string and new list-of-strings formats."""
         if not data:
             return []
+        data = bytes(data)
         if data.startswith(b"["):
             try:
                 val = orjson.loads(data)
@@ -452,7 +453,7 @@ class LMDBConversationStore(metaclass=Singleton):
 
                 count = 0
                 for key, _ in cursor:
-                    key_str = key.decode("utf-8")
+                    key_str = bytes(key).decode("utf-8")
                     # Skip internal index mappings
                     if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
                         self.FUZZY_LOOKUP_PREFIX
@@ -484,7 +485,7 @@ class LMDBConversationStore(metaclass=Singleton):
             with self._get_transaction(write=False) as txn:
                 cursor = txn.cursor()
                 for key_bytes, value_bytes in cursor:
-                    key_str = key_bytes.decode("utf-8")
+                    key_str = bytes(key_bytes).decode("utf-8")
                     if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
                         self.FUZZY_LOOKUP_PREFIX
                     ):

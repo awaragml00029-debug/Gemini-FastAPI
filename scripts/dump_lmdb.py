@@ -8,8 +8,9 @@ import orjson
 from lmdb import Transaction
 
 
-def _decode_value(value: bytes) -> Any:
+def _decode_value(value: bytes | memoryview) -> Any:
     """Decode a value from LMDB to Python data."""
+    value = bytes(value)
     try:
         return orjson.loads(value)
     except orjson.JSONDecodeError:
@@ -20,7 +21,7 @@ def _dump_all(txn: Transaction) -> list[dict[str, Any]]:
     """Return all records from the database."""
     result: list[dict[str, Any]] = []
     for key, value in txn.cursor():
-        result.append({"key": key.decode("utf-8"), "value": _decode_value(value)})
+        result.append({"key": bytes(key).decode("utf-8"), "value": _decode_value(value)})
     return result
 
 
