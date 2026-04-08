@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import orjson
-from curl_cffi.requests import AsyncSession
+from curl_cffi import CurlFollow, requests
 from loguru import logger
 
 from app.models import AppMessage, AppToolCall, AppToolCallFunction
@@ -199,7 +199,9 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
         elif not suffix:
             suffix = ".bin"
     else:
-        async with AsyncSession(impersonate="chrome", allow_redirects=True) as client:
+        async with requests.AsyncSession(
+            impersonate="chrome", allow_redirects=CurlFollow.SAFE
+        ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             data = resp.content
