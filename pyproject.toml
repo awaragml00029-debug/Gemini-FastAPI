@@ -22,7 +22,6 @@ Repository = "https://github.com/Nativu5/Gemini-FastAPI"
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
     "ruff",
     "ty",
 ]
@@ -63,3 +62,6 @@ extend-immutable-calls = [
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.uv.sources]
+gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git", rev = "enable-guest-mode" }
