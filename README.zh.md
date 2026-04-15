@@ -57,6 +57,7 @@ gemini:
       secure_1psid: "YOUR_SECURE_1PSID_HERE"
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
       proxy: null # 可选代理 URL (null/空值则保持直连)
+      impersonate: null # 可选浏览器指纹模拟 (null 则使用默认值 "chrome")
 ```
 
 > [!NOTE]
@@ -180,6 +181,9 @@ export CONFIG_GEMINI__CLIENTS__0__SECURE_1PSIDTS="your-secure-1psidts"
 # 覆盖 Client 0 的代理设置
 export CONFIG_GEMINI__CLIENTS__0__PROXY="socks5://127.0.0.1:1080"
 
+# 覆盖 Client 0 的浏览器指纹模拟
+export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
+
 
 # 覆盖对话存储大小限制
 export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
@@ -212,6 +216,25 @@ export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
 ### 代理设置
 
 每个客户端条目可以配置不同的代理，从而规避速率限制。省略 `proxy` 字段或将其设置为 `null` 或空字符串以保持直连。
+
+### 浏览器指纹模拟
+
+每个客户端可以通过 `impersonate` 参数设置 `curl_cffi` 使用的 TLS/HTTP 指纹。当 Google 屏蔽某种浏览器指纹时，切换为其他浏览器会有帮助。
+
+- 设置为 `null`（默认）则使用库的默认值（`"chrome"`，即最新 Chrome 版本）。
+- 可设为 [`curl_cffi` 的 `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi) 支持的任意值，例如：`chrome`、`safari`、`safari_ios`、`firefox` 等。
+- 启动时会校验该值；无效值会阻止服务启动。
+
+```yaml
+gemini:
+  clients:
+    - id: "client-a"
+      impersonate: "chrome" # 使用最新 Chrome 指纹（默认）
+    - id: "client-b"
+      impersonate: "firefox" # 使用 Firefox 指纹
+    - id: "client-c"
+      impersonate: null # 使用库默认值
+```
 
 ### 自定义模型
 

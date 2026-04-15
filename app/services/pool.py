@@ -46,7 +46,7 @@ class GeminiClientPool(metaclass=Singleton):
                 logger.info(f"Staggering next initialization by {delay:.2f}s")
                 await asyncio.sleep(delay)
 
-        success_count = sum(1 for client in self._clients if client.running())
+        success_count = sum(bool(client.running()) for client in self._clients)
         if success_count == 0:
             raise RuntimeError("Failed to initialize any Gemini clients")
 

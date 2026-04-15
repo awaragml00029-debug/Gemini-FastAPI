@@ -19,6 +19,7 @@ class GeminiClientWrapper(GeminiClient):
     """Gemini client with helper methods."""
 
     def __init__(self, client_id: str, **kwargs):
+        self._cfg_impersonate: str | None = kwargs.pop("impersonate", None)
         super().__init__(**kwargs)
         self.id = client_id
 
@@ -27,14 +28,17 @@ class GeminiClientWrapper(GeminiClient):
         Inject default configuration values from global settings.
         """
         config = g_config.gemini
+        init_kwargs: dict[str, Any] = {
+            "timeout": config.timeout,
+            "watchdog_timeout": config.watchdog_timeout,
+            "auto_refresh": config.auto_refresh,
+            "refresh_interval": config.refresh_interval,
+            "verbose": config.verbose,
+        }
+        if self._cfg_impersonate is not None:
+            init_kwargs["impersonate"] = self._cfg_impersonate
         try:
-            await super().init(
-                timeout=config.timeout,
-                watchdog_timeout=config.watchdog_timeout,
-                auto_refresh=config.auto_refresh,
-                refresh_interval=config.refresh_interval,
-                verbose=config.verbose,
-            )
+            await super().init(**init_kwargs)
         except Exception:
             logger.exception(f"Failed to initialize GeminiClient {self.id}")
             raise
@@ -66,20 +70,17 @@ class GeminiClientWrapper(GeminiClient):
                     if item_text or message.role == "tool":
                         text_fragments.append(item_text)
                 elif item.type == "image_url":
-                    item_media_url = getattr(item, "url", None)
-                    if not item_media_url:
-                        raise ValueError(f"{item.type} cannot be empty")
-                    files.append(await save_url_to_tempfile(item_media_url, tempdir))
-                elif item.type == "file":
-                    file_data = getattr(item, "file_data", None)
-                    if file_data:
-                        filename = getattr(item, "filename", "") or ""
-                        files.append(await save_file_to_tempfile(file_data, filename, tempdir))
+                    if item_media_url := getattr(item, "url", None):
+                        files.append(await save_url_to_tempfile(item_media_url, tempdir))
                     else:
+                        raise ValueError(f"{item.type} cannot be empty")
+                elif item.type == "file":
+                    if not (file_data := getattr(item, "file_data", None)):
                         raise ValueError("File must contain 'file_data'")
+                    filename = getattr(item, "filename", "") or ""
+                    files.append(await save_file_to_tempfile(file_data, filename, tempdir))
                 elif item.type == "input_audio":
-                    file_data = getattr(item, "file_data", None)
-                    if file_data:
+                    if file_data := getattr(item, "file_data", None):
                         files.append(await save_file_to_tempfile(file_data, "audio.wav", tempdir))
                     else:
                         raise ValueError("input_audio must contain 'file_data' key")

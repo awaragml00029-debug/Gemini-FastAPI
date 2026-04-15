@@ -57,6 +57,7 @@ gemini:
       secure_1psid: "YOUR_SECURE_1PSID_HERE"
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
       proxy: null # Optional proxy URL (null/empty keeps direct connection)
+      impersonate: null # Optional browser impersonation target (null uses default "chrome")
 ```
 
 > [!NOTE]
@@ -180,6 +181,9 @@ export CONFIG_GEMINI__CLIENTS__0__SECURE_1PSIDTS="your-secure-1psidts"
 # Override optional proxy settings for client 0
 export CONFIG_GEMINI__CLIENTS__0__PROXY="socks5://127.0.0.1:1080"
 
+# Override browser impersonation for client 0
+export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
+
 
 # Override conversation storage size limit
 export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
@@ -216,6 +220,25 @@ To use Gemini-FastAPI, you need to extract your Gemini session cookies:
 ### Proxy Settings
 
 Each client entry can be configured with a different proxy to work around rate limits. Omit the `proxy` field or set it to `null` or an empty string to keep a direct connection.
+
+### Browser Impersonation
+
+Each client can optionally set an `impersonate` value to control the TLS/HTTP fingerprint used by `curl_cffi`. This is useful when Google blocks requests from a specific browser profile.
+
+- Set to `null` (default) to use the library's default (`"chrome"`, which maps to the latest Chrome version).
+- Set to any value supported by [`curl_cffi`'s `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi), for example: `chrome`, `safari`, `safari_ios`, `firefox`, etc.
+- The value is validated at startup; an invalid value will prevent the server from starting.
+
+```yaml
+gemini:
+  clients:
+    - id: "client-a"
+      impersonate: "chrome" # Use latest Chrome fingerprint (default)
+    - id: "client-b"
+      impersonate: "firefox" # Use Firefox fingerprint
+    - id: "client-c"
+      impersonate: null # Use library default
+```
 
 ### Custom Models
 

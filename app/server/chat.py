@@ -169,9 +169,9 @@ async def _media_to_local_file(
                 continue
 
             data = original_path.read_bytes()
-            suffix = original_path.suffix
-            if not suffix:
-                suffix = default_extensions.get(mtype) or (".mp4" if "video" in mtype else ".mp3")
+            suffix = original_path.suffix or (
+                default_extensions.get(mtype) or (".mp4" if "video" in mtype else ".mp3")
+            )
 
             random_name = f"media_{uuid.uuid4().hex}{suffix}"
             new_path = temp_dir / random_name
@@ -557,8 +557,7 @@ def _build_tool_prompt(
             schema_text = orjson.dumps(function.parameters, option=orjson.OPT_SORT_KEYS).decode(
                 "utf-8"
             )
-            lines.append("Arguments JSON schema:")
-            lines.append(schema_text)
+            lines.extend(("Arguments JSON schema:", schema_text))
         else:
             lines.append("Arguments JSON schema: {}")
 
@@ -661,18 +660,15 @@ def _prepare_messages_for_model(
 
     instructions: list[str] = []
     tool_prompt_injected = False
-    if inject_system_defaults:
-        if tools:
-            tool_prompt = _build_tool_prompt(tools, tool_choice)
-            if tool_prompt:
-                instructions.append(tool_prompt)
-                tool_prompt_injected = True
+    if inject_system_defaults and tools and (tool_prompt := _build_tool_prompt(tools, tool_choice)):
+        instructions.append(tool_prompt)
+        tool_prompt_injected = True
 
-        if extra_instructions:
-            instructions.extend(instr for instr in extra_instructions if instr)
-            logger.debug(
-                f"Applied {len(extra_instructions)} extra instructions for tool/structured output."
-            )
+    if extra_instructions:
+        instructions.extend(instr for instr in extra_instructions if instr)
+        logger.debug(
+            f"Applied {len(extra_instructions)} extra instructions for tool/structured output."
+        )
 
     if not instructions:
         if tools and tool_choice != "none" and not tool_prompt_injected:
@@ -721,16 +717,13 @@ def _convert_responses_to_app_messages(
                 reasoning_parts: list[str] = []
                 for part in content:
                     if part.type in ("input_text", "output_text"):
-                        text_value = getattr(part, "text", "") or ""
-                        if text_value:
+                        if text_value := getattr(part, "text", "") or "":
                             converted.append(AppContentItem(type="text", text=text_value))
                     elif part.type == "reasoning_text":
-                        text_value = getattr(part, "text", "") or ""
-                        if text_value:
+                        if text_value := getattr(part, "text", "") or "":
                             reasoning_parts.append(text_value)
                     elif part.type == "input_image":
-                        image_url = getattr(part, "image_url", None)
-                        if image_url:
+                        if image_url := getattr(part, "image_url", None):
                             converted.append(AppContentItem(type="image_url", url=image_url))
                     elif part.type == "input_file":
                         file_url = getattr(part, "file_url", None)
@@ -841,8 +834,8 @@ def _convert_responses_to_app_messages(
                 merged_tools.extend(msg.tool_calls)
 
             last_msg.reasoning_content = "\n\n".join(reasoning_parts) if reasoning_parts else None
-            last_msg.content = merged_content if merged_content else None
-            last_msg.tool_calls = merged_tools if merged_tools else None
+            last_msg.content = merged_content or None
+            last_msg.tool_calls = merged_tools or None
         else:
             compacted_messages.append(msg)
 
@@ -878,12 +871,10 @@ def _convert_instructions_to_app_messages(
             converted: list[AppContentItem] = []
             for part in content:
                 if part.type in ("input_text", "output_text"):
-                    text_value = getattr(part, "text", "") or ""
-                    if text_value:
+                    if text_value := getattr(part, "text", "") or "":
                         converted.append(AppContentItem(type="text", text=text_value))
                 elif part.type == "input_image":
-                    image_url = getattr(part, "image_url", None)
-                    if image_url:
+                    if image_url := getattr(part, "image_url", None):
                         converted.append(AppContentItem(type="image_url", url=image_url))
                 elif part.type == "input_file":
                     file_url = getattr(part, "file_url", None)
@@ -939,10 +930,9 @@ async def _get_available_models(pool: GeminiClientPool) -> list[ModelData]:
             if not client.running():
                 continue
 
-            client_models = client.list_models()
-            if client_models:
+            if client_models := client.list_models():
                 for model in client_models:
-                    model_id = model.model_name if model.model_name else model.model_id
+                    model_id = model.model_name or model.model_id
                     if model_id and model_id not in seen_model_ids:
                         models_data.append(
                             ModelData(
@@ -1057,14 +1047,13 @@ class StreamingOutputFilter:
         while self.buffer:
             if self.state == "IN_TAG_HEADER":
                 nl_idx = self.buffer.find("\n")
-                if nl_idx != -1:
-                    self.current_role = self.buffer[:nl_idx].strip().lower()
-                    self.buffer = self.buffer[nl_idx + 1 :]
-                    self.stack[-1] = "IN_BLOCK"
-                    continue
-                else:
+                if nl_idx == -1:
                     break
 
+                self.current_role = self.buffer[:nl_idx].strip().lower()
+                self.buffer = self.buffer[nl_idx + 1 :]
+                self.stack[-1] = "IN_BLOCK"
+                continue
             if self.state == "POST_BLOCK":
                 stripped = self.buffer.lstrip()
                 if not stripped:
@@ -1074,8 +1063,7 @@ class StreamingOutputFilter:
 
             match = STREAM_MASTER_RE.search(self.buffer)
             if not match:
-                tail_match = STREAM_TAIL_RE.search(self.buffer)
-                if tail_match:
+                if tail_match := STREAM_TAIL_RE.search(self.buffer):
                     yield_len = len(self.buffer) - len(tail_match.group(0))
                     if yield_len > 0:
                         if self._is_outputting():
@@ -1124,8 +1112,7 @@ class StreamingOutputFilter:
         res = ""
         if self._is_outputting():
             res = self.buffer
-            tail_match = STREAM_TAIL_RE.search(res)
-            if tail_match:
+            if tail_match := STREAM_TAIL_RE.search(res):
                 res = res[: -len(tail_match.group(0))]
 
         self.buffer = ""

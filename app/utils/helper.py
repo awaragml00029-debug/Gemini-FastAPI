@@ -101,9 +101,7 @@ if TOOL_HINT_START_ESC and TOOL_HINT_END_ESC:
     _START_PATTERNS["HINT"] = rf"\n?{TOOL_HINT_START_ESC}:?\s*"
 
 _master_parts = [f"(?P<{name}_START>{pattern})" for name, pattern in _START_PATTERNS.items()]
-_master_parts.append(f"(?P<PROTOCOL_EXIT>{_PROTOCOL_ENDS})")
-_master_parts.append(f"(?P<TAG_EXIT>{_TAG_END})")
-
+_master_parts.extend((f"(?P<PROTOCOL_EXIT>{_PROTOCOL_ENDS})", f"(?P<TAG_EXIT>{_TAG_END})"))
 if TOOL_HINT_START_ESC and TOOL_HINT_END_ESC:
     _master_parts.append(f"(?P<HINT_EXIT>{TOOL_HINT_END_ESC}\n?)")
 
@@ -120,7 +118,7 @@ def add_tag(role: str, content: str, unclose: bool = False) -> str:
         logger.warning(f"Unknown role: {role}, returning content without tags")
         return content
 
-    return f"<|im_start|>{role}\n{content}" + ("\n<|im_end|>" if not unclose else "")
+    return f"<|im_start|>{role}\n{content}" + ("" if unclose else "\n<|im_end|>")
 
 
 def normalize_llm_text(s: str) -> str:
@@ -140,9 +138,7 @@ def normalize_llm_text(s: str) -> str:
 
 def unescape_text(s: str) -> str:
     """Remove CommonMark backslash escapes from LLM-generated text."""
-    if not s:
-        return ""
-    return COMMONMARK_UNESCAPE_RE.sub(r"\1", s)
+    return COMMONMARK_UNESCAPE_RE.sub(r"\1", s) if s else ""
 
 
 def _strip_param_fences(s: str) -> str:
@@ -168,9 +164,7 @@ def _strip_param_fences(s: str) -> str:
 
 def estimate_tokens(text: str | None) -> int:
     """Estimate the number of tokens heuristically based on character count."""
-    if not text:
-        return 0
-    return int(len(text) / 3)
+    return len(text) // 3 if text else 0
 
 
 async def save_file_to_tempfile(
@@ -193,11 +187,9 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
         metadata_part = url.split(",")[0]
         mime_type = metadata_part.split(":")[1].split(";")[0]
         data = base64.b64decode(url.split(",")[1])
-        suffix = mimetypes.guess_extension(mime_type)
-        if not suffix and "/" in mime_type:
-            suffix = f".{mime_type.split('/')[1]}"
-        elif not suffix:
-            suffix = ".bin"
+        suffix = mimetypes.guess_extension(mime_type) or (
+            f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
+        )
     else:
         async with requests.AsyncSession(
             impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.V2_0
@@ -205,8 +197,7 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
             resp = await client.get(url)
             resp.raise_for_status()
             data = resp.content
-            content_type = resp.headers.get("content-type")
-            if content_type:
+            if content_type := resp.headers.get("content-type"):
                 suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
             if not suffix:
                 suffix = Path(urlparse(url).path).suffix or ".bin"
@@ -374,7 +365,7 @@ def extract_image_dimensions(data: bytes) -> tuple[int | None, int | None]:
         except struct.error:
             return None, None
 
-    if len(data) >= 4 and data[0:2] == b"\xff\xd8":
+    if len(data) >= 4 and data[:2] == b"\xff\xd8":
         idx = 2
         length = len(data)
         sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
@@ -414,6 +405,4 @@ def detect_image_extension(data: bytes) -> str | None:
         return ".jpg"
     if data.startswith(b"GIF8"):
         return ".gif"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return ".webp"
-    return None
+    return ".webp" if data.startswith(b"RIFF") and data[8:12] == b"WEBP" else None

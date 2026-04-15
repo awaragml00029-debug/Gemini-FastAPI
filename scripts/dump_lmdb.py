@@ -20,8 +20,10 @@ def _decode_value(value: bytes | memoryview) -> Any:
 def _dump_all(txn: Transaction) -> list[dict[str, Any]]:
     """Return all records from the database."""
     result: list[dict[str, Any]] = []
-    for key, value in txn.cursor():
-        result.append({"key": bytes(key).decode("utf-8"), "value": _decode_value(value)})
+    result.extend(
+        {"key": bytes(key).decode("utf-8"), "value": _decode_value(value)}
+        for key, value in txn.cursor()
+    )
     return result
 
 

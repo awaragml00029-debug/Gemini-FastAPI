@@ -1,7 +1,7 @@
 import hashlib
 import string
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,9 +31,7 @@ def _fuzzy_normalize(text: str | None) -> str | None:
     Lowercase and remove all whitespace and punctuation.
     Used as a fallback for complex/malformed contents matching.
     """
-    if text is None:
-        return None
-    return text.lower().translate(_VOLATILE_TRANS_TABLE)
+    return None if text is None else text.lower().translate(_VOLATILE_TRANS_TABLE)
 
 
 def _normalize_text(text: str | None, fuzzy: bool = False) -> str | None:
@@ -45,11 +43,7 @@ def _normalize_text(text: str | None, fuzzy: bool = False) -> str | None:
     text = unescape_text(text)
     text = remove_tool_call_blocks(text)
 
-    if fuzzy:
-        return _fuzzy_normalize(text)
-
-    # Always strip to ensure trailing newlines/spaces don't break exact matches
-    return text.strip() if text.strip() else None
+    return _fuzzy_normalize(text) if fuzzy else text.strip() or None
 
 
 def _hash_message(message: AppMessage, fuzzy: bool = False) -> str:
@@ -71,8 +65,7 @@ def _hash_message(message: AppMessage, fuzzy: bool = False) -> str:
         text_parts = []
         for item in content:
             if item.type == "text" and item.text:
-                normalized_part = _normalize_text(item.text, fuzzy=fuzzy)
-                if normalized_part:
+                if normalized_part := _normalize_text(item.text, fuzzy=fuzzy):
                     text_parts.append(normalized_part)
             elif item.type != "text" and item.url:
                 text_parts.append(f"[{item.type}:{item.url}]")
@@ -206,12 +199,10 @@ class LMDBConversationStore(metaclass=Singleton):
             return []
         data = bytes(data)
         if data.startswith(b"["):
-            try:
+            with suppress(orjson.JSONDecodeError):
                 val = orjson.loads(data)
                 if isinstance(val, list):
                     return [str(v) for v in val]
-            except orjson.JSONDecodeError:
-                pass
         try:
             return [data.decode("utf-8")]
         except UnicodeDecodeError:
@@ -309,21 +300,25 @@ class LMDBConversationStore(metaclass=Singleton):
         """
         try:
             with self._get_transaction(write=False) as txn:
-                data = txn.get(key.encode("utf-8"), default=None)
-                if not data:
-                    return None
-
-                storage_data = orjson.loads(data)
-                conv = ConversationInStore.model_validate(storage_data)
-
-                logger.debug(f"Retrieved {len(conv.messages)} messages with key: {key[:12]}")
-                return conv
+                return self._get_messages_from_database(txn, key)
         except (Error, orjson.JSONDecodeError) as e:
             logger.error(f"Failed to retrieve/parse messages with key {key[:12]}: {e}")
             return None
         except Exception as e:
             logger.error(f"Unexpected error retrieving messages with key {key[:12]}: {e}")
             return None
+
+    @staticmethod
+    def _get_messages_from_database(txn, key):
+        data = txn.get(key.encode("utf-8"), default=None)
+        if not data:
+            return None
+
+        storage_data = orjson.loads(data)
+        conv = ConversationInStore.model_validate(storage_data)
+
+        logger.debug(f"Retrieved {len(conv.messages)} messages with key: {key[:12]}")
+        return conv
 
     def find(self, model: str, messages: list[AppMessage]) -> ConversationInStore | None:
         """
@@ -387,15 +382,10 @@ class LMDBConversationStore(metaclass=Singleton):
                                 if len(conv.messages) != target_len:
                                     continue
 
-                                match_found = True
-                                for i in range(target_len):
-                                    if (
-                                        _hash_message(conv.messages[i], fuzzy=fuzzy)
-                                        != target_hashes[i]
-                                    ):
-                                        match_found = False
-                                        break
-
+                                match_found = all(
+                                    _hash_message(conv.messages[i], fuzzy=fuzzy) == target_hashes[i]
+                                    for i in range(target_len)
+                                )
                                 if match_found:
                                     return conv
             except Error as e:
@@ -421,27 +411,28 @@ class LMDBConversationStore(metaclass=Singleton):
         """Delete conversation model by key."""
         try:
             with self._get_transaction(write=True) as txn:
-                data = txn.get(key.encode("utf-8"))
-                if not data:
-                    return None
-
-                storage_data = orjson.loads(data)
-                conv = ConversationInStore.model_validate(storage_data)
-                message_hash = _hash_conversation(conv.client_id, conv.model, conv.messages)
-                fuzzy_hash = _hash_conversation(
-                    conv.client_id, conv.model, conv.messages, fuzzy=True
-                )
-
-                txn.delete(key.encode("utf-8"))
-
-                self._remove_from_index(txn, self.HASH_LOOKUP_PREFIX, message_hash, key)
-                self._remove_from_index(txn, self.FUZZY_LOOKUP_PREFIX, fuzzy_hash, key)
-
-                logger.debug(f"Deleted messages with key: {key[:12]}")
-                return conv
+                return self._delete_messages_from_database(txn, key)
         except (Error, orjson.JSONDecodeError) as e:
             logger.error(f"Failed to delete messages with key {key[:12]}: {e}")
             return None
+
+    def _delete_messages_from_database(self, txn, key):
+        data = txn.get(key.encode("utf-8"))
+        if not data:
+            return None
+
+        storage_data = orjson.loads(data)
+        conv = ConversationInStore.model_validate(storage_data)
+        message_hash = _hash_conversation(conv.client_id, conv.model, conv.messages)
+        fuzzy_hash = _hash_conversation(conv.client_id, conv.model, conv.messages, fuzzy=True)
+
+        txn.delete(key.encode("utf-8"))
+
+        self._remove_from_index(txn, self.HASH_LOOKUP_PREFIX, message_hash, key)
+        self._remove_from_index(txn, self.FUZZY_LOOKUP_PREFIX, fuzzy_hash, key)
+
+        logger.debug(f"Deleted messages with key: {key[:12]}")
+        return conv
 
     def keys(self, prefix: str = "", limit: int | None = None) -> list[str]:
         """List all keys in the store, optionally filtered by prefix."""
@@ -519,8 +510,9 @@ class LMDBConversationStore(metaclass=Singleton):
                     if not txn.delete(key_bytes):
                         continue
 
-                    message_hash = _hash_conversation(conv.client_id, conv.model, conv.messages)
-                    if message_hash:
+                    if message_hash := _hash_conversation(
+                        conv.client_id, conv.model, conv.messages
+                    ):
                         self._remove_from_index(txn, self.HASH_LOOKUP_PREFIX, message_hash, key_str)
                         fuzzy_hash = _hash_conversation(
                             conv.client_id, conv.model, conv.messages, fuzzy=True

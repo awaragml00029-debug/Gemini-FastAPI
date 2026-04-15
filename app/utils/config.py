@@ -1,9 +1,10 @@
 import ast
 import os
 import sys
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 import orjson
+from curl_cffi import BrowserTypeLiteral
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from pydantic_settings import (
@@ -42,14 +43,32 @@ class GeminiClientSettings(BaseModel):
     secure_1psid: str | None = Field(default=None, description="Gemini Secure 1PSID")
     secure_1psidts: str | None = Field(default=None, description="Gemini Secure 1PSIDTS")
     proxy: str | None = Field(default=None, description="Proxy URL for this Gemini client")
+    impersonate: str | None = Field(
+        default=None,
+        description="Browser impersonation target for curl_cffi (e.g. 'chrome'). None uses library default",
+    )
 
-    @field_validator("proxy", mode="before")
+    @field_validator("proxy", "impersonate", mode="before")
     @classmethod
-    def _blank_proxy_to_none(cls, value: str | None) -> str | None:
+    def _blank_string_to_none(cls, value: str | None) -> str | None:
+        """Normalize empty or whitespace-only strings to None."""
         if value is None:
             return None
         stripped = value.strip()
         return stripped or None
+
+    @field_validator("impersonate")
+    @classmethod
+    def _validate_impersonate(cls, value: str | None) -> str | None:
+        """Validate that impersonate is a supported curl_cffi BrowserTypeLiteral value."""
+        if value is None:
+            return None
+        allowed = get_args(BrowserTypeLiteral)
+        if value not in allowed:
+            raise ValueError(
+                f"impersonate={value!r} is not supported. Allowed values: {', '.join(allowed)}"
+            )
+        return value
 
 
 class GeminiModelConfig(BaseModel):
@@ -86,7 +105,7 @@ class GeminiConfig(BaseModel):
         description="Strategy for loading models: 'append' merges custom with default, 'overwrite' uses only custom",
     )
     timeout: int = Field(default=450, ge=30, description="Init timeout in seconds")
-    watchdog_timeout: int = Field(default=90, ge=30, description="Watchdog timeout in seconds")
+    watchdog_timeout: int = Field(default=120, ge=30, description="Watchdog timeout in seconds")
     auto_refresh: bool = Field(True, description="Enable auto-refresh for Gemini sessions")
     refresh_interval: int = Field(
         default=600,
@@ -280,7 +299,7 @@ def _merge_clients_with_env(
                 f"Client index {idx} in env is out of range (current count: {len(result_clients)}). "
                 "Client indices must be contiguous starting from 0."
             )
-    return result_clients if result_clients else base_clients
+    return result_clients or base_clients
 
 
 def extract_gemini_models_env() -> dict[int, dict[str, Any]]:
