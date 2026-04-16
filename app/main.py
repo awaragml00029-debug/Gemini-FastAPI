@@ -13,6 +13,7 @@ from .server.middleware import (
     cleanup_expired_media,
 )
 from .services import GeminiClientPool, LMDBConversationStore
+from .utils import g_config
 
 RETENTION_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60  # Check every 6 hours
 
@@ -48,6 +49,31 @@ async def _run_retention_cleanup(stop_event: asyncio.Event) -> None:
     logger.info("LMDB retention cleanup task stopped.")
 
 
+async def _run_pool_watchdog(stop_event: asyncio.Event) -> None:
+    """
+    Periodically check for dead clients in the pool and revive them.
+    """
+    pool = GeminiClientPool()
+    interval = g_config.gemini.pool_watchdog_interval
+    logger.info(f"Starting Gemini pool watchdog task (interval={interval} seconds).")
+
+    while not stop_event.is_set():
+        try:
+            await pool.revive_dead_clients()
+        except Exception:
+            logger.exception("Gemini pool watchdog task encountered an error.")
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=interval,
+            )
+        except TimeoutError:
+            continue
+
+    logger.info("Gemini pool watchdog task stopped.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cleanup_stop_event = asyncio.Event()
@@ -60,14 +86,18 @@ async def lifespan(app: FastAPI):
         raise
 
     cleanup_task = asyncio.create_task(_run_retention_cleanup(cleanup_stop_event))
-    # Give the cleanup task a chance to start and surface immediate failures.
+    watchdog_task = asyncio.create_task(_run_pool_watchdog(cleanup_stop_event))
+
+    # Give the tasks a chance to start and surface immediate failures.
     await asyncio.sleep(0)
-    if cleanup_task.done():
-        try:
-            cleanup_task.result()
-        except Exception:
-            logger.exception("LMDB retention cleanup task failed to start.")
-            raise
+
+    for task, name in [(cleanup_task, "LMDB retention cleanup"), (watchdog_task, "Pool watchdog")]:
+        if task.done():
+            try:
+                task.result()
+            except Exception:
+                logger.exception(f"{name} task failed to start.")
+                raise
 
     logger.info(f"Gemini clients initialized: {[c.id for c in pool.clients]}.")
     logger.info("Gemini API Server ready to serve requests.")
@@ -82,12 +112,12 @@ async def lifespan(app: FastAPI):
             logger.exception("Failed to close Gemini client pool gracefully.")
 
         try:
-            await cleanup_task
+            await asyncio.gather(cleanup_task, watchdog_task)
         except asyncio.CancelledError:
-            logger.debug("LMDB retention cleanup task cancelled during shutdown.")
+            logger.debug("Background tasks cancelled during shutdown.")
         except Exception:
             logger.exception(
-                "LMDB retention cleanup task terminated with an unexpected error during shutdown."
+                "One or more background tasks terminated with an unexpected error during shutdown."
             )
 
 

@@ -113,6 +113,11 @@ class GeminiConfig(BaseModel):
         description="Interval in seconds to refresh Gemini sessions (Not less than 60s)",
     )
     verbose: bool = Field(True, description="Enable verbose logging for Gemini API requests")
+    pool_watchdog_interval: int = Field(
+        default=60,
+        ge=10,
+        description="Interval in seconds for the client pool watchdog to check and revive dead clients",
+    )
     max_chars_per_request: int = Field(
         default=1_000_000,
         ge=1,

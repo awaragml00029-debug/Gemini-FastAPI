@@ -1,4 +1,5 @@
 import io
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,8 @@ class GeminiClientWrapper(GeminiClient):
         self._cfg_impersonate: str | None = kwargs.pop("impersonate", None)
         super().__init__(**kwargs)
         self.id = client_id
+        self._failure_count: int = 0
+        self._last_failure_time: float = 0.0
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -45,6 +48,34 @@ class GeminiClientWrapper(GeminiClient):
 
     def running(self) -> bool:
         return self._running
+
+    def record_success(self) -> None:
+        """Reset failure tracking on successful connection."""
+        self._failure_count = 0
+        self._last_failure_time = 0.0
+
+    def record_failure(self) -> None:
+        """Increment failure count and update timestamp on connection error."""
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+
+    def can_revive(self, now: float, base_delay: int, max_delay: int) -> bool:
+        """
+        Check if the client is eligible for revival based on exponential backoff.
+        Delay = min(max_delay, base_delay * (2 ** (failure_count - 1)))
+        """
+        if self._failure_count == 0:
+            return True
+
+        delay = min(max_delay, base_delay * (2 ** (self._failure_count - 1)))
+        eligible = now >= (self._last_failure_time + delay)
+        if not eligible:
+            remaining = int((self._last_failure_time + delay) - now)
+            logger.debug(
+                f"Client {self.id} backoff active: {self._failure_count} failures, "
+                f"retrying in {remaining}s"
+            )
+        return eligible
 
     @staticmethod
     async def process_message(
