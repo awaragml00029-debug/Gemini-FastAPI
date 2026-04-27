@@ -112,5 +112,5 @@ class GeminiClientPool(metaclass=Singleton):
         logger.info("All Gemini clients closed.")
 
     def status(self) -> dict[str, bool]:
-        """Return running status for each client."""
-        return {client.id: client.running() for client in self._clients}
+        """Return healthy status for each client."""
+        return {client.id: client.is_healthy() for client in self._clients}

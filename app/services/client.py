@@ -22,6 +22,7 @@ class GeminiClientWrapper(GeminiClient):
         self._cfg_impersonate: str | None = kwargs.pop("impersonate", None)
         super().__init__(**kwargs)
         self.id = client_id
+        self._initialized = False
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -41,12 +42,21 @@ class GeminiClientWrapper(GeminiClient):
             init_kwargs["impersonate"] = self._cfg_impersonate
         try:
             await super().init(**init_kwargs)
+            self._initialized = True
         except Exception:
+            self._initialized = False
             logger.exception(f"Failed to initialize GeminiClient {self.id}")
             raise
 
     def running(self) -> bool:
         return self._running
+
+    def is_healthy(self) -> bool:
+        """
+        Check if the client is healthy.
+        A client is healthy if it is running, or if auto_close is enabled and it has initialized successfully.
+        """
+        return self._running or (self.auto_close and self._initialized)
 
     @staticmethod
     async def _process_content_item(

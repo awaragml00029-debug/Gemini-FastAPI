@@ -16,7 +16,7 @@ async def health_check():
 
     if not all(client_status.values()):
         down_clients = [client_id for client_id, status in client_status.items() if not status]
-        logger.warning(f"One or more Gemini clients not running: {', '.join(down_clients)}")
+        logger.warning(f"One or more Gemini clients are unhealthy: {', '.join(down_clients)}")
 
     if not stat:
         logger.error("Failed to retrieve LMDB conversation store stats")
