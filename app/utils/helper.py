@@ -192,7 +192,7 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
         )
     else:
         async with requests.AsyncSession(
-            impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.V3
+            impersonate="firefox", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.V3
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()

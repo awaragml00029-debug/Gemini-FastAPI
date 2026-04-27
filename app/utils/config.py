@@ -45,7 +45,7 @@ class GeminiClientSettings(BaseModel):
     proxy: str | None = Field(default=None, description="Proxy URL for this Gemini client")
     impersonate: str | None = Field(
         default=None,
-        description="Browser impersonation target for curl_cffi (e.g. 'chrome'). None uses library default",
+        description="Browser impersonation target for curl_cffi (e.g. 'firefox'). None uses library default",
     )
 
     @field_validator("proxy", "impersonate", mode="before")
