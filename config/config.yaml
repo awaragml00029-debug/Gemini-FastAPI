@@ -22,7 +22,7 @@ gemini:
       secure_1psid: "YOUR_SECURE_1PSID_HERE"      # Gemini Secure 1PSID
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"  # Gemini Secure 1PSIDTS
       proxy: null          # Optional proxy URL (null/empty means direct connection)
-      impersonate: null    # Optional browser impersonation target (null uses library default "firefox")
+      impersonate: null    # Optional browser impersonation target (null uses library default)
   timeout: 450             # Init timeout in seconds (Not less than 30s)
   watchdog_timeout: 120    # Watchdog timeout in seconds (Not less than 30s)
   auto_refresh: true       # Auto-refresh session cookies

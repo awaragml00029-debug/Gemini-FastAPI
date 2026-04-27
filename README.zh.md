@@ -57,7 +57,7 @@ gemini:
       secure_1psid: "YOUR_SECURE_1PSID_HERE"
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
       proxy: null # 可选代理 URL (null/空值则保持直连)
-      impersonate: null # 可选浏览器指纹模拟 (null 则使用默认值 "firefox")
+      impersonate: null # 可选浏览器指纹模拟 (null 则使用库的默认值)
 ```
 
 > [!NOTE]
@@ -219,11 +219,14 @@ export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
 
 ### 浏览器指纹模拟
 
-每个客户端可以通过 `impersonate` 参数设置 `curl_cffi` 使用的 TLS/HTTP 指纹。当 Google 屏蔽某种浏览器指纹时，切换为其他浏览器会有帮助。
+每个客户端可以通过 `impersonate` 参数设置 `curl_cffi` 使用的 TLS/HTTP 指纹。
 
-- 设置为 `null`（默认）则使用库的默认值（`"firefox"`，即最新 Firefox 版本）。
-- 可设为 [`curl_cffi` 的 `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi) 支持的任意值，例如：`safari`、`safari_ios`、`firefox` 等。
+- 设置为 `null`（默认）则使用库的默认值。
+- 可设为 [`curl_cffi` 的 `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi) 支持的任意值。
 - 启动时会校验该值；无效值会阻止服务启动。
+
+> [!IMPORTANT]
+> 目前请避免使用基于 Chrome 的指纹，因为它现在会应用设备绑定会话 Cookie (Device-bound session cookies)。
 
 ```yaml
 gemini:

@@ -57,7 +57,7 @@ gemini:
       secure_1psid: "YOUR_SECURE_1PSID_HERE"
       secure_1psidts: "YOUR_SECURE_1PSIDTS_HERE"
       proxy: null # Optional proxy URL (null/empty keeps direct connection)
-      impersonate: null # Optional browser impersonation target (null uses default "firefox")
+      impersonate: null # Optional browser impersonation target (null uses library default)
 ```
 
 > [!NOTE]
@@ -223,11 +223,14 @@ Each client entry can be configured with a different proxy to work around rate l
 
 ### Browser Impersonation
 
-Each client can optionally set an `impersonate` value to control the TLS/HTTP fingerprint used by `curl_cffi`. This is useful when Google blocks requests from a specific browser profile.
+Each client can optionally set an `impersonate` value to control the TLS/HTTP fingerprint used by `curl_cffi`.
 
-- Set to `null` (default) to use the library's default (`"firefox"`, which maps to the latest Firefox version).
-- Set to any value supported by [`curl_cffi`'s `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi), for example: `safari`, `safari_ios`, `firefox`, etc.
+- Set to `null` (default) to use the library's default.
+- Set to any value supported by [`curl_cffi`'s `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi).
 - The value is validated at startup; an invalid value will prevent the server from starting.
+
+> [!IMPORTANT]
+> Currently, avoid using chrome based as it now applies device-bound session cookies.
 
 ```yaml
 gemini:
