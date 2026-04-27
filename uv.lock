@@ -176,8 +176,8 @@ dev = [{ name = "gemini-fastapi", extras = ["dev"] }]
 
 [[package]]
 name = "gemini-webapi"
-version = "0.0.post273"
-source = { git = "https://github.com/luuquangvu/Gemini-API.git?rev=enable-guest-mode#8ad85b688a1243d904ccf1685059cc32d173f41c" }
+version = "0.0.post274"
+source = { git = "https://github.com/luuquangvu/Gemini-API.git?rev=enable-guest-mode#a3878dca221b4428f0d96a2ffef47aa7ecc83bfe" }
 dependencies = [
     { name = "curl-cffi" },
     { name = "loguru" },
