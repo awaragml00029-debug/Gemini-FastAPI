@@ -1,6 +1,5 @@
 import asyncio
 import random
-import time
 from collections import deque
 
 from loguru import logger
@@ -39,9 +38,7 @@ class GeminiClientPool(metaclass=Singleton):
         for i, client in enumerate(clients_to_init):
             try:
                 await client.init()
-                client.record_success()
             except Exception:
-                client.record_failure()
                 logger.error(f"Failed to initialize client {client.id}")
 
             if i < len(clients_to_init) - 1:
@@ -91,11 +88,9 @@ class GeminiClientPool(metaclass=Singleton):
 
             try:
                 await client.init()
-                client.record_success()
                 logger.info(f"Restarted Gemini client {client.id} after it stopped.")
                 return True
             except Exception:
-                client.record_failure()
                 logger.exception(f"Failed to restart Gemini client {client.id}")
                 return False
 
@@ -103,24 +98,6 @@ class GeminiClientPool(metaclass=Singleton):
     def clients(self) -> list[GeminiClientWrapper]:
         """Return managed clients."""
         return self._clients
-
-    async def revive_dead_clients(self) -> None:
-        """Check all clients and attempt to restart any that are not running with staggering and backoff."""
-        now = time.time()
-        base_delay = g_config.gemini.pool_watchdog_interval
-        max_delay = 3600  # 1 hour
-
-        dead_clients = [
-            c for c in self._clients if not c.running() and c.can_revive(now, base_delay, max_delay)
-        ]
-        for i, client in enumerate(dead_clients):
-            logger.info(f"Watchdog detected dead client {client.id}; attempting revival.")
-            await self._ensure_client_ready(client)
-
-            if i < len(dead_clients) - 1:
-                delay = random.uniform(5, 30)
-                logger.info(f"Staggering next revival by {delay:.2f}s")
-                await asyncio.sleep(delay)
 
     async def close(self) -> None:
         """Close all clients in the pool."""

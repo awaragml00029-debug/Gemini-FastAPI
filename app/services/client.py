@@ -1,5 +1,4 @@
 import io
-import time
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +22,6 @@ class GeminiClientWrapper(GeminiClient):
         self._cfg_impersonate: str | None = kwargs.pop("impersonate", None)
         super().__init__(**kwargs)
         self.id = client_id
-        self._failure_count: int = 0
-        self._last_failure_time: float = 0.0
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -36,6 +33,8 @@ class GeminiClientWrapper(GeminiClient):
             "watchdog_timeout": config.watchdog_timeout,
             "auto_refresh": config.auto_refresh,
             "refresh_interval": config.refresh_interval,
+            "auto_close": config.auto_close,
+            "close_delay": config.close_delay,
             "verbose": config.verbose,
         }
         if self._cfg_impersonate is not None:
@@ -49,33 +48,105 @@ class GeminiClientWrapper(GeminiClient):
     def running(self) -> bool:
         return self._running
 
-    def record_success(self) -> None:
-        """Reset failure tracking on successful connection."""
-        self._failure_count = 0
-        self._last_failure_time = 0.0
-
-    def record_failure(self) -> None:
-        """Increment failure count and update timestamp on connection error."""
-        self._failure_count += 1
-        self._last_failure_time = time.time()
-
-    def can_revive(self, now: float, base_delay: int, max_delay: int) -> bool:
+    @staticmethod
+    async def _process_content_item(
+        item: Any, role: str, tempdir: Path | None
+    ) -> tuple[str | None, Path | str | None]:
         """
-        Check if the client is eligible for revival based on exponential backoff.
-        Delay = min(max_delay, base_delay * (2 ** (failure_count - 1)))
+        Process a single content item (text, image_url, file, input_audio).
+        Returns a tuple of (text_fragment, file_path).
         """
-        if self._failure_count == 0:
-            return True
+        if item.type == "text":
+            item_text = getattr(item, "text", "") or ""
+            if item_text or role == "tool":
+                return item_text, None
+        elif item.type == "image_url":
+            if item_media_url := getattr(item, "url", None):
+                return None, await save_url_to_tempfile(item_media_url, tempdir)
+            raise ValueError(f"{item.type} cannot be empty")
+        elif item.type == "file":
+            if not (file_data := getattr(item, "file_data", None)):
+                raise ValueError("File must contain 'file_data'")
+            filename = getattr(item, "filename", "") or ""
+            return None, await save_file_to_tempfile(file_data, filename, tempdir)
+        elif item.type == "input_audio":
+            if file_data := getattr(item, "file_data", None):
+                return None, await save_file_to_tempfile(file_data, "audio.wav", tempdir)
+            raise ValueError("input_audio must contain 'file_data' key")
+        return None, None
 
-        delay = min(max_delay, base_delay * (2 ** (self._failure_count - 1)))
-        eligible = now >= (self._last_failure_time + delay)
-        if not eligible:
-            remaining = int((self._last_failure_time + delay) - now)
-            logger.debug(
-                f"Client {self.id} backoff active: {self._failure_count} failures, "
-                f"retrying in {remaining}s"
-            )
-        return eligible
+    @staticmethod
+    async def _extract_content_and_files(
+        message: AppMessage, tempdir: Path | None
+    ) -> tuple[list[str], list[Path | str]]:
+        """
+        Extract text fragments and files from message content.
+        """
+        files: list[Path | str] = []
+        text_fragments: list[str] = []
+
+        if isinstance(message.content, str):
+            if message.content or message.role == "tool":
+                text_fragments.append(message.content or "")
+        elif isinstance(message.content, list):
+            for item in message.content:
+                text, file = await GeminiClientWrapper._process_content_item(
+                    item, message.role, tempdir
+                )
+                if text is not None:
+                    text_fragments.append(text)
+                if file is not None:
+                    files.append(file)
+        elif message.content is None and message.role == "tool":
+            text_fragments.append("")
+        elif message.content is not None:
+            raise ValueError(f"Unsupported message content type: {type(message.content)}")
+
+        return text_fragments, files
+
+    @staticmethod
+    def _format_tool_results(
+        text_fragments: list[str], tool_name: str | None, wrap_tool: bool
+    ) -> list[str]:
+        """
+        Format tool results into the PascalCase technical protocol blocks.
+        """
+        tool_name = tool_name or "unknown"
+        combined_content = "\n".join(text_fragments).strip()
+        res_block = (
+            f"[Result:{tool_name}]\n[ToolResult]\n{combined_content}\n[/ToolResult]\n[/Result]"
+        )
+        return [f"[ToolResults]\n{res_block}\n[/ToolResults]"] if wrap_tool else [res_block]
+
+    @staticmethod
+    def _format_tool_calls(message: AppMessage) -> str | None:
+        """
+        Format tool calls into the PascalCase technical protocol blocks.
+        """
+        if not message.tool_calls:
+            return None
+
+        tool_blocks: list[str] = []
+        for call in message.tool_calls:
+            params_text = call.function.arguments.strip()
+            formatted_params = ""
+            if params_text:
+                try:
+                    parsed_params = orjson.loads(params_text)
+                    if isinstance(parsed_params, dict):
+                        for k, v in parsed_params.items():
+                            val_str = v if isinstance(v, str) else orjson.dumps(v).decode("utf-8")
+                            formatted_params += (
+                                f"[CallParameter:{k}]\n```\n{val_str}\n```\n[/CallParameter]\n"
+                            )
+                    else:
+                        formatted_params += f"```\n{params_text}\n```\n"
+                except orjson.JSONDecodeError:
+                    formatted_params += f"```\n{params_text}\n```\n"
+
+            tool_blocks.append(f"[Call:{call.function.name}]\n{formatted_params}[/Call]")
+
+        return "[ToolCalls]\n" + "\n".join(tool_blocks) + "\n[/ToolCalls]" if tool_blocks else None
 
     @staticmethod
     async def process_message(
@@ -88,75 +159,17 @@ class GeminiClientWrapper(GeminiClient):
         Process a Message into Gemini API format using the PascalCase technical protocol.
         Extracts text, handles files, and appends ToolCalls/ToolResults blocks.
         """
-        files: list[Path | str] = []
-        text_fragments: list[str] = []
-
-        if isinstance(message.content, str):
-            if message.content or message.role == "tool":
-                text_fragments.append(message.content or "")
-        elif isinstance(message.content, list):
-            for item in message.content:
-                if item.type == "text":
-                    item_text = getattr(item, "text", "") or ""
-                    if item_text or message.role == "tool":
-                        text_fragments.append(item_text)
-                elif item.type == "image_url":
-                    if item_media_url := getattr(item, "url", None):
-                        files.append(await save_url_to_tempfile(item_media_url, tempdir))
-                    else:
-                        raise ValueError(f"{item.type} cannot be empty")
-                elif item.type == "file":
-                    if not (file_data := getattr(item, "file_data", None)):
-                        raise ValueError("File must contain 'file_data'")
-                    filename = getattr(item, "filename", "") or ""
-                    files.append(await save_file_to_tempfile(file_data, filename, tempdir))
-                elif item.type == "input_audio":
-                    if file_data := getattr(item, "file_data", None):
-                        files.append(await save_file_to_tempfile(file_data, "audio.wav", tempdir))
-                    else:
-                        raise ValueError("input_audio must contain 'file_data' key")
-        elif message.content is None and message.role == "tool":
-            text_fragments.append("")
-        elif message.content is not None:
-            raise ValueError(f"Unsupported message content type: {type(message.content)}")
+        text_fragments, files = await GeminiClientWrapper._extract_content_and_files(
+            message, tempdir
+        )
 
         if message.role == "tool":
-            tool_name = message.name or "unknown"
-            combined_content = "\n".join(text_fragments).strip()
-            res_block = (
-                f"[Result:{tool_name}]\n[ToolResult]\n{combined_content}\n[/ToolResult]\n[/Result]"
+            text_fragments = GeminiClientWrapper._format_tool_results(
+                text_fragments, message.name, wrap_tool
             )
-            if wrap_tool:
-                text_fragments = [f"[ToolResults]\n{res_block}\n[/ToolResults]"]
-            else:
-                text_fragments = [res_block]
 
-        if message.tool_calls:
-            tool_blocks: list[str] = []
-            for call in message.tool_calls:
-                params_text = call.function.arguments.strip()
-                formatted_params = ""
-                if params_text:
-                    try:
-                        parsed_params = orjson.loads(params_text)
-                        if isinstance(parsed_params, dict):
-                            for k, v in parsed_params.items():
-                                val_str = (
-                                    v if isinstance(v, str) else orjson.dumps(v).decode("utf-8")
-                                )
-                                formatted_params += (
-                                    f"[CallParameter:{k}]\n```\n{val_str}\n```\n[/CallParameter]\n"
-                                )
-                        else:
-                            formatted_params += f"```\n{params_text}\n```\n"
-                    except orjson.JSONDecodeError:
-                        formatted_params += f"```\n{params_text}\n```\n"
-
-                tool_blocks.append(f"[Call:{call.function.name}]\n{formatted_params}[/Call]")
-
-            if tool_blocks:
-                tool_section = "[ToolCalls]\n" + "\n".join(tool_blocks) + "\n[/ToolCalls]"
-                text_fragments.append(tool_section)
+        if tool_section := GeminiClientWrapper._format_tool_calls(message):
+            text_fragments.append(tool_section)
 
         model_input = "\n".join(fragment for fragment in text_fragments if fragment is not None)
 
