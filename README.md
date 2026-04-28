@@ -182,7 +182,7 @@ export CONFIG_GEMINI__CLIENTS__0__SECURE_1PSIDTS="your-secure-1psidts"
 export CONFIG_GEMINI__CLIENTS__0__PROXY="socks5://127.0.0.1:1080"
 
 # Override browser impersonation for client 0
-export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="firefox"
+export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
 
 
 # Override conversation storage size limit
@@ -229,14 +229,11 @@ Each client can optionally set an `impersonate` value to control the TLS/HTTP fi
 - Set to any value supported by [`curl_cffi`'s `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi).
 - The value is validated at startup; an invalid value will prevent the server from starting.
 
-> [!IMPORTANT]
-> Currently, avoid using chrome based as it now applies device-bound session cookies.
-
 ```yaml
 gemini:
   clients:
     - id: "client-a"
-      impersonate: "firefox" # Use Firefox fingerprint
+      impersonate: "chrome" # Use Chrome fingerprint
     - id: "client-b"
       impersonate: null # Use library default
 ```

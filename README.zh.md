@@ -182,7 +182,7 @@ export CONFIG_GEMINI__CLIENTS__0__SECURE_1PSIDTS="your-secure-1psidts"
 export CONFIG_GEMINI__CLIENTS__0__PROXY="socks5://127.0.0.1:1080"
 
 # 覆盖 Client 0 的浏览器指纹模拟
-export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="firefox"
+export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
 
 
 # 覆盖对话存储大小限制
@@ -225,14 +225,11 @@ export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
 - 可设为 [`curl_cffi` 的 `BrowserTypeLiteral`](https://github.com/lexiforest/curl_cffi) 支持的任意值。
 - 启动时会校验该值；无效值会阻止服务启动。
 
-> [!IMPORTANT]
-> 目前请避免使用基于 Chrome 的指纹，因为它现在会应用设备绑定会话 Cookie (Device-bound session cookies)。
-
 ```yaml
 gemini:
   clients:
     - id: "client-a"
-      impersonate: "firefox" # 使用 Firefox 指纹
+      impersonate: "chrome" # 使用 Chrome 指纹
     - id: "client-b"
       impersonate: null # 使用库默认值
 ```
