@@ -4,6 +4,7 @@ from typing import Any
 
 import orjson
 from gemini_webapi import GeminiClient
+from gemini_webapi.constants import AccountStatus
 from loguru import logger
 
 from app.models import AppMessage
@@ -54,9 +55,12 @@ class GeminiClientWrapper(GeminiClient):
     def is_healthy(self) -> bool:
         """
         Check if the client is healthy.
-        A client is healthy if it is running, or if auto_close is enabled and it has initialized successfully.
+
+        A client is healthy if it is active (running or initialized with auto-close)
+        and the account status is available.
         """
-        return self._running or (self.auto_close and self._initialized)
+        is_active = self._running or (self.auto_close and self._initialized)
+        return is_active and self.account_status == AccountStatus.AVAILABLE
 
     @staticmethod
     async def _process_content_item(
