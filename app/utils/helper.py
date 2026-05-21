@@ -8,6 +8,7 @@ import struct
 import tempfile
 import unicodedata
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import orjson
@@ -15,6 +16,8 @@ from curl_cffi import CurlFollow, CurlHttpVersion, requests
 from loguru import logger
 
 from app.models import AppMessage, AppToolCall, AppToolCallFunction
+
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
 VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
 TOOL_WRAP_HINT = (
@@ -162,6 +165,25 @@ def _strip_param_fences(s: str) -> str:
     return s[len(fence) : -len(fence)].strip()
 
 
+def _parse_tool_argument_value(raw_value: str) -> JsonValue:
+    """
+    Convert a tagged tool argument into the most specific JSON-compatible value.
+
+    JSON literals, arrays, and objects are preserved so downstream clients receive
+    strict argument types, while plain text values remain strings for compatibility.
+    """
+    value = _strip_param_fences(raw_value)
+    if not value:
+        return ""
+
+    try:
+        parsed_value: Any = orjson.loads(value)
+    except orjson.JSONDecodeError:
+        return value
+
+    return parsed_value
+
+
 def estimate_tokens(text: str | None) -> int:
     """Estimate the number of tokens heuristically based on character count."""
     return len(text) // 3 if text else 0
@@ -272,7 +294,7 @@ def strip_system_hints(text: str) -> str:
 def _process_tools_internal(text: str, extract: bool = True) -> tuple[str, list[AppToolCall]]:
     """
     Extract tool metadata and return text stripped of technical markers.
-    Arguments are parsed into JSON and assigned deterministic call IDs.
+    Tagged arguments preserve JSON-compatible types and receive deterministic call IDs.
     """
     if not text:
         return text, []
@@ -292,7 +314,7 @@ def _process_tools_internal(text: str, extract: bool = True) -> tuple[str, list[
         arg_matches = TAGGED_ARG_RE.findall(raw_args)
         if arg_matches:
             args_dict = {
-                arg_name.strip(): _strip_param_fences(arg_value)
+                arg_name.strip(): _parse_tool_argument_value(arg_value)
                 for arg_name, arg_value in arg_matches
             }
             arguments = orjson.dumps(args_dict).decode("utf-8")
