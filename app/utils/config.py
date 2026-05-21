@@ -116,7 +116,7 @@ class GeminiConfig(BaseModel):
         default=True, description="Enable auto-close for Gemini sessions after inactivity"
     )
     close_delay: int = Field(
-        default=450, ge=30, description="Inactivity delay in seconds before auto-closing"
+        default=900, ge=30, description="Inactivity delay in seconds before auto-closing"
     )
     verbose: bool = Field(True, description="Enable verbose logging for Gemini API requests")
     extended_thinking: bool = Field(
