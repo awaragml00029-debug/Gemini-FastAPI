@@ -94,7 +94,7 @@ class GeminiModelConfig(BaseModel):
 
 
 class GeminiConfig(BaseModel):
-    """Gemini API configuration"""
+    """Gemini API configuration, including session behavior and generation options."""
 
     clients: list[GeminiClientSettings] = Field(
         ..., description="List of Gemini client credential pairs"
@@ -119,6 +119,10 @@ class GeminiConfig(BaseModel):
         default=450, ge=30, description="Inactivity delay in seconds before auto-closing"
     )
     verbose: bool = Field(True, description="Enable verbose logging for Gemini API requests")
+    extended_thinking: bool = Field(
+        default=False,
+        description="Enable Gemini extended thinking mode for message generation",
+    )
     max_chars_per_request: int = Field(
         default=1_000_000,
         ge=1,

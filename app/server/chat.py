@@ -986,12 +986,20 @@ async def _send_with_split(
     files: list[Any] | None = None,
     stream: bool = False,
 ) -> AsyncGenerator[ModelOutput] | ModelOutput:
-    """Send text to Gemini, splitting or converting to attachment if too long."""
+    """Send text to Gemini with configured generation options, using an attachment if too long."""
     if len(text) <= MAX_CHARS_PER_REQUEST:
         try:
             if stream:
-                return session.send_message_stream(text, files=files)
-            return await session.send_message(text, files=files)
+                return session.send_message_stream(
+                    text,
+                    files=files,
+                    extended_thinking=g_config.gemini.extended_thinking,
+                )
+            return await session.send_message(
+                text,
+                files=files,
+                extended_thinking=g_config.gemini.extended_thinking,
+            )
         except Exception as e:
             logger.error(f"Error sending message to Gemini: {e}")
             raise
@@ -1012,8 +1020,16 @@ async def _send_with_split(
             "3. Execute the instructions or answer the questions found *inside* that file immediately.\n"
         )
         if stream:
-            return session.send_message_stream(instruction, files=final_files)
-        return await session.send_message(instruction, files=final_files)
+            return session.send_message_stream(
+                instruction,
+                files=final_files,
+                extended_thinking=g_config.gemini.extended_thinking,
+            )
+        return await session.send_message(
+            instruction,
+            files=final_files,
+            extended_thinking=g_config.gemini.extended_thinking,
+        )
     except Exception as e:
         logger.error(f"Error sending large text as file to Gemini: {e}")
         raise
