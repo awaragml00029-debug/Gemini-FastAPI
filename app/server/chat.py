@@ -92,6 +92,14 @@ class StructuredOutputRequirement:
     raw_format: dict[str, Any]
 
 
+type ProcessedImageData = tuple[str, int | None, int | None, str, str]
+type ProcessedMediaData = dict[str, tuple[str, str]]
+type ProcessedImageResult = tuple[Literal["image"], Image, ProcessedImageData]
+type ProcessedMediaResult = tuple[
+    Literal["media"], GeneratedVideo | GeneratedMedia, ProcessedMediaData
+]
+
+
 # --- Helper Functions ---
 
 
@@ -693,7 +701,7 @@ def _prepare_messages_for_model(
 def _convert_responses_to_app_messages(
     items: Any,
 ) -> list[AppMessage]:
-    """Convert Responses API input items into internal AppMessage objects."""
+    """Convert Responses API input items into internal AppMessage objects, skipping incomplete tool calls."""
     messages: list[AppMessage] = []
 
     if isinstance(items, str):
@@ -747,12 +755,18 @@ def _convert_responses_to_app_messages(
                 )
 
         elif isinstance(item, ResponseFunctionToolCall):
+            call_id = item.call_id or item.id
+            if not call_id or not item.name or item.arguments is None:
+                logger.warning(
+                    f"Skipping incomplete function_call input item: {reprlib.repr(item.model_dump(mode='json'))}"
+                )
+                continue
             messages.append(
                 AppMessage(
                     role="assistant",
                     tool_calls=[
                         AppToolCall(
-                            id=item.call_id,
+                            id=call_id,
                             type="function",
                             function=AppToolCallFunction(name=item.name, arguments=item.arguments),
                         )
@@ -1140,8 +1154,8 @@ class StreamingOutputFilter:
 # --- Media Processing Helpers ---
 
 
-async def _process_image_item(image: Image):
-    """Process an image item by converting it to base64 and returning a standard result tuple."""
+async def _process_image_item(image: Image) -> ProcessedImageResult | None:
+    """Process an image item by converting it to base64 and returning a typed image result tuple."""
     try:
         media_store = get_media_store_dir()
         return "image", image, await _image_to_base64(image, media_store)
@@ -1150,8 +1164,10 @@ async def _process_image_item(image: Image):
         return None
 
 
-async def _process_media_item(media_item: GeneratedVideo | GeneratedMedia):
-    """Process a media item by saving it to a local file and returning a standard result tuple."""
+async def _process_media_item(
+    media_item: GeneratedVideo | GeneratedMedia,
+) -> ProcessedMediaResult | None:
+    """Process a media item by saving it to local files and returning a typed media result tuple."""
     try:
         media_store = get_media_store_dir()
         return "media", media_item, await _media_to_local_file(media_item, media_store)
@@ -2305,9 +2321,10 @@ async def create_chat_completion(
     for res in results:
         if not res:
             continue
-        rtype, original_item, media_data = res
 
-        if rtype == "image":
+        if res[0] == "image":
+            original_item = res[1]
+            media_data = res[2]
             _, _, _, fname, fhash = media_data
             if fhash in seen_hashes:
                 (media_store / fname).unlink(missing_ok=True)
@@ -2319,7 +2336,9 @@ async def create_chat_completion(
             title = getattr(original_item, "title", "Image")
             image_markdown += f"\n\n![{title}]({img_url})"
 
-        elif rtype == "media":
+        elif res[0] == "media":
+            original_item = res[1]
+            media_data = res[2]
             m_dict = media_data
             if not m_dict:
                 continue
@@ -2518,8 +2537,7 @@ async def create_response(
     )
     images = resp_or_stream.images or []
     if (
-        request.tool_choice is not None
-        and hasattr(request.tool_choice, "type")
+        isinstance(request.tool_choice, ToolChoiceTypes)
         and request.tool_choice.type == "image_generation"
     ) and not images:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="No images returned.")
@@ -2546,9 +2564,9 @@ async def create_response(
     for res in results:
         if not res:
             continue
-        rtype, original_item, media_data = res
 
-        if rtype == "image":
+        if res[0] == "image":
+            media_data = res[2]
             b64, w, h, fname, fhash = media_data
             if fhash in seen_hashes:
                 (media_store / fname).unlink(missing_ok=True)
@@ -2565,7 +2583,9 @@ async def create_response(
                 )
             )
 
-        elif rtype == "media":
+        elif res[0] == "media":
+            original_item = res[1]
+            media_data = res[2]
             m_dict = media_data
             if not m_dict:
                 continue

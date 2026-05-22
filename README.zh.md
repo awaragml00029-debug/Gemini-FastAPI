@@ -244,9 +244,11 @@ gemini:
 gemini:
   model_strategy: "append" # "append" (默认 + 自定义) 或 "overwrite" (仅限自定义)
   models:
-    - model_name: "gemini-3.0-pro"
+    - model_name: "xxx"
       model_header:
-        x-goog-ext-525001261-jspb: '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4],null,null,1]'
+        x-goog-ext-525001261-jspb: '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8],null,null,1,null,null,1,1,"EA3C5672-E422-4A5F-BE26-B5B57D3B9AC3"]'
+        x-goog-ext-73010989-jspb: "[0]"
+        x-goog-ext-73010990-jspb: "[0,0,0]"
 ```
 
 #### 环境变量
@@ -255,7 +257,7 @@ gemini:
 
 ```bash
 export CONFIG_GEMINI__MODEL_STRATEGY="overwrite"
-export CONFIG_GEMINI__MODELS='[{"model_name": "gemini-3.0-pro", "model_header": {"x-goog-ext-525001261-jspb": "[1,null,null,null,\"9d8ca3786ebdfbea\",null,null,0,[4],null,null,1]"}}]'
+export CONFIG_GEMINI__MODELS='[{"model_name": "xxx", "model_header": {"x-goog-ext-525001261-jspb": "[1,null,null,null,\"fbb127bbb056c959\",null,null,0,\[4,5,6,8\],null,null,1,null,null,1,1,\"EA3C5672-E422-4A5F-BE26-B5B57D3B9AC3\"]", "x-goog-ext-73010989-jspb": "[0]", "x-goog-ext-73010990-jspb": "[0,0,0]"}}]'
 ```
 
 ## 鸣谢

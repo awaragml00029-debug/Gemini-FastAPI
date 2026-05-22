@@ -248,9 +248,11 @@ You can define custom models in `config/config.yaml` or via environment variable
 gemini:
   model_strategy: "append" # "append" (default + custom) or "overwrite" (custom only)
   models:
-    - model_name: "gemini-3.0-pro"
+    - model_name: "xxx"
       model_header:
-        x-goog-ext-525001261-jspb: '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4],null,null,1]'
+        x-goog-ext-525001261-jspb: '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8],null,null,1,null,null,1,1,"EA3C5672-E422-4A5F-BE26-B5B57D3B9AC3"]'
+        x-goog-ext-73010989-jspb: "[0]"
+        x-goog-ext-73010990-jspb: "[0,0,0]"
 ```
 
 #### Environment Variables
@@ -259,7 +261,7 @@ You can supply models as a JSON string or list structure via `CONFIG_GEMINI__MOD
 
 ```bash
 export CONFIG_GEMINI__MODEL_STRATEGY="overwrite"
-export CONFIG_GEMINI__MODELS='[{"model_name": "gemini-3.0-pro", "model_header": {"x-goog-ext-525001261-jspb": "[1,null,null,null,\"9d8ca3786ebdfbea\",null,null,0,[4],null,null,1]"}}]'
+export CONFIG_GEMINI__MODELS='[{"model_name": "xxx", "model_header": {"x-goog-ext-525001261-jspb": "[1,null,null,null,\"fbb127bbb056c959\",null,null,0,\[4,5,6,8\],null,null,1,null,null,1,1,\"EA3C5672-E422-4A5F-BE26-B5B57D3B9AC3\"]", "x-goog-ext-73010989-jspb": "[0]", "x-goog-ext-73010990-jspb": "[0,0,0]"}}]'
 ```
 
 ## Acknowledgments

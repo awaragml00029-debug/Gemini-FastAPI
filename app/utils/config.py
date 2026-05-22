@@ -288,10 +288,10 @@ def extract_gemini_clients_env() -> dict[int, dict[str, Any]]:
 def _merge_clients_with_env(
     base_clients: list[GeminiClientSettings] | None,
     env_overrides: dict[int, dict[str, Any]],
-):
-    """Override base_clients with env_overrides, return the new clients list."""
+) -> list[GeminiClientSettings]:
+    """Return Gemini clients with environment overrides applied to the base list."""
     if not env_overrides:
-        return base_clients
+        return base_clients or []
     result_clients: list[GeminiClientSettings] = []
     if base_clients:
         result_clients = [client.model_copy() for client in base_clients]
@@ -309,7 +309,7 @@ def _merge_clients_with_env(
                 f"Client index {idx} in env is out of range (current count: {len(result_clients)}). "
                 "Client indices must be contiguous starting from 0."
             )
-    return result_clients or base_clients
+    return result_clients or base_clients or []
 
 
 def extract_gemini_models_env() -> dict[int, dict[str, Any]]:
@@ -372,15 +372,16 @@ def _merge_models_with_env(
 
 def initialize_config() -> Config:
     """
-    Initialize the configuration.
+    Initialize configuration from environment variables and the YAML settings source.
 
     Returns:
-        Config: Configuration object
+        Config: Configuration object with Gemini client and model overrides merged
     """
     try:
         env_clients_overrides = extract_gemini_clients_env()
         env_models_overrides = extract_gemini_models_env()
-        config = Config()
+        settings_cls: type[Any] = Config
+        config = cast(Config, settings_cls())
 
         config.gemini.clients = _merge_clients_with_env(
             config.gemini.clients, env_clients_overrides

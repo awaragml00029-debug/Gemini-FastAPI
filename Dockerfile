@@ -7,8 +7,6 @@ USER root
 
 WORKDIR /app
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
