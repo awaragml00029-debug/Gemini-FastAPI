@@ -66,6 +66,7 @@ from app.utils import g_config
 from app.utils.helper import (
     STREAM_MASTER_RE,
     STREAM_TAIL_RE,
+    STRUCTURED_JSON_WRAP_HINT,
     TOOL_HINT_STRIPPED,
     TOOL_WRAP_HINT,
     detect_image_extension,
@@ -73,6 +74,7 @@ from app.utils.helper import (
     extract_image_dimensions,
     extract_tool_calls,
     normalize_llm_text,
+    strip_markdown_fence,
     strip_system_hints,
     text_from_message,
 )
@@ -348,13 +350,31 @@ def _create_chat_completion_standard_payload(
     )
 
 
+def _canonicalize_structured_output(
+    visible_output: str, structured_requirement: StructuredOutputRequirement
+) -> str | None:
+    """Parse raw or fenced structured JSON and return its canonical JSON representation."""
+    candidate = strip_markdown_fence(visible_output)
+    try:
+        structured_payload = orjson.loads(candidate)
+    except orjson.JSONDecodeError:
+        logger.warning(
+            f"Failed to decode JSON for structured response (schema={structured_requirement.schema_name})."
+        )
+        return None
+
+    canonical_output = orjson.dumps(structured_payload).decode("utf-8")
+    logger.debug(f"Structured response fulfilled (schema={structured_requirement.schema_name}).")
+    return canonical_output
+
+
 def _process_llm_output(
     thoughts: str | None,
     raw_text: str,
     structured_requirement: StructuredOutputRequirement | None,
 ) -> tuple[str | None, str, str, list[AppToolCall]]:
     """
-    Post-process Gemini output to extract tool calls and prepare clean text for display and storage.
+    Post-process Gemini output to extract tool calls, unwrap structured JSON fences, and prepare clean text for display and storage.
     Returns: (thoughts, visible_text, storage_output, tool_calls)
     """
     if thoughts:
@@ -368,18 +388,10 @@ def _process_llm_output(
     storage_output = visible_output
 
     if structured_requirement and visible_output:
-        try:
-            structured_payload = orjson.loads(visible_output)
-            canonical_output = orjson.dumps(structured_payload).decode("utf-8")
+        canonical_output = _canonicalize_structured_output(visible_output, structured_requirement)
+        if canonical_output:
             visible_output = canonical_output
             storage_output = canonical_output
-            logger.debug(
-                f"Structured response fulfilled (schema={structured_requirement.schema_name})."
-            )
-        except orjson.JSONDecodeError:
-            logger.warning(
-                f"Failed to decode JSON for structured response (schema={structured_requirement.schema_name})."
-            )
 
     return thoughts, visible_output, storage_output, tool_calls
 
@@ -491,7 +503,7 @@ def _persist_conversation(
 def _build_structured_requirement(
     response_format: dict[str, Any] | None,
 ) -> StructuredOutputRequirement | None:
-    """Translate OpenAI-style response_format into internal instructions."""
+    """Translate OpenAI-style response_format into helper-managed fenced JSON instructions."""
     if not response_format or not isinstance(response_format, dict):
         return None
 
@@ -520,16 +532,15 @@ def _build_structured_requirement(
 
     pretty_schema = orjson.dumps(schema, option=orjson.OPT_SORT_KEYS).decode("utf-8")
     instruction_parts = [
-        "You must respond with a single valid JSON document that conforms to the schema shown below.",
-        "Do not include explanations, comments, or any text before or after the JSON.",
+        STRUCTURED_JSON_WRAP_HINT,
         f'Schema name: "{schema_name}"',
         "JSON Schema:",
         pretty_schema,
     ]
-    if not strict:
+    if strict:
         instruction_parts.insert(
             1,
-            "The schema allows unspecified fields, but include only what is necessary to satisfy the user's request.",
+            "Strict schema adherence is required: the JSON must conform exactly to the schema.",
         )
 
     instruction = "\n\n".join(instruction_parts)

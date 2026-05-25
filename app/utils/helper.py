@@ -38,6 +38,16 @@ TOOL_WRAP_HINT = (
     "[/ToolCalls]\n\n"
     "CRITICAL: Do NOT mix natural language with protocol tags. Either respond naturally OR provide the protocol block alone. There is no middle ground."
 )
+STRUCTURED_JSON_WRAP_HINT = (
+    "\n\n### SYSTEM: STRUCTURED JSON PROTOCOL (MANDATORY) ###\n"
+    "Return ONLY one markdown code block containing a single strict JSON document that conforms to the provided JSON Schema.\n"
+    "Use ```json by default. If the JSON contains backticks, the outer fence MUST be longer than any backtick sequence inside (e.g., ````json).\n"
+    "REQUIRED SYNTAX:\n"
+    "```json\n"
+    '{"field":"value"}\n'
+    "```\n\n"
+    "CRITICAL: Do NOT mix natural language with the fenced JSON block. Provide the protocol block alone. There is no middle ground."
+)
 TOOL_BLOCK_RE = re.compile(
     r"\\?\[ToolCalls\\?](.*?)\\?\[\\?/ToolCalls\\?]",
     re.DOTALL | re.IGNORECASE,
@@ -144,10 +154,12 @@ def unescape_text(s: str) -> str:
     return COMMONMARK_UNESCAPE_RE.sub(r"\1", s) if s else ""
 
 
-def _strip_param_fences(s: str) -> str:
+def strip_markdown_fence(s: str) -> str:
     """
-    Remove one layer of outermost Markdown code fences,
-    supporting nested blocks by detecting variable fence lengths.
+    Remove one outer Markdown code fence layer for protected LLM payloads.
+
+    The fence length is detected from the opening fence so tool parameters and
+    structured JSON can safely contain shorter backtick sequences inside.
     """
     s = s.strip()
     if not s:
@@ -172,7 +184,7 @@ def _parse_tool_argument_value(raw_value: str) -> JsonValue:
     JSON literals, arrays, and objects are preserved so downstream clients receive
     strict argument types, while plain text values remain strings for compatibility.
     """
-    value = _strip_param_fences(raw_value)
+    value = strip_markdown_fence(raw_value)
     if not value:
         return ""
 
