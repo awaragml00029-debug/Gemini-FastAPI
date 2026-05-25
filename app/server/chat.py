@@ -80,6 +80,8 @@ from app.utils.helper import (
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
 
 router = APIRouter()
+_AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
+_AVAILABLE_MODELS_CACHE_LOCK = asyncio.Lock()
 
 
 @dataclass
@@ -921,8 +923,8 @@ def _get_model_by_name(name: str) -> Model:
     return Model.from_name(name)
 
 
-async def _get_available_models(pool: GeminiClientPool) -> list[ModelData]:
-    """Return a list of available models based on the configuration strategy and per-client accounts."""
+async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
+    """Build the available model list from configured models and currently running clients."""
     now = int(datetime.now(tz=UTC).timestamp())
     strategy = g_config.gemini.model_strategy
     models_data = []
@@ -958,6 +960,25 @@ async def _get_available_models(pool: GeminiClientPool) -> list[ModelData]:
                         seen_model_ids.add(model_id)
 
     return models_data
+
+
+async def refresh_available_models_cache(pool: GeminiClientPool) -> list[ModelData]:
+    """Refresh and return the cached model list while clients are available."""
+    global _AVAILABLE_MODELS_CACHE
+
+    async with _AVAILABLE_MODELS_CACHE_LOCK:
+        models = await _build_available_models(pool)
+        _AVAILABLE_MODELS_CACHE = models
+        logger.info(f"Cached {len(models)} available model(s).")
+        return list(models)
+
+
+async def _get_available_models(pool: GeminiClientPool) -> list[ModelData]:
+    """Return cached available models, populating the cache if it has not been warmed yet."""
+    if _AVAILABLE_MODELS_CACHE is not None:
+        return list(_AVAILABLE_MODELS_CACHE)
+
+    return await refresh_available_models_cache(pool)
 
 
 async def _find_reusable_session(
