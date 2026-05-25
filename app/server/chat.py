@@ -1275,7 +1275,9 @@ def _create_real_streaming_response(
 
                 if text_delta := chunk.text_delta:
                     full_text += text_delta
-                    if visible_delta := suppressor.process(text_delta):
+                    if not structured_requirement and (
+                        visible_delta := suppressor.process(text_delta)
+                    ):
                         yield make_chunk(
                             {"delta": {"content": visible_delta}, "finish_reason": None}
                         )
@@ -1314,19 +1316,21 @@ def _create_real_streaming_response(
                 if f_len > c_len and f_text.startswith(full_text):
                     drift = f_text[c_len:]
                     full_text = f_text
-                    if visible_drift := suppressor.process(drift):
+                    if not structured_requirement and (visible_drift := suppressor.process(drift)):
                         yield make_chunk(
                             {"delta": {"content": visible_drift}, "finish_reason": None}
                         )
 
-        if remaining_text := suppressor.flush():
+        if not structured_requirement and (remaining_text := suppressor.flush()):
             yield make_chunk({"delta": {"content": remaining_text}, "finish_reason": None})
 
-        _, _, storage_output, detected_tool_calls = _process_llm_output(
+        _, visible_output, storage_output, detected_tool_calls = _process_llm_output(
             normalize_llm_text(full_thoughts or ""),
             normalize_llm_text(full_text or ""),
             structured_requirement,
         )
+        if structured_requirement and visible_output:
+            yield make_chunk({"delta": {"content": visible_output}, "finish_reason": None})
 
         seen_hashes = {}
         seen_media_hashes = {}
@@ -1607,6 +1611,7 @@ def _create_responses_real_streaming_response(
                     )
 
                 if chunk.text_delta:
+                    full_text += chunk.text_delta
                     if thought_open:
                         yield make_event(
                             "response.reasoning_summary_text.done",
@@ -1648,54 +1653,54 @@ def _create_responses_real_streaming_response(
                         )
                         thought_open = False
 
-                    if not message_open:
-                        message_index = next_output_index
-                        next_output_index += 1
-                        yield make_event(
-                            "response.output_item.added",
-                            {
-                                **base_event,
-                                "type": "response.output_item.added",
-                                "output_index": message_index,
-                                "item": ResponseOutputMessage(
-                                    id=message_item_id,
-                                    type="message",
-                                    status="in_progress",
-                                    role="assistant",
-                                    content=[],
-                                ).model_dump(mode="json"),
-                            },
-                        )
+                    if not structured_requirement:
+                        if not message_open:
+                            message_index = next_output_index
+                            next_output_index += 1
+                            yield make_event(
+                                "response.output_item.added",
+                                {
+                                    **base_event,
+                                    "type": "response.output_item.added",
+                                    "output_index": message_index,
+                                    "item": ResponseOutputMessage(
+                                        id=message_item_id,
+                                        type="message",
+                                        status="in_progress",
+                                        role="assistant",
+                                        content=[],
+                                    ).model_dump(mode="json"),
+                                },
+                            )
 
-                        yield make_event(
-                            "response.content_part.added",
-                            {
-                                **base_event,
-                                "type": "response.content_part.added",
-                                "item_id": message_item_id,
-                                "output_index": message_index,
-                                "content_index": 0,
-                                "part": ResponseOutputText(type="output_text", text="").model_dump(
-                                    mode="json"
-                                ),
-                            },
-                        )
-                        message_open = True
+                            yield make_event(
+                                "response.content_part.added",
+                                {
+                                    **base_event,
+                                    "type": "response.content_part.added",
+                                    "item_id": message_item_id,
+                                    "output_index": message_index,
+                                    "content_index": 0,
+                                    "part": ResponseOutputText(
+                                        type="output_text", text=""
+                                    ).model_dump(mode="json"),
+                                },
+                            )
+                            message_open = True
 
-                    full_text += chunk.text_delta
-                    if visible := suppressor.process(chunk.text_delta):
-                        yield make_event(
-                            "response.output_text.delta",
-                            {
-                                **base_event,
-                                "type": "response.output_text.delta",
-                                "item_id": message_item_id,
-                                "output_index": message_index,
-                                "content_index": 0,
-                                "delta": visible,
-                                "logprobs": [],
-                            },
-                        )
+                        if visible := suppressor.process(chunk.text_delta):
+                            yield make_event(
+                                "response.output_text.delta",
+                                {
+                                    **base_event,
+                                    "type": "response.output_text.delta",
+                                    "item_id": message_item_id,
+                                    "output_index": message_index,
+                                    "content_index": 0,
+                                    "delta": visible,
+                                    "logprobs": [],
+                                },
+                            )
 
                 for img in chunk.images or []:
                     if img.url and img.url not in seen_image_urls:
@@ -1777,7 +1782,7 @@ def _create_responses_real_streaming_response(
                 if l_len > c_len and l_text.startswith(full_text):
                     drift = l_text[c_len:]
                     full_text = l_text
-                    if visible := suppressor.process(drift):
+                    if not structured_requirement and (visible := suppressor.process(drift)):
                         if not message_open:
                             message_index = next_output_index
                             next_output_index += 1
@@ -1824,7 +1829,7 @@ def _create_responses_real_streaming_response(
                             },
                         )
 
-        remaining = suppressor.flush()
+        remaining = "" if structured_requirement else suppressor.flush()
         if remaining and message_open:
             yield make_event(
                 "response.output_text.delta",
@@ -1882,6 +1887,49 @@ def _create_responses_real_streaming_response(
             normalize_llm_text(full_text or ""),
             structured_requirement,
         )
+
+        if structured_requirement and assistant_text and not message_open:
+            message_index = next_output_index
+            next_output_index += 1
+            yield make_event(
+                "response.output_item.added",
+                {
+                    **base_event,
+                    "type": "response.output_item.added",
+                    "output_index": message_index,
+                    "item": ResponseOutputMessage(
+                        id=message_item_id,
+                        type="message",
+                        status="in_progress",
+                        role="assistant",
+                        content=[],
+                    ).model_dump(mode="json"),
+                },
+            )
+            yield make_event(
+                "response.content_part.added",
+                {
+                    **base_event,
+                    "type": "response.content_part.added",
+                    "item_id": message_item_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "part": ResponseOutputText(type="output_text", text="").model_dump(mode="json"),
+                },
+            )
+            message_open = True
+            yield make_event(
+                "response.output_text.delta",
+                {
+                    **base_event,
+                    "type": "response.output_text.delta",
+                    "item_id": message_item_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "delta": assistant_text,
+                    "logprobs": [],
+                },
+            )
 
         image_items = []
         seen_hashes = {}
