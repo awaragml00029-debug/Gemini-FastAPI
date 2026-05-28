@@ -1374,6 +1374,7 @@ def _create_real_streaming_response(
     """
     Create a real-time streaming response.
     Reconciles manual delta accumulation with the model's final authoritative state.
+    Emits typed image and media results as incremental markdown deltas.
     """
 
     async def generate_stream():
@@ -1519,7 +1520,7 @@ def _create_real_streaming_response(
                         yield make_chunk({"delta": {"content": f"\n\n{md}"}, "finish_reason": None})
 
                     elif rtype == "media":
-                        m_dict = media_data
+                        m_dict = cast(ProcessedMediaData, media_data)
                         if not m_dict:
                             continue
 
@@ -1631,6 +1632,7 @@ def _create_responses_real_streaming_response(
     """
     Create a real-time streaming response for the Responses API.
     Ensures final accumulated text and thoughts are synchronized and follow the formal event stream spec.
+    Emits typed image and media results as incremental response output text events.
     """
     base_event = {
         "id": response_id,
@@ -2204,7 +2206,7 @@ def _create_responses_real_streaming_response(
                         image_items.append(img_item)
 
                     elif rtype == "media":
-                        m_dict = media_data
+                        m_dict = cast(ProcessedMediaData, media_data)
                         if not m_dict:
                             continue
 
