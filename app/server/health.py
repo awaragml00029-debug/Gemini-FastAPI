@@ -8,6 +8,7 @@ router = APIRouter()
 
 
 @router.get("/health", response_model=HealthCheckResponse)
+@router.get("/v1/health", response_model=HealthCheckResponse)
 async def health_check():
     pool = GeminiClientPool()
     db = LMDBConversationStore()

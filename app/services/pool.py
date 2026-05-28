@@ -34,19 +34,28 @@ class GeminiClientPool(metaclass=Singleton):
 
     async def init(self) -> None:
         """Initialize all clients in the pool with staggered start times."""
-        clients_to_init = [c for c in self._clients if not c.running()]
+        clients_to_init = [c for c in self._clients if not self._client_ready(c)]
         for i, client in enumerate(clients_to_init):
-            try:
-                await client.init()
-            except Exception:
-                logger.error(f"Failed to initialize client {client.id}")
+            lock = self._restart_locks.get(client.id)
+            if lock is None:
+                logger.error(f"Restart lock missing for client {client.id}")
+                continue
+
+            async with lock:
+                if self._client_ready(client):
+                    continue
+
+                try:
+                    await self._restart_client(client)
+                except Exception:
+                    logger.error(f"Failed to initialize client {client.id}")
 
             if i < len(clients_to_init) - 1:
                 delay = random.uniform(5, 30)
                 logger.info(f"Staggering next initialization by {delay:.2f}s")
                 await asyncio.sleep(delay)
 
-        success_count = sum(bool(client.running()) for client in self._clients)
+        success_count = sum(self._client_ready(client) for client in self._clients)
         if success_count == 0:
             raise RuntimeError("Failed to initialize any Gemini clients")
 
@@ -73,9 +82,24 @@ class GeminiClientPool(metaclass=Singleton):
 
         raise RuntimeError("No Gemini clients are currently available")
 
-    async def _ensure_client_ready(self, client: GeminiClientWrapper) -> bool:
-        """Make sure the client is running, attempting a restart if needed."""
+    @staticmethod
+    def _client_ready(client: GeminiClientWrapper) -> bool:
+        return client.running() and client.is_healthy()
+
+    async def _restart_client(self, client: GeminiClientWrapper) -> None:
+        if client.active_requests > 0:
+            raise RuntimeError(
+                f"Gemini client {client.id} has {client.active_requests} active request(s)"
+            )
+
         if client.running():
+            await client.close()
+
+        await asyncio.wait_for(client.init(), timeout=float(g_config.gemini.timeout))
+
+    async def _ensure_client_ready(self, client: GeminiClientWrapper) -> bool:
+        """Make sure the client is usable, attempting a restart if needed."""
+        if self._client_ready(client):
             return True
 
         lock = self._restart_locks.get(client.id)
@@ -83,13 +107,13 @@ class GeminiClientPool(metaclass=Singleton):
             return False
 
         async with lock:
-            if client.running():
+            if self._client_ready(client):
                 return True
 
             try:
-                await client.init()
-                logger.info(f"Restarted Gemini client {client.id} after it stopped.")
-                return True
+                await self._restart_client(client)
+                logger.info(f"Restarted Gemini client {client.id} after it became unavailable.")
+                return self._client_ready(client)
             except Exception:
                 logger.exception(f"Failed to restart Gemini client {client.id}")
                 return False

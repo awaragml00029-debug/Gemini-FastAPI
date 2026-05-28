@@ -1,10 +1,15 @@
+import asyncio
 import io
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import orjson
 from gemini_webapi import GeminiClient
 from gemini_webapi.constants import AccountStatus
+from gemini_webapi.utils.rotate_1psidts import save_cookies
 from loguru import logger
 
 from app.models import AppMessage
@@ -24,6 +29,9 @@ class GeminiClientWrapper(GeminiClient):
         super().__init__(**kwargs)
         self.id = client_id
         self._initialized = False
+        self._needs_restart = False
+        self._active_requests = 0
+        self._active_requests_changed = asyncio.Condition()
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -44,13 +52,84 @@ class GeminiClientWrapper(GeminiClient):
         try:
             await super().init(**init_kwargs)
             self._initialized = True
+            self._needs_restart = False
         except Exception:
             self._initialized = False
+            self._needs_restart = True
             logger.exception(f"Failed to initialize GeminiClient {self.id}")
             raise
 
     def running(self) -> bool:
         return self._running
+
+    @property
+    def active_requests(self) -> int:
+        return self._active_requests
+
+    @asynccontextmanager
+    async def request_scope(self) -> AsyncIterator[None]:
+        async with self._active_requests_changed:
+            self._active_requests += 1
+            if self.close_task and not self.close_task.done():
+                self.close_task.cancel()
+                self.close_task = None
+
+        try:
+            yield
+        finally:
+            async with self._active_requests_changed:
+                self._active_requests = max(0, self._active_requests - 1)
+                self._active_requests_changed.notify_all()
+
+    async def close(self, delay: float = 0) -> None:
+        if delay:
+            await asyncio.sleep(delay)
+            async with self._active_requests_changed:
+                while self._active_requests > 0:
+                    logger.debug(
+                        f"Gemini client {self.id} auto-close is waiting for "
+                        f"{self._active_requests} active request(s)."
+                    )
+                    await self._active_requests_changed.wait()
+            logger.debug(
+                f"Auto-close option "
+                f"[{'enabled' if self.auto_close else 'disabled'}] "
+                f"triggered client closing."
+            )
+
+        self._running = False
+        current_task = asyncio.current_task()
+
+        if self.close_task:
+            if self.close_task is not current_task:
+                self.close_task.cancel()
+            self.close_task = None
+
+        if self.refresh_task:
+            if self.refresh_task is not current_task:
+                self.refresh_task.cancel()
+            self.refresh_task = None
+
+        if self.activity_task:
+            if self.activity_task is not current_task:
+                self.activity_task.cancel()
+            self.activity_task = None
+
+        if self.client:
+            self._cookies.update(self.client.cookies)
+            try:
+                await asyncio.wait_for(self.client.close(), timeout=10)
+            except TimeoutError:
+                logger.warning(f"Timed out closing Gemini client {self.id}; dropping session.")
+            self.client = None
+
+        try:
+            await asyncio.to_thread(save_cookies, self._cookies, self.verbose)
+        except OSError as e:
+            logger.warning(f"Failed to save cookies to cache file: {e}")
+
+    def mark_unavailable(self) -> None:
+        self._needs_restart = True
 
     def is_healthy(self) -> bool:
         """
@@ -60,7 +139,11 @@ class GeminiClientWrapper(GeminiClient):
         and the account status is available.
         """
         is_active = self._running or (self.auto_close and self._initialized)
-        return is_active and self.account_status == AccountStatus.AVAILABLE
+        return (
+            is_active
+            and not self._needs_restart
+            and self.account_status == AccountStatus.AVAILABLE
+        )
 
     @staticmethod
     async def _process_content_item(
@@ -76,16 +159,41 @@ class GeminiClientWrapper(GeminiClient):
                 return item_text, None
         elif item.type == "image_url":
             if item_media_url := getattr(item, "url", None):
-                return None, await save_url_to_tempfile(item_media_url, tempdir)
+                started = time.perf_counter()
+                path = await save_url_to_tempfile(item_media_url, tempdir)
+                logger.info(
+                    "Processed image_url content item: path={}, bytes={}, elapsed={:.3f}s",
+                    path,
+                    path.stat().st_size,
+                    time.perf_counter() - started,
+                )
+                return None, path
             raise ValueError(f"{item.type} cannot be empty")
         elif item.type == "file":
             if not (file_data := getattr(item, "file_data", None)):
                 raise ValueError("File must contain 'file_data'")
             filename = getattr(item, "filename", "") or ""
-            return None, await save_file_to_tempfile(file_data, filename, tempdir)
+            started = time.perf_counter()
+            path = await save_file_to_tempfile(file_data, filename, tempdir)
+            logger.info(
+                "Processed file content item: filename={}, path={}, bytes={}, elapsed={:.3f}s",
+                filename or "<none>",
+                path,
+                path.stat().st_size,
+                time.perf_counter() - started,
+            )
+            return None, path
         elif item.type == "input_audio":
             if file_data := getattr(item, "file_data", None):
-                return None, await save_file_to_tempfile(file_data, "audio.wav", tempdir)
+                started = time.perf_counter()
+                path = await save_file_to_tempfile(file_data, "audio.wav", tempdir)
+                logger.info(
+                    "Processed input_audio content item: path={}, bytes={}, elapsed={:.3f}s",
+                    path,
+                    path.stat().st_size,
+                    time.perf_counter() - started,
+                )
+                return None, path
             raise ValueError("input_audio must contain 'file_data' key")
         return None, None
 
@@ -196,6 +304,7 @@ class GeminiClientWrapper(GeminiClient):
     async def process_conversation(
         messages: list[AppMessage], tempdir: Path | None = None
     ) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
+        started = time.perf_counter()
         conversation: list[str] = []
         files: list[str | Path | bytes | io.BytesIO] = []
 
@@ -224,4 +333,12 @@ class GeminiClientWrapper(GeminiClient):
                 i += 1
 
         conversation.append(add_tag("assistant", "", unclose=True))
-        return "\n".join(conversation), files
+        model_input = "\n".join(conversation)
+        logger.info(
+            "Processed conversation for Gemini: messages={}, input_chars={}, files={}, elapsed={:.3f}s",
+            len(messages),
+            len(model_input),
+            len(files),
+            time.perf_counter() - started,
+        )
+        return model_input, files

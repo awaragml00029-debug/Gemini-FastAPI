@@ -49,38 +49,65 @@ async def _run_retention_cleanup(stop_event: asyncio.Event) -> None:
     logger.info("LMDB retention cleanup task stopped.")
 
 
+async def _run_pool_init_in_background(pool: GeminiClientPool) -> None:
+    try:
+        await pool.init()
+        await refresh_available_models_cache(pool)
+        healthy_clients = [c.id for c in pool.clients if c.running()]
+        if healthy_clients:
+            logger.info(f"Gemini clients initialized in background: {healthy_clients}.")
+        else:
+            logger.warning("Gemini client background initialization finished with no running clients.")
+    except asyncio.CancelledError:
+        logger.debug("Gemini client background initialization task cancelled.")
+        raise
+    except Exception:
+        logger.exception("Gemini client background initialization failed.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cleanup_stop_event = asyncio.Event()
 
     pool = GeminiClientPool()
-    try:
-        await pool.init()
-        await refresh_available_models_cache(pool)
-    except Exception as e:
-        logger.exception(f"Failed to initialize Gemini clients: {e}")
-        raise
-
     cleanup_task = asyncio.create_task(_run_retention_cleanup(cleanup_stop_event))
+    pool_init_task = asyncio.create_task(_run_pool_init_in_background(pool))
 
     # Give the tasks a chance to start and surface immediate failures.
     await asyncio.sleep(0)
 
-    for task, name in [(cleanup_task, "LMDB retention cleanup")]:
-        if task.done():
-            try:
-                task.result()
-            except Exception:
-                logger.exception(f"{name} task failed to start.")
-                raise
+    if cleanup_task.done():
+        try:
+            cleanup_task.result()
+        except Exception:
+            logger.exception("LMDB retention cleanup task failed to start.")
+            raise
 
-    logger.info(f"Gemini clients initialized: {[c.id for c in pool.clients]}.")
-    logger.info("Gemini API Server ready to serve requests.")
+    if pool_init_task.done():
+        try:
+            pool_init_task.result()
+        except asyncio.CancelledError:
+            logger.debug("Gemini client background initialization task cancelled at startup.")
+        except Exception:
+            logger.exception("Gemini client background initialization task failed to start.")
+
+    logger.info("Gemini API Server ready to serve requests; Gemini clients initialize in background.")
 
     try:
         yield
     finally:
         cleanup_stop_event.set()
+
+        if not pool_init_task.done():
+            pool_init_task.cancel()
+
+        try:
+            await pool_init_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Gemini client background initialization task ended with an error.")
+
         try:
             await pool.close()
         except Exception:

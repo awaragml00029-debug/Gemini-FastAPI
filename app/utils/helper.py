@@ -6,6 +6,7 @@ import re
 import reprlib
 import struct
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -205,40 +206,81 @@ async def save_file_to_tempfile(
     file_in_base64: str | bytes, file_name: str = "", tempdir: Path | None = None
 ) -> Path:
     """Decode base64 file data and save to a temporary file."""
+    started = time.perf_counter()
+    input_size = len(file_in_base64)
+    decoded = base64.b64decode(file_in_base64)
     with tempfile.NamedTemporaryFile(
         delete=False, suffix=Path(file_name).suffix if file_name else ".bin", dir=tempdir
     ) as tmp:
-        tmp.write(base64.b64decode(file_in_base64))
+        tmp.write(decoded)
         path = Path(tmp.name)
+    logger.info(
+        "Saved base64 upload to temp file: filename={}, input_bytes={}, decoded_bytes={}, path={}, elapsed={:.3f}s",
+        file_name or "<none>",
+        input_size,
+        len(decoded),
+        path,
+        time.perf_counter() - started,
+    )
     return path
 
 
 async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
     """Download content from a URL and save to a temporary file."""
+    started = time.perf_counter()
     data: bytes | None = None
     suffix: str | None = None
+    source = "data_url" if url.startswith("data:") else "remote_url"
     if url.startswith("data:"):
-        metadata_part = url.split(",")[0]
+        decode_started = time.perf_counter()
+        metadata_part, encoded_data = url.split(",", 1)
         mime_type = metadata_part.split(":")[1].split(";")[0]
-        data = base64.b64decode(url.split(",")[1])
+        data = base64.b64decode(encoded_data)
         suffix = mimetypes.guess_extension(mime_type) or (
             f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
         )
+        logger.info(
+            "Decoded image data URL: mime_type={}, encoded_bytes={}, decoded_bytes={}, elapsed={:.3f}s",
+            mime_type,
+            len(encoded_data),
+            len(data),
+            time.perf_counter() - decode_started,
+        )
     else:
+        download_started = time.perf_counter()
         async with requests.AsyncSession(
             impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.V3
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             data = resp.content
-            if content_type := resp.headers.get("content-type"):
+            content_type = resp.headers.get("content-type")
+            if content_type:
                 suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
             if not suffix:
                 suffix = Path(urlparse(url).path).suffix or ".bin"
+            logger.info(
+                "Downloaded upload URL: url={}, status_code={}, content_type={}, bytes={}, elapsed={:.3f}s",
+                reprlib.repr(url),
+                resp.status_code,
+                content_type,
+                len(data),
+                time.perf_counter() - download_started,
+            )
 
+    write_started = time.perf_counter()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
         tmp.write(data)
         path = Path(tmp.name)
+    logger.info(
+        "Saved URL upload to temp file: source={}, suffix={}, bytes={}, path={}, write_elapsed={:.3f}s,total_elapsed={:.3f}s",
+        source,
+        suffix,
+        len(data),
+        path,
+        time.perf_counter() - write_started,
+        time.perf_counter() - started,
+    )
     return path
 
 

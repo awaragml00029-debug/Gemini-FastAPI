@@ -3,8 +3,10 @@ import base64
 import hashlib
 import io
 import reprlib
+import time
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -80,6 +82,8 @@ from app.utils.helper import (
 )
 
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
+INPUT_PREPROCESS_TIMEOUT_SECONDS = min(float(g_config.gemini.timeout), 60.0)
+STREAM_CHUNK_HEARTBEAT_SECONDS = 5.0
 
 router = APIRouter()
 _AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
@@ -1026,26 +1030,128 @@ async def _find_reusable_session(
     return None, None, messages
 
 
+async def _process_conversation_with_timeout(
+    messages: list[AppMessage], tmp_dir: Path
+) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
+    return await asyncio.wait_for(
+        GeminiClientWrapper.process_conversation(messages, tmp_dir),
+        timeout=INPUT_PREPROCESS_TIMEOUT_SECONDS,
+    )
+
+
+async def _stream_with_idle_timeout(
+    generator: AsyncGenerator[ModelOutput], timeout: float
+) -> AsyncGenerator[ModelOutput | None]:
+    pending: asyncio.Task[ModelOutput] | None = None
+    loop = asyncio.get_running_loop()
+
+    try:
+        while True:
+            pending = asyncio.create_task(anext(generator))
+            started_at = loop.time()
+
+            while True:
+                remaining = timeout - (loop.time() - started_at)
+                if remaining <= 0:
+                    pending.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await pending
+                    raise TimeoutError("Timed out waiting for Gemini stream chunk")
+
+                done, _ = await asyncio.wait(
+                    {pending},
+                    timeout=min(STREAM_CHUNK_HEARTBEAT_SECONDS, remaining),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    yield None
+                    continue
+
+                try:
+                    yield pending.result()
+                except StopAsyncIteration:
+                    return
+                pending = None
+                break
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+        with suppress(Exception):
+            await generator.aclose()
+
+
+async def _log_stream_timing(
+    generator: AsyncGenerator[ModelOutput],
+    started: float,
+    text_chars: int,
+    file_count: int,
+    large_text_attachment: bool,
+) -> AsyncGenerator[ModelOutput | None]:
+    try:
+        async for chunk in _stream_with_idle_timeout(generator, float(g_config.gemini.timeout)):
+            yield chunk
+    except Exception:
+        logger.exception(
+            "Gemini stream request failed: text_chars={}, files={}, large_text_attachment={}, elapsed={:.3f}s",
+            text_chars,
+            file_count,
+            large_text_attachment,
+            time.perf_counter() - started,
+        )
+        raise
+    finally:
+        logger.info(
+            "Gemini stream request finished: text_chars={}, files={}, large_text_attachment={}, elapsed={:.3f}s",
+            text_chars,
+            file_count,
+            large_text_attachment,
+            time.perf_counter() - started,
+        )
+
+
 async def _send_with_split(
     session: ChatSession,
     text: str,
     files: list[Any] | None = None,
     stream: bool = False,
-) -> AsyncGenerator[ModelOutput] | ModelOutput:
+) -> AsyncGenerator[ModelOutput | None] | ModelOutput:
     """Send text to Gemini with configured generation options, using an attachment if too long."""
+    started = time.perf_counter()
+    file_count = len(files) if files else 0
     if len(text) <= MAX_CHARS_PER_REQUEST:
         try:
+            logger.info(
+                "Sending request to Gemini: text_chars={}, files={}, stream={}, extended_thinking={}",
+                len(text),
+                file_count,
+                stream,
+                g_config.gemini.extended_thinking,
+            )
             if stream:
-                return session.send_message_stream(
+                generator = session.send_message_stream(
                     text,
                     files=files,
                     extended_thinking=g_config.gemini.extended_thinking,
                 )
-            return await session.send_message(
-                text,
-                files=files,
-                extended_thinking=g_config.gemini.extended_thinking,
+                return _log_stream_timing(generator, started, len(text), file_count, False)
+            response = await asyncio.wait_for(
+                session.send_message(
+                    text,
+                    files=files,
+                    extended_thinking=g_config.gemini.extended_thinking,
+                ),
+                timeout=float(g_config.gemini.timeout),
             )
+            logger.info(
+                "Gemini request finished: text_chars={}, files={}, stream={}, elapsed={:.3f}s",
+                len(text),
+                file_count,
+                stream,
+                time.perf_counter() - started,
+            )
+            return response
         except Exception as e:
             logger.error(f"Error sending message to Gemini: {e}")
             raise
@@ -1058,6 +1164,7 @@ async def _send_with_split(
     try:
         final_files: list[Any] = list(files) if files else []
         final_files.insert(0, file_obj)
+        final_file_count = len(final_files)
         instruction = (
             "The user's input exceeds the character limit and is provided in the attached file `message.txt`.\n\n"
             "**System Instruction:**\n"
@@ -1065,20 +1172,60 @@ async def _send_with_split(
             "2. Treat that content as the **primary** user prompt for this turn.\n"
             "3. Execute the instructions or answer the questions found *inside* that file immediately.\n"
         )
+        logger.info(
+            "Sending large request to Gemini: original_text_chars={}, files={}, stream={}, extended_thinking={}",
+            len(text),
+            final_file_count,
+            stream,
+            g_config.gemini.extended_thinking,
+        )
         if stream:
-            return session.send_message_stream(
+            generator = session.send_message_stream(
                 instruction,
                 files=final_files,
                 extended_thinking=g_config.gemini.extended_thinking,
             )
-        return await session.send_message(
-            instruction,
-            files=final_files,
-            extended_thinking=g_config.gemini.extended_thinking,
+            return _log_stream_timing(generator, started, len(text), final_file_count, True)
+        response = await asyncio.wait_for(
+            session.send_message(
+                instruction,
+                files=final_files,
+                extended_thinking=g_config.gemini.extended_thinking,
+            ),
+            timeout=float(g_config.gemini.timeout),
         )
+        logger.info(
+            "Gemini large request finished: original_text_chars={}, files={}, stream={}, elapsed={:.3f}s",
+            len(text),
+            final_file_count,
+            stream,
+            time.perf_counter() - started,
+        )
+        return response
     except Exception as e:
         logger.error(f"Error sending large text as file to Gemini: {e}")
         raise
+
+
+async def _send_stream_with_split(
+    client_wrapper: GeminiClientWrapper,
+    session: ChatSession,
+    text: str,
+    files: list[Any] | None = None,
+) -> AsyncGenerator[ModelOutput | None]:
+    async with client_wrapper.request_scope():
+        result = await _send_with_split(session, text, files=files, stream=True)
+        if isinstance(result, ModelOutput):
+            yield result
+            return
+
+        generator = cast(AsyncGenerator[ModelOutput | None], result)
+        try:
+            async for chunk in generator:
+                yield chunk
+        finally:
+            with suppress(Exception):
+                await generator.aclose()
 
 
 class StreamingOutputFilter:
@@ -1212,7 +1359,7 @@ async def _process_media_item(
 
 
 def _create_real_streaming_response(
-    resp_or_stream: AsyncGenerator[ModelOutput] | ModelOutput,
+    resp_or_stream: AsyncGenerator[ModelOutput | None] | ModelOutput,
     completion_id: str,
     created_time: int,
     model_name: str,
@@ -1260,6 +1407,9 @@ def _create_real_streaming_response(
                 generator = _make_async_gen(cast(ModelOutput, resp_or_stream))
 
             async for chunk in generator:
+                if chunk is None:
+                    yield ": ping\n\n"
+                    continue
                 all_outputs.append(chunk)
                 if not has_started:
                     yield make_chunk(
@@ -1465,7 +1615,7 @@ def _create_real_streaming_response(
 
 
 def _create_responses_real_streaming_response(
-    resp_or_stream: AsyncGenerator[ModelOutput] | ModelOutput,
+    resp_or_stream: AsyncGenerator[ModelOutput | None] | ModelOutput,
     response_id: str,
     created_time: int,
     model_name: str,
@@ -1563,6 +1713,9 @@ def _create_responses_real_streaming_response(
                 generator = _make_async_gen(cast(ModelOutput, resp_or_stream))
 
             async for chunk in generator:
+                if chunk is None:
+                    yield ": ping\n\n"
+                    continue
                 all_outputs.append(chunk)
 
                 if chunk.thoughts_delta:
@@ -2318,7 +2471,7 @@ async def create_chat_completion(
             extra_instr,
             False,
         )
-        m_input, files = await GeminiClientWrapper.process_conversation(input_msgs, tmp_dir)
+        m_input, files = await _process_conversation_with_timeout(input_msgs, tmp_dir)
 
         logger.debug(
             f"Reused session {reprlib.repr(session.metadata)} - sending {len(input_msgs)} prepared messages."
@@ -2327,7 +2480,7 @@ async def create_chat_completion(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model)
-            m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
@@ -2342,10 +2495,16 @@ async def create_chat_completion(
         logger.debug(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
-        resp_or_stream = await _send_with_split(
-            session, m_input, files=files, stream=bool(request.stream)
-        )
+        if request.stream:
+            resp_or_stream = _send_stream_with_split(client, session, m_input, files=files)
+        else:
+            async with client.request_scope():
+                resp_or_stream = await _send_with_split(
+                    session, m_input, files=files, stream=False
+                )
     except Exception as e:
+        if client:
+            client.mark_unavailable()
         logger.error(f"Gemini API error: {e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
@@ -2390,7 +2549,13 @@ async def create_chat_completion(
     tasks = [_process_image_item(img) for img in images] + [
         _process_media_item(m) for m in unique_media
     ]
-    results = await asyncio.gather(*tasks)
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks), timeout=float(g_config.gemini.timeout)
+        )
+    except TimeoutError:
+        logger.warning("Timed out waiting for generated media processing.")
+        results = []
 
     image_markdown = ""
     media_markdown = ""
@@ -2561,7 +2726,7 @@ async def create_response(
         )
         if not msgs:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No new messages.")
-        m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
+        m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
         logger.debug(
             f"Reused session {reprlib.repr(session.metadata)} - sending {len(msgs)} prepared messages."
         )
@@ -2569,7 +2734,7 @@ async def create_response(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model)
-            m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
+            m_input, files = await _process_conversation_with_timeout(messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
@@ -2584,10 +2749,16 @@ async def create_response(
         logger.debug(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
-        resp_or_stream = await _send_with_split(
-            session, m_input, files=files, stream=bool(request.stream)
-        )
+        if request.stream:
+            resp_or_stream = _send_stream_with_split(client, session, m_input, files=files)
+        else:
+            async with client.request_scope():
+                resp_or_stream = await _send_with_split(
+                    session, m_input, files=files, stream=False
+                )
     except Exception as e:
+        if client:
+            client.mark_unavailable()
         logger.error(f"Gemini API error: {e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
@@ -2633,7 +2804,13 @@ async def create_response(
     tasks = [_process_image_item(img) for img in images] + [
         _process_media_item(m) for m in unique_media
     ]
-    results = await asyncio.gather(*tasks)
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks), timeout=float(g_config.gemini.timeout)
+        )
+    except TimeoutError:
+        logger.warning("Timed out waiting for generated media processing.")
+        results = []
 
     contents, img_calls = [], []
     seen_hashes = {}
