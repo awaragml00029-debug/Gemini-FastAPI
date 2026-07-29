@@ -1,6 +1,6 @@
 import hashlib
 import string
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -530,7 +530,7 @@ class LMDBConversationStore(metaclass=Singleton):
 
         return removed
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self) -> Mapping[str, Any]:
         """Get database statistics."""
         if not self._env:
             logger.error("LMDB environment not initialized")

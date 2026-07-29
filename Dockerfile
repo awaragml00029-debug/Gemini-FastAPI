@@ -16,11 +16,13 @@ ENV UV_COMPILE_BYTECODE=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --no-cache --frozen --no-install-project --no-dev
+RUN uv sync --refresh --frozen --no-install-project --no-dev
 
 COPY app/ app/
 COPY config/ config/
 COPY run.py .
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
 
@@ -29,4 +31,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-CMD ["uv", "run", "--no-dev", "run.py"]
+CMD ["python", "run.py"]

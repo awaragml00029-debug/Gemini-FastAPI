@@ -457,7 +457,7 @@ def _convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppM
 
         app_messages.append(
             AppMessage(
-                role=role,  # type: ignore
+                role=role,
                 content=app_content,
                 tool_calls=tool_calls,
                 tool_call_id=msg.tool_call_id,
@@ -889,7 +889,7 @@ def _convert_instructions_to_app_messages(
         normalized_role = {"developer": "system", "function": "tool"}.get(raw_role, raw_role)
         if normalized_role not in ("system", "user", "assistant", "tool"):
             normalized_role = "system"
-        role = cast(Literal["system", "user", "assistant", "tool"], normalized_role)
+        role = normalized_role
 
         content = instruction.content
         if isinstance(content, str):

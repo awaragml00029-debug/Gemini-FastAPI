@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -448,8 +449,8 @@ class HealthCheckResponse(BaseModel):
     """Response body for the health check endpoint."""
 
     ok: bool
-    storage: dict[str, Any] | None = Field(default=None)
-    clients: dict[str, bool] | None = Field(default=None)
+    storage: Mapping[str, Any] | None = Field(default=None)
+    clients: Mapping[str, bool] | None = Field(default=None)
     error: str | None = Field(default=None)
 
 
