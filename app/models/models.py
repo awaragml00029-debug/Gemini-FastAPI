@@ -85,6 +85,21 @@ class ChatCompletionFunctionTool(BaseModel):
     type: Literal["function"]
     function: FunctionDefinition
 
+    @model_validator(mode="before")
+    @classmethod
+    def _nest_flat_function(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "function" not in data and "name" in data:
+            return {
+                "type": data.get("type", "function"),
+                "function": {
+                    "name": data.get("name"),
+                    "description": data.get("description"),
+                    "parameters": data.get("parameters"),
+                    "strict": data.get("strict"),
+                },
+            }
+        return data
+
 
 class ChatCompletionNamedToolChoiceFunction(BaseModel):
     name: str
@@ -230,6 +245,19 @@ class FunctionTool(BaseModel):
     description: str | None = Field(default=None)
     parameters: dict[str, Any] | None = Field(default=None)
     strict: bool | None = Field(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_nested_function(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "function" in data and isinstance(data["function"], dict):
+            fn = data["function"]
+            res = dict(data)
+            res.setdefault("name", fn.get("name"))
+            res.setdefault("description", fn.get("description"))
+            res.setdefault("parameters", fn.get("parameters"))
+            res.setdefault("strict", fn.get("strict"))
+            return res
+        return data
 
 
 class ImageGeneration(BaseModel):
@@ -394,7 +422,9 @@ class ResponseCreateRequest(BaseModel):
     tool_choice: (
         Literal["none", "auto", "required"] | ToolChoiceFunction | ToolChoiceTypes | None
     ) = Field(default=None)
-    tools: list[FunctionTool | ImageGeneration] | None = Field(default=None)
+    tools: list[FunctionTool | ChatCompletionFunctionTool | ImageGeneration] | None = Field(
+        default=None
+    )
     store: bool | None = Field(default=None)
     prompt_cache_key: str | None = Field(default=None)
     response_format: dict[str, Any] | None = Field(default=None)
@@ -422,7 +452,9 @@ class ResponseCreateResponse(BaseModel):
     tool_choice: (
         Literal["none", "auto", "required"] | ToolChoiceFunction | ToolChoiceTypes | None
     ) = Field(default=None)
-    tools: list[FunctionTool | ImageGeneration] = Field(default_factory=list)
+    tools: list[FunctionTool | ChatCompletionFunctionTool | ImageGeneration] = Field(
+        default_factory=list
+    )
     usage: ResponseUsage | None = Field(default=None)
     error: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] = Field(default_factory=dict)

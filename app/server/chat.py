@@ -4,7 +4,7 @@ import hashlib
 import io
 import reprlib
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +26,6 @@ from app.models import (
     AppToolCall,
     AppToolCallFunction,
     ChatCompletionChoice,
-    ChatCompletionFunctionTool,
     ChatCompletionMessage,
     ChatCompletionMessageToolCall,
     ChatCompletionNamedToolChoice,
@@ -396,11 +395,23 @@ def _process_llm_output(
     return thoughts, visible_output, storage_output, tool_calls
 
 
+def _normalize_app_message_role(role_name: str) -> Literal["system", "user", "assistant", "tool"]:
+    """Normalize and validate input role string to a valid AppMessage role."""
+    mapped = {"developer": "system", "function": "tool"}.get(role_name, role_name)
+    if mapped == "user":
+        return "user"
+    if mapped == "assistant":
+        return "assistant"
+    if mapped == "tool":
+        return "tool"
+    return "system"
+
+
 def _convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppMessage]:
-    """Convert ChatCompletionMessage (OpenAI format) to generic internal AppMessage."""
-    app_messages = []
+    """Convert OpenAI ChatCompletionMessage list into AppMessage format."""
+    app_messages: list[AppMessage] = []
     for msg in messages:
-        app_content = None
+        app_content: str | list[AppContentItem] | None = None
         if isinstance(msg.content, str):
             app_content = msg.content
         elif isinstance(msg.content, list):
@@ -411,11 +422,7 @@ def _convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppM
                 elif item.type == "image_url":
                     media_dict = getattr(item, "image_url", None)
                     url = media_dict.get("url") if media_dict else None
-                    if url and url.startswith("data:"):
-                        # image_url can be either a regular url or base64 data url
-                        app_content.append(AppContentItem(type="image_url", url=url))
-                    else:
-                        app_content.append(AppContentItem(type="image_url", url=url))
+                    app_content.append(AppContentItem(type="image_url", url=url))
                 elif item.type == "file":
                     file_dict = getattr(item, "file", None)
                     filename = file_dict.get("filename") if file_dict else None
@@ -451,9 +458,7 @@ def _convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppM
                 for tc in msg.tool_calls
             ]
 
-        role = {"developer": "system", "function": "tool"}.get(msg.role, msg.role)
-        if role not in ("system", "user", "assistant", "tool"):
-            role = "system"
+        role = _normalize_app_message_role(msg.role)
 
         app_messages.append(
             AppMessage(
@@ -552,8 +557,55 @@ def _build_structured_requirement(
     )
 
 
+def _extract_tool_info(tool: Any) -> tuple[str, str, dict[str, Any] | None]:
+    """Extract (name, description, parameters) from any tool representation."""
+    if hasattr(tool, "function") and tool.function is not None:
+        fn = tool.function
+        if isinstance(fn, dict):
+            name = fn.get("name", "")
+            description = fn.get("description") or "No description provided."
+            parameters = fn.get("parameters")
+        else:
+            name = getattr(fn, "name", "")
+            description = getattr(fn, "description", None) or "No description provided."
+            parameters = getattr(fn, "parameters", None)
+        return name, description, parameters
+
+    if isinstance(tool, dict):
+        if "function" in tool and isinstance(tool["function"], dict):
+            fn = tool["function"]
+            return (
+                fn.get("name", ""),
+                fn.get("description") or "No description provided.",
+                fn.get("parameters"),
+            )
+        return (
+            tool.get("name", ""),
+            tool.get("description") or "No description provided.",
+            tool.get("parameters"),
+        )
+
+    name = getattr(tool, "name", "")
+    description = getattr(tool, "description", None) or "No description provided."
+    parameters = getattr(tool, "parameters", None)
+    return name, description, parameters
+
+
+def _extract_named_tool_choice(tool_choice: Any) -> str | None:
+    """Extract target function name from any named tool choice representation."""
+    if isinstance(tool_choice, ChatCompletionNamedToolChoice):
+        return tool_choice.function.name
+    if isinstance(tool_choice, ToolChoiceFunction):
+        return tool_choice.name
+    if isinstance(tool_choice, dict):
+        if "function" in tool_choice and isinstance(tool_choice["function"], dict):
+            return tool_choice["function"].get("name")
+        return tool_choice.get("name")
+    return None
+
+
 def _build_tool_prompt(
-    tools: list[ChatCompletionFunctionTool],
+    tools: Sequence[Any],
     tool_choice: (
         Literal["none", "auto", "required"]
         | ChatCompletionNamedToolChoice
@@ -571,13 +623,12 @@ def _build_tool_prompt(
     ]
 
     for tool in tools:
-        function = tool.function
-        description = function.description or "No description provided."
-        lines.append(f"Tool `{function.name}`: {description}")
-        if function.parameters:
-            schema_text = orjson.dumps(function.parameters, option=orjson.OPT_SORT_KEYS).decode(
-                "utf-8"
-            )
+        name, description, parameters = _extract_tool_info(tool)
+        if not name:
+            continue
+        lines.append(f"Tool `{name}`: {description}")
+        if parameters:
+            schema_text = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS).decode("utf-8")
             lines.extend(("Arguments JSON schema:", schema_text))
         else:
             lines.append("Arguments JSON schema: {}")
@@ -590,10 +641,9 @@ def _build_tool_prompt(
         lines.append(
             "You must call at least one tool before responding to the user. Do not provide a final user-facing answer until a tool call has been issued."
         )
-    elif isinstance(tool_choice, ChatCompletionNamedToolChoice):
-        target = tool_choice.function.name
+    elif (target_name := _extract_named_tool_choice(tool_choice)) is not None:
         lines.append(
-            f"You are required to call the tool named `{target}`. Do not call any other tool."
+            f"You are required to call the tool named `{target_name}`. Do not call any other tool."
         )
 
     lines.append(TOOL_WRAP_HINT)
@@ -656,7 +706,7 @@ def _append_tool_hint_to_last_user_message(messages: list[AppMessage]) -> None:
 
 def _prepare_messages_for_model(
     source_messages: list[AppMessage],
-    tools: list[ChatCompletionFunctionTool] | None,
+    tools: Sequence[Any] | None,
     tool_choice: Literal["none", "auto", "required"]
     | ChatCompletionNamedToolChoice
     | ToolChoiceFunction
@@ -885,11 +935,7 @@ def _convert_instructions_to_app_messages(
         if instruction.type and instruction.type != "message":
             continue
 
-        raw_role = instruction.role
-        normalized_role = {"developer": "system", "function": "tool"}.get(raw_role, raw_role)
-        if normalized_role not in ("system", "user", "assistant", "tool"):
-            normalized_role = "system"
-        role = normalized_role
+        role = _normalize_app_message_role(instruction.role)
 
         content = instruction.content
         if isinstance(content, str):
@@ -2556,7 +2602,7 @@ async def create_response(
     if session:
         msgs = _prepare_messages_for_model(
             remain,
-            request.tools,  # type: ignore
+            request.tools,
             request.tool_choice,
             None,
             False,
