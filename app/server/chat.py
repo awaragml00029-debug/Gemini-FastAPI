@@ -467,10 +467,7 @@ def _convert_responses_to_app_messages(
     for item in items:
         if isinstance(item, (ResponseInputMessage, ResponseOutputMessage)):
             raw_role = getattr(item, "role", "user")
-            normalized_role = {"developer": "system", "function": "tool"}.get(raw_role, raw_role)
-            if normalized_role not in ("system", "user", "assistant", "tool"):
-                normalized_role = "system"
-            role = cast(Literal["system", "user", "assistant", "tool"], normalized_role)
+            role = normalize_app_message_role(raw_role)
 
             content = item.content
             if isinstance(content, str):
@@ -558,12 +555,7 @@ def _convert_responses_to_app_messages(
         else:
             if hasattr(item, "role"):
                 raw_role = getattr(item, "role", "user")
-                normalized_role = {"developer": "system", "function": "tool"}.get(
-                    raw_role, raw_role
-                )
-                if normalized_role not in ("system", "user", "assistant", "tool"):
-                    normalized_role = "system"
-                role = cast(Literal["system", "user", "assistant", "tool"], normalized_role)
+                role = normalize_app_message_role(raw_role)
                 messages.append(
                     AppMessage(
                         role=role,

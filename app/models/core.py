@@ -24,8 +24,11 @@ class AppContentItem(BaseModel):
     raw_data: dict[str, Any] | None = None
 
 
+type AppMessageRole = Literal["system", "user", "assistant", "tool"]
+
+
 class AppMessage(BaseModel):
-    role: Literal["system", "user", "assistant", "tool"]
+    role: AppMessageRole
     name: str | None = None
     content: str | list[AppContentItem] | None = None
     tool_calls: list[AppToolCall] | None = None

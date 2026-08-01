@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from app.models import (
     AppContentItem,
     AppMessage,
+    AppMessageRole,
     AppToolCall,
     AppToolCallFunction,
     ChatCompletionMessage,
@@ -239,7 +240,7 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
         )
     else:
         async with requests.AsyncSession(
-            impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.V3
+            impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.NONE
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
@@ -519,16 +520,17 @@ def calculate_usage(
     )
 
 
-def normalize_app_message_role(role_name: str) -> Literal["system", "user", "assistant", "tool"]:
+def normalize_app_message_role(role_name: str) -> AppMessageRole:
     """Normalize and validate input role string to a valid AppMessage role."""
-    mapped = {"developer": "system", "function": "tool"}.get(role_name, role_name)
-    if mapped == "user":
-        return "user"
-    if mapped == "assistant":
-        return "assistant"
-    if mapped == "tool":
-        return "tool"
-    return "system"
+    roles: dict[str, AppMessageRole] = {
+        "developer": "system",
+        "function": "tool",
+        "user": "user",
+        "assistant": "assistant",
+        "tool": "tool",
+        "system": "system",
+    }
+    return roles.get(role_name, "system")
 
 
 def convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppMessage]:
@@ -634,11 +636,17 @@ def process_llm_output(
     visible_output = visible_output.strip()
     storage_output = visible_output
 
-    if structured_requirement and visible_output:
-        canonical_output = canonicalize_structured_output(visible_output, structured_requirement)
-        if canonical_output:
-            visible_output = canonical_output
-            storage_output = canonical_output
+    if (
+        structured_requirement
+        and visible_output
+        and (
+            canonical_output := canonicalize_structured_output(
+                visible_output, structured_requirement
+            )
+        )
+    ):
+        visible_output = canonical_output
+        storage_output = canonical_output
 
     return thoughts, visible_output, storage_output, tool_calls
 
