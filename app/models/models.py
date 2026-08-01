@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+
+@dataclass
+class StructuredOutputRequirement:
+    """Represents a structured response request from the client."""
+
+    schema_name: str
+    schema: dict[str, Any]
+    instruction: str
+    raw_format: dict[str, Any]
 
 
 class FunctionCall(BaseModel):
@@ -450,11 +461,13 @@ class ResponseCreateResponse(BaseModel):
         Field(default="completed")
     )
     tool_choice: (
-        Literal["none", "auto", "required"] | ToolChoiceFunction | ToolChoiceTypes | None
+        Literal["none", "auto", "required"]
+        | ToolChoiceFunction
+        | ToolChoiceTypes
+        | dict[str, Any]
+        | None
     ) = Field(default=None)
-    tools: list[FunctionTool | ChatCompletionFunctionTool | ImageGeneration] = Field(
-        default_factory=list
-    )
+    tools: list[dict[str, Any]] = Field(default_factory=list)
     usage: ResponseUsage | None = Field(default=None)
     error: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] = Field(default_factory=dict)

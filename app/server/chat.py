@@ -5,7 +5,6 @@ import io
 import reprlib
 import uuid
 from collections.abc import AsyncGenerator, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -50,6 +49,7 @@ from app.models import (
     ResponseReasoningItem,
     ResponseTextConfig,
     ResponseUsage,
+    StructuredOutputRequirement,
     SummaryTextContent,
     ToolChoiceFunction,
     ToolChoiceTypes,
@@ -66,16 +66,20 @@ from app.utils.helper import (
     STREAM_MASTER_RE,
     STREAM_TAIL_RE,
     STRUCTURED_JSON_WRAP_HINT,
-    TOOL_HINT_STRIPPED,
-    TOOL_WRAP_HINT,
+    append_tool_hint_to_last_user_message,
+    build_image_generation_instruction,
+    build_tool_prompt,
+    calculate_usage,
+    convert_to_app_messages,
     detect_image_extension,
-    estimate_tokens,
+    dump_model,
     extract_image_dimensions,
-    extract_tool_calls,
+    normalize_app_message_role,
     normalize_llm_text,
-    strip_markdown_fence,
+    process_llm_output,
+    serialize_tool_choice_for_response,
+    serialize_tools_for_response,
     strip_system_hints,
-    text_from_message,
 )
 
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
@@ -83,16 +87,6 @@ MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
 router = APIRouter()
 _AVAILABLE_MODELS_CACHE: list[ModelData] | None = None
 _AVAILABLE_MODELS_CACHE_LOCK = asyncio.Lock()
-
-
-@dataclass
-class StructuredOutputRequirement:
-    """Represents a structured response request from the client."""
-
-    schema_name: str
-    schema: dict[str, Any]
-    instruction: str
-    raw_format: dict[str, Any]
 
 
 type ProcessedImageData = tuple[str, int | None, int | None, str, str]
@@ -197,37 +191,6 @@ async def _media_to_local_file(
     return results
 
 
-def _calculate_usage(
-    messages: list[AppMessage],
-    assistant_text: str | None,
-    tool_calls: list[AppToolCall] | None,
-    thoughts: str | None = None,
-) -> tuple[int, int, int, int]:
-    """Calculate prompt, completion, total and reasoning tokens consistently."""
-    prompt_tokens = sum(estimate_tokens(text_from_message(msg)) for msg in messages)
-    tool_args_text = ""
-    if tool_calls:
-        for call in tool_calls:
-            tool_args_text += call.function.arguments or ""
-
-    completion_basis = assistant_text or ""
-    if tool_args_text:
-        completion_basis = (
-            f"{completion_basis}\n{tool_args_text}" if completion_basis else tool_args_text
-        )
-
-    completion_tokens = estimate_tokens(completion_basis)
-    reasoning_tokens = estimate_tokens(thoughts) if thoughts else 0
-    total_completion_tokens = completion_tokens + reasoning_tokens
-
-    return (
-        prompt_tokens,
-        total_completion_tokens,
-        prompt_tokens + total_completion_tokens,
-        reasoning_tokens,
-    )
-
-
 def _create_responses_standard_payload(
     response_id: str,
     created_time: int,
@@ -298,8 +261,8 @@ def _create_responses_standard_payload(
         status="completed",
         usage=usage,
         metadata=request.metadata or {},
-        tools=request.tools or [],
-        tool_choice=request.tool_choice if request.tool_choice is not None else "auto",
+        tools=serialize_tools_for_response(request.tools),
+        tool_choice=serialize_tool_choice_for_response(request.tool_choice),
         text=text_config,
     )
 
@@ -347,130 +310,6 @@ def _create_chat_completion_standard_payload(
         ],
         usage=CompletionUsage(**usage),
     )
-
-
-def _canonicalize_structured_output(
-    visible_output: str, structured_requirement: StructuredOutputRequirement
-) -> str | None:
-    """Parse raw or fenced structured JSON and return its canonical JSON representation."""
-    candidate = strip_markdown_fence(visible_output)
-    try:
-        structured_payload = orjson.loads(candidate)
-    except orjson.JSONDecodeError:
-        logger.warning(
-            f"Failed to decode JSON for structured response (schema={structured_requirement.schema_name})."
-        )
-        return None
-
-    canonical_output = orjson.dumps(structured_payload).decode("utf-8")
-    logger.debug(f"Structured response fulfilled (schema={structured_requirement.schema_name}).")
-    return canonical_output
-
-
-def _process_llm_output(
-    thoughts: str | None,
-    raw_text: str,
-    structured_requirement: StructuredOutputRequirement | None,
-) -> tuple[str | None, str, str, list[AppToolCall]]:
-    """
-    Post-process Gemini output to extract tool calls, unwrap structured JSON fences, and prepare clean text for display and storage.
-    Returns: (thoughts, visible_text, storage_output, tool_calls)
-    """
-    if thoughts:
-        thoughts = thoughts.strip()
-
-    visible_output, tool_calls = extract_tool_calls(raw_text)
-    if tool_calls:
-        logger.debug(f"Detected {len(tool_calls)} tool call(s) in model output.")
-
-    visible_output = visible_output.strip()
-    storage_output = visible_output
-
-    if structured_requirement and visible_output:
-        canonical_output = _canonicalize_structured_output(visible_output, structured_requirement)
-        if canonical_output:
-            visible_output = canonical_output
-            storage_output = canonical_output
-
-    return thoughts, visible_output, storage_output, tool_calls
-
-
-def _normalize_app_message_role(role_name: str) -> Literal["system", "user", "assistant", "tool"]:
-    """Normalize and validate input role string to a valid AppMessage role."""
-    mapped = {"developer": "system", "function": "tool"}.get(role_name, role_name)
-    if mapped == "user":
-        return "user"
-    if mapped == "assistant":
-        return "assistant"
-    if mapped == "tool":
-        return "tool"
-    return "system"
-
-
-def _convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppMessage]:
-    """Convert OpenAI ChatCompletionMessage list into AppMessage format."""
-    app_messages: list[AppMessage] = []
-    for msg in messages:
-        app_content: str | list[AppContentItem] | None = None
-        if isinstance(msg.content, str):
-            app_content = msg.content
-        elif isinstance(msg.content, list):
-            app_content = []
-            for item in msg.content:
-                if item.type == "text":
-                    app_content.append(AppContentItem(type="text", text=item.text))
-                elif item.type == "image_url":
-                    media_dict = getattr(item, "image_url", None)
-                    url = media_dict.get("url") if media_dict else None
-                    app_content.append(AppContentItem(type="image_url", url=url))
-                elif item.type == "file":
-                    file_dict = getattr(item, "file", None)
-                    filename = file_dict.get("filename") if file_dict else None
-                    file_data = file_dict.get("file_data") if file_dict else None
-                    app_content.append(
-                        AppContentItem(type="file", filename=filename, file_data=file_data)
-                    )
-                elif item.type == "input_audio":
-                    audio_dict = getattr(item, "input_audio", None)
-                    audio_data = audio_dict.get("data") if audio_dict else None
-                    app_content.append(
-                        AppContentItem(
-                            type="input_audio",
-                            file_data=audio_data,
-                            raw_data=audio_dict,
-                        )
-                    )
-                elif item.type in ("refusal", "reasoning"):
-                    text_val = getattr(item, "text", None) or getattr(item, item.type, None)
-                    app_content.append(AppContentItem(type=item.type, text=text_val))
-
-        tool_calls = None
-        if msg.tool_calls:
-            tool_calls = [
-                AppToolCall(
-                    id=tc.id,
-                    type="function",
-                    function=AppToolCallFunction(
-                        name=tc.function.name,
-                        arguments=tc.function.arguments,
-                    ),
-                )
-                for tc in msg.tool_calls
-            ]
-
-        role = _normalize_app_message_role(msg.role)
-
-        app_messages.append(
-            AppMessage(
-                role=role,
-                content=app_content,
-                tool_calls=tool_calls,
-                tool_call_id=msg.tool_call_id,
-                name=msg.name,
-                reasoning_content=getattr(msg, "reasoning_content", None),
-            )
-        )
-    return app_messages
 
 
 def _persist_conversation(
@@ -557,153 +396,6 @@ def _build_structured_requirement(
     )
 
 
-def _extract_tool_info(tool: Any) -> tuple[str, str, dict[str, Any] | None]:
-    """Extract (name, description, parameters) from any tool representation."""
-    if hasattr(tool, "function") and tool.function is not None:
-        fn = tool.function
-        if isinstance(fn, dict):
-            name = fn.get("name", "")
-            description = fn.get("description") or "No description provided."
-            parameters = fn.get("parameters")
-        else:
-            name = getattr(fn, "name", "")
-            description = getattr(fn, "description", None) or "No description provided."
-            parameters = getattr(fn, "parameters", None)
-        return name, description, parameters
-
-    if isinstance(tool, dict):
-        if "function" in tool and isinstance(tool["function"], dict):
-            fn = tool["function"]
-            return (
-                fn.get("name", ""),
-                fn.get("description") or "No description provided.",
-                fn.get("parameters"),
-            )
-        return (
-            tool.get("name", ""),
-            tool.get("description") or "No description provided.",
-            tool.get("parameters"),
-        )
-
-    name = getattr(tool, "name", "")
-    description = getattr(tool, "description", None) or "No description provided."
-    parameters = getattr(tool, "parameters", None)
-    return name, description, parameters
-
-
-def _extract_named_tool_choice(tool_choice: Any) -> str | None:
-    """Extract target function name from any named tool choice representation."""
-    if isinstance(tool_choice, ChatCompletionNamedToolChoice):
-        return tool_choice.function.name
-    if isinstance(tool_choice, ToolChoiceFunction):
-        return tool_choice.name
-    if isinstance(tool_choice, dict):
-        if "function" in tool_choice and isinstance(tool_choice["function"], dict):
-            return tool_choice["function"].get("name")
-        return tool_choice.get("name")
-    return None
-
-
-def _build_tool_prompt(
-    tools: Sequence[Any],
-    tool_choice: (
-        Literal["none", "auto", "required"]
-        | ChatCompletionNamedToolChoice
-        | ToolChoiceFunction
-        | ToolChoiceTypes
-        | None
-    ),
-) -> str:
-    """Generate a system prompt describing available tools and the PascalCase protocol."""
-    if not tools:
-        return ""
-
-    lines: list[str] = [
-        "SYSTEM INTERFACE: You have access to the following technical tools. You MUST invoke them when necessary to fulfill the request, strictly adhering to the provided JSON schemas."
-    ]
-
-    for tool in tools:
-        name, description, parameters = _extract_tool_info(tool)
-        if not name:
-            continue
-        lines.append(f"Tool `{name}`: {description}")
-        if parameters:
-            schema_text = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS).decode("utf-8")
-            lines.extend(("Arguments JSON schema:", schema_text))
-        else:
-            lines.append("Arguments JSON schema: {}")
-
-    if tool_choice == "none":
-        lines.append(
-            "For this request you must not call any tool. Provide the best possible natural language answer."
-        )
-    elif tool_choice == "required":
-        lines.append(
-            "You must call at least one tool before responding to the user. Do not provide a final user-facing answer until a tool call has been issued."
-        )
-    elif (target_name := _extract_named_tool_choice(tool_choice)) is not None:
-        lines.append(
-            f"You are required to call the tool named `{target_name}`. Do not call any other tool."
-        )
-
-    lines.append(TOOL_WRAP_HINT)
-
-    return "\n".join(lines)
-
-
-def _build_image_generation_instruction(
-    tools: list[ImageGeneration] | None,
-    tool_choice: ToolChoiceFunction | None,
-) -> str | None:
-    """Construct explicit guidance so Gemini emits images when requested."""
-    has_forced_choice = tool_choice is not None and tool_choice.type == "image_generation"
-    primary = tools[0] if tools else None
-
-    if not has_forced_choice and primary is None:
-        return None
-
-    instructions: list[str] = [
-        "IMAGE GENERATION ENABLED: When an image is requested, you MUST return a real generated image directly.",
-        "1. For new requests, generate new images matching the description immediately.",
-        "2. For edits to existing images, apply changes and return a new generated version.",
-        "3. CRITICAL: Provide ZERO text explanation, prologue, or apologies. Do not describe the creation process.",
-        "4. NEVER send placeholder text or descriptions like 'Generating image...' without an actual image attachment.",
-    ]
-
-    if has_forced_choice:
-        instructions.append(
-            "Image generation was explicitly requested. You MUST return at least one generated image. Any response without an image will be treated as a failure."
-        )
-
-    return "\n\n".join(instructions)
-
-
-def _append_tool_hint_to_last_user_message(messages: list[AppMessage]) -> None:
-    """Ensure the last user message carries the tool wrap hint."""
-    for msg in reversed(messages):
-        if msg.role != "user" or msg.content is None:
-            continue
-
-        if isinstance(msg.content, str):
-            if TOOL_HINT_STRIPPED not in msg.content:
-                msg.content = f"{msg.content}\n{TOOL_WRAP_HINT}"
-            return
-
-        if isinstance(msg.content, list):
-            for part in reversed(msg.content):
-                if getattr(part, "type", None) != "text":
-                    continue
-                text_value = getattr(part, "text", "") or ""
-                if TOOL_HINT_STRIPPED in text_value:
-                    return
-                part.text = f"{text_value}\n{TOOL_WRAP_HINT}"
-                return
-
-            messages_text = TOOL_WRAP_HINT.strip()
-            msg.content.append(AppContentItem(type="text", text=messages_text))
-            return
-
-
 def _prepare_messages_for_model(
     source_messages: list[AppMessage],
     tools: Sequence[Any] | None,
@@ -731,7 +423,7 @@ def _prepare_messages_for_model(
 
     instructions: list[str] = []
     tool_prompt_injected = False
-    if inject_system_defaults and tools and (tool_prompt := _build_tool_prompt(tools, tool_choice)):
+    if inject_system_defaults and tools and (tool_prompt := build_tool_prompt(tools, tool_choice)):
         instructions.append(tool_prompt)
         tool_prompt_injected = True
 
@@ -743,7 +435,7 @@ def _prepare_messages_for_model(
 
     if not instructions:
         if tools and tool_choice != "none" and not tool_prompt_injected:
-            _append_tool_hint_to_last_user_message(prepared)
+            append_tool_hint_to_last_user_message(prepared)
         return prepared
 
     combined_instructions = "\n\n".join(instructions)
@@ -756,7 +448,7 @@ def _prepare_messages_for_model(
         prepared.insert(0, AppMessage(role="system", content=combined_instructions))
 
     if tools and tool_choice != "none" and not tool_prompt_injected:
-        _append_tool_hint_to_last_user_message(prepared)
+        append_tool_hint_to_last_user_message(prepared)
 
     return prepared
 
@@ -935,7 +627,7 @@ def _convert_instructions_to_app_messages(
         if instruction.type and instruction.type != "message":
             continue
 
-        role = _normalize_app_message_role(instruction.role)
+        role = normalize_app_message_role(instruction.role)
 
         content = instruction.content
         if isinstance(content, str):
@@ -1371,7 +1063,7 @@ def _create_real_streaming_response(
         if not structured_requirement and (remaining_text := suppressor.flush()):
             yield make_chunk({"delta": {"content": remaining_text}, "finish_reason": None})
 
-        _, visible_output, storage_output, detected_tool_calls = _process_llm_output(
+        _, visible_output, storage_output, detected_tool_calls = process_llm_output(
             normalize_llm_text(full_thoughts or ""),
             normalize_llm_text(full_text or ""),
             structured_requirement,
@@ -1481,7 +1173,7 @@ def _create_real_streaming_response(
                     }
                 )
 
-        p_tok, c_tok, t_tok, r_tok = _calculate_usage(
+        p_tok, c_tok, t_tok, r_tok = calculate_usage(
             messages, storage_output, detected_tool_calls, full_thoughts
         )
         usage = CompletionUsage(
@@ -1503,7 +1195,7 @@ def _create_real_streaming_response(
             {
                 "delta": {},
                 "finish_reason": "tool_calls" if detected_tool_calls else "stop",
-                "usage": usage.model_dump(mode="json"),
+                "usage": dump_model(usage),
             }
         )
         yield "data: [DONE]\n\n"
@@ -1559,8 +1251,8 @@ def _create_responses_real_streaming_response(
                     "status": "in_progress",
                     "metadata": request.metadata or {},
                     "input": None,
-                    "tools": request.tools or [],
-                    "tool_choice": request.tool_choice or "auto",
+                    "tools": serialize_tools_for_response(request.tools),
+                    "tool_choice": serialize_tool_choice_for_response(request.tool_choice),
                     "output": [],
                     "usage": None,
                 },
@@ -1623,12 +1315,14 @@ def _create_responses_real_streaming_response(
                                 **base_event,
                                 "type": "response.output_item.added",
                                 "output_index": thought_index,
-                                "item": ResponseReasoningItem(
-                                    id=thought_item_id,
-                                    type="reasoning",
-                                    status="in_progress",
-                                    summary=[],
-                                ).model_dump(mode="json"),
+                                "item": dump_model(
+                                    ResponseReasoningItem(
+                                        id=thought_item_id,
+                                        type="reasoning",
+                                        status="in_progress",
+                                        summary=[],
+                                    )
+                                ),
                             },
                         )
 
@@ -1640,7 +1334,7 @@ def _create_responses_real_streaming_response(
                                 "item_id": thought_item_id,
                                 "output_index": thought_index,
                                 "summary_index": 0,
-                                "part": SummaryTextContent(text="").model_dump(mode="json"),
+                                "part": dump_model(SummaryTextContent(text="")),
                             },
                         )
                         thought_open = True
@@ -1680,9 +1374,7 @@ def _create_responses_real_streaming_response(
                                 "item_id": thought_item_id,
                                 "output_index": thought_index,
                                 "summary_index": 0,
-                                "part": SummaryTextContent(text=full_thoughts).model_dump(
-                                    mode="json"
-                                ),
+                                "part": dump_model(SummaryTextContent(text=full_thoughts)),
                             },
                         )
                         yield make_event(
@@ -1691,12 +1383,14 @@ def _create_responses_real_streaming_response(
                                 **base_event,
                                 "type": "response.output_item.done",
                                 "output_index": thought_index,
-                                "item": ResponseReasoningItem(
-                                    id=thought_item_id,
-                                    type="reasoning",
-                                    status="completed",
-                                    summary=[SummaryTextContent(text=full_thoughts)],
-                                ).model_dump(mode="json"),
+                                "item": dump_model(
+                                    ResponseReasoningItem(
+                                        id=thought_item_id,
+                                        type="reasoning",
+                                        status="completed",
+                                        summary=[SummaryTextContent(text=full_thoughts)],
+                                    )
+                                ),
                             },
                         )
                         thought_open = False
@@ -1711,13 +1405,15 @@ def _create_responses_real_streaming_response(
                                     **base_event,
                                     "type": "response.output_item.added",
                                     "output_index": message_index,
-                                    "item": ResponseOutputMessage(
-                                        id=message_item_id,
-                                        type="message",
-                                        status="in_progress",
-                                        role="assistant",
-                                        content=[],
-                                    ).model_dump(mode="json"),
+                                    "item": dump_model(
+                                        ResponseOutputMessage(
+                                            id=message_item_id,
+                                            type="message",
+                                            status="in_progress",
+                                            role="assistant",
+                                            content=[],
+                                        )
+                                    ),
                                 },
                             )
 
@@ -1729,9 +1425,9 @@ def _create_responses_real_streaming_response(
                                     "item_id": message_item_id,
                                     "output_index": message_index,
                                     "content_index": 0,
-                                    "part": ResponseOutputText(
-                                        type="output_text", text=""
-                                    ).model_dump(mode="json"),
+                                    "part": dump_model(
+                                        ResponseOutputText(type="output_text", text="")
+                                    ),
                                 },
                             )
                             message_open = True
@@ -1791,12 +1487,14 @@ def _create_responses_real_streaming_response(
                                 **base_event,
                                 "type": "response.output_item.added",
                                 "output_index": thought_index,
-                                "item": ResponseReasoningItem(
-                                    id=thought_item_id,
-                                    type="reasoning",
-                                    status="in_progress",
-                                    summary=[],
-                                ).model_dump(mode="json"),
+                                "item": dump_model(
+                                    ResponseReasoningItem(
+                                        id=thought_item_id,
+                                        type="reasoning",
+                                        status="in_progress",
+                                        summary=[],
+                                    )
+                                ),
                             },
                         )
                         yield make_event(
@@ -1807,7 +1505,7 @@ def _create_responses_real_streaming_response(
                                 "item_id": thought_item_id,
                                 "output_index": thought_index,
                                 "summary_index": 0,
-                                "part": SummaryTextContent(text="").model_dump(mode="json"),
+                                "part": dump_model(SummaryTextContent(text="")),
                             },
                         )
                         thought_open = True
@@ -1840,13 +1538,15 @@ def _create_responses_real_streaming_response(
                                     **base_event,
                                     "type": "response.output_item.added",
                                     "output_index": message_index,
-                                    "item": ResponseOutputMessage(
-                                        id=message_item_id,
-                                        type="message",
-                                        status="in_progress",
-                                        role="assistant",
-                                        content=[],
-                                    ).model_dump(mode="json"),
+                                    "item": dump_model(
+                                        ResponseOutputMessage(
+                                            id=message_item_id,
+                                            type="message",
+                                            status="in_progress",
+                                            role="assistant",
+                                            content=[],
+                                        )
+                                    ),
                                 },
                             )
                             yield make_event(
@@ -1857,9 +1557,9 @@ def _create_responses_real_streaming_response(
                                     "item_id": message_item_id,
                                     "output_index": message_index,
                                     "content_index": 0,
-                                    "part": ResponseOutputText(
-                                        type="output_text", text=""
-                                    ).model_dump(mode="json"),
+                                    "part": dump_model(
+                                        ResponseOutputText(type="output_text", text="")
+                                    ),
                                 },
                             )
                             message_open = True
@@ -1912,7 +1612,7 @@ def _create_responses_real_streaming_response(
                     "item_id": thought_item_id,
                     "output_index": thought_index,
                     "summary_index": 0,
-                    "part": SummaryTextContent(text=full_thoughts).model_dump(mode="json"),
+                    "part": dump_model(SummaryTextContent(text=full_thoughts)),
                 },
             )
             yield make_event(
@@ -1921,16 +1621,18 @@ def _create_responses_real_streaming_response(
                     **base_event,
                     "type": "response.output_item.done",
                     "output_index": thought_index,
-                    "item": ResponseReasoningItem(
-                        id=thought_item_id,
-                        type="reasoning",
-                        status="completed",
-                        summary=[SummaryTextContent(text=full_thoughts)],
-                    ).model_dump(mode="json"),
+                    "item": dump_model(
+                        ResponseReasoningItem(
+                            id=thought_item_id,
+                            type="reasoning",
+                            status="completed",
+                            summary=[SummaryTextContent(text=full_thoughts)],
+                        )
+                    ),
                 },
             )
 
-        _, assistant_text, storage_output, detected_tool_calls = _process_llm_output(
+        _, assistant_text, storage_output, detected_tool_calls = process_llm_output(
             normalize_llm_text(full_thoughts or ""),
             normalize_llm_text(full_text or ""),
             structured_requirement,
@@ -1945,13 +1647,15 @@ def _create_responses_real_streaming_response(
                     **base_event,
                     "type": "response.output_item.added",
                     "output_index": message_index,
-                    "item": ResponseOutputMessage(
-                        id=message_item_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
-                    ).model_dump(mode="json"),
+                    "item": dump_model(
+                        ResponseOutputMessage(
+                            id=message_item_id,
+                            type="message",
+                            status="in_progress",
+                            role="assistant",
+                            content=[],
+                        )
+                    ),
                 },
             )
             yield make_event(
@@ -1962,7 +1666,7 @@ def _create_responses_real_streaming_response(
                     "item_id": message_item_id,
                     "output_index": message_index,
                     "content_index": 0,
-                    "part": ResponseOutputText(type="output_text", text="").model_dump(mode="json"),
+                    "part": dump_model(ResponseOutputText(type="output_text", text="")),
                 },
             )
             message_open = True
@@ -2036,7 +1740,7 @@ def _create_responses_real_streaming_response(
                                 **base_event,
                                 "type": "response.output_item.added",
                                 "output_index": img_index,
-                                "item": img_item.model_dump(mode="json"),
+                                "item": dump_model(img_item),
                             },
                         )
                         yield make_event(
@@ -2045,7 +1749,7 @@ def _create_responses_real_streaming_response(
                                 **base_event,
                                 "type": "response.output_item.done",
                                 "output_index": img_index,
-                                "item": img_item.model_dump(mode="json"),
+                                "item": dump_model(img_item),
                             },
                         )
 
@@ -2058,13 +1762,15 @@ def _create_responses_real_streaming_response(
                                     **base_event,
                                     "type": "response.output_item.added",
                                     "output_index": message_index,
-                                    "item": ResponseOutputMessage(
-                                        id=message_item_id,
-                                        type="message",
-                                        status="in_progress",
-                                        role="assistant",
-                                        content=[],
-                                    ).model_dump(mode="json"),
+                                    "item": dump_model(
+                                        ResponseOutputMessage(
+                                            id=message_item_id,
+                                            type="message",
+                                            status="in_progress",
+                                            role="assistant",
+                                            content=[],
+                                        )
+                                    ),
                                 },
                             )
                             yield make_event(
@@ -2075,9 +1781,9 @@ def _create_responses_real_streaming_response(
                                     "item_id": message_item_id,
                                     "output_index": message_index,
                                     "content_index": 0,
-                                    "part": ResponseOutputText(
-                                        type="output_text", text=""
-                                    ).model_dump(mode="json"),
+                                    "part": dump_model(
+                                        ResponseOutputText(type="output_text", text="")
+                                    ),
                                 },
                             )
                             message_open = True
@@ -2152,13 +1858,15 @@ def _create_responses_real_streaming_response(
                                         **base_event,
                                         "type": "response.output_item.added",
                                         "output_index": message_index,
-                                        "item": ResponseOutputMessage(
-                                            id=message_item_id,
-                                            type="message",
-                                            status="in_progress",
-                                            role="assistant",
-                                            content=[],
-                                        ).model_dump(mode="json"),
+                                        "item": dump_model(
+                                            ResponseOutputMessage(
+                                                id=message_item_id,
+                                                type="message",
+                                                status="in_progress",
+                                                role="assistant",
+                                                content=[],
+                                            )
+                                        ),
                                     },
                                 )
                                 yield make_event(
@@ -2169,9 +1877,9 @@ def _create_responses_real_streaming_response(
                                         "item_id": message_item_id,
                                         "output_index": message_index,
                                         "content_index": 0,
-                                        "part": ResponseOutputText(
-                                            type="output_text", text=""
-                                        ).model_dump(mode="json"),
+                                        "part": dump_model(
+                                            ResponseOutputText(type="output_text", text="")
+                                        ),
                                     },
                                 )
                                 message_open = True
@@ -2218,9 +1926,7 @@ def _create_responses_real_streaming_response(
                     "item_id": message_item_id,
                     "output_index": message_index,
                     "content_index": 0,
-                    "part": ResponseOutputText(type="output_text", text=assistant_text).model_dump(
-                        mode="json"
-                    ),
+                    "part": dump_model(ResponseOutputText(type="output_text", text=assistant_text)),
                 },
             )
 
@@ -2230,13 +1936,15 @@ def _create_responses_real_streaming_response(
                     **base_event,
                     "type": "response.output_item.done",
                     "output_index": message_index,
-                    "item": ResponseOutputMessage(
-                        id=message_item_id,
-                        type="message",
-                        status="completed",
-                        role="assistant",
-                        content=final_response_contents,
-                    ).model_dump(mode="json"),
+                    "item": dump_model(
+                        ResponseOutputMessage(
+                            id=message_item_id,
+                            type="message",
+                            status="completed",
+                            role="assistant",
+                            content=final_response_contents,
+                        )
+                    ),
                 },
             )
 
@@ -2256,7 +1964,7 @@ def _create_responses_real_streaming_response(
                     **base_event,
                     "type": "response.output_item.added",
                     "output_index": tc_index,
-                    "item": tc_item.model_dump(mode="json"),
+                    "item": dump_model(tc_item),
                 },
             )
             yield make_event(
@@ -2265,11 +1973,11 @@ def _create_responses_real_streaming_response(
                     **base_event,
                     "type": "response.output_item.done",
                     "output_index": tc_index,
-                    "item": tc_item.model_dump(mode="json"),
+                    "item": dump_model(tc_item),
                 },
             )
 
-        p_tok, c_tok, t_tok, r_tok = _calculate_usage(
+        p_tok, c_tok, t_tok, r_tok = calculate_usage(
             messages, storage_output, detected_tool_calls, full_thoughts
         )
         usage = ResponseUsage(
@@ -2306,7 +2014,7 @@ def _create_responses_real_streaming_response(
             {
                 **base_event,
                 "type": "response.completed",
-                "response": payload.model_dump(mode="json"),
+                "response": dump_model(payload),
             },
         )
 
@@ -2325,7 +2033,7 @@ async def list_models(api_key: str = Depends(verify_api_key)):
     return ModelListResponse(data=models)
 
 
-@router.post("/v1/chat/completions")
+@router.post("/v1/chat/completions", response_model_exclude_none=True)
 async def create_chat_completion(
     request: ChatCompletionRequest,
     raw_request: Request,
@@ -2344,7 +2052,7 @@ async def create_chat_completion(
     structured_requirement = _build_structured_requirement(request.response_format)
     extra_instr = [structured_requirement.instruction] if structured_requirement else None
 
-    app_messages = _convert_to_app_messages(request.messages)
+    app_messages = convert_to_app_messages(request.messages)
 
     msgs = _prepare_messages_for_model(
         app_messages,
@@ -2415,7 +2123,7 @@ async def create_chat_completion(
 
     assert isinstance(resp_or_stream, ModelOutput)
 
-    thoughts, visible_output, storage_output, tool_calls = _process_llm_output(
+    thoughts, visible_output, storage_output, tool_calls = process_llm_output(
         normalize_llm_text(resp_or_stream.thoughts or ""),
         normalize_llm_text(resp_or_stream.text or ""),
         structured_requirement,
@@ -2516,9 +2224,7 @@ async def create_chat_completion(
         visible_output += media_markdown
         storage_output += media_markdown
 
-    p_tok, c_tok, t_tok, r_tok = _calculate_usage(
-        app_messages, storage_output, tool_calls, thoughts
-    )
+    p_tok, c_tok, t_tok, r_tok = calculate_usage(app_messages, storage_output, tool_calls, thoughts)
     usage = {
         "prompt_tokens": p_tok,
         "completion_tokens": c_tok,
@@ -2547,7 +2253,7 @@ async def create_chat_completion(
     return payload
 
 
-@router.post("/v1/responses")
+@router.post("/v1/responses", response_model_exclude_none=True)
 async def create_response(
     request: ResponseCreateRequest,
     raw_request: Request,
@@ -2572,7 +2278,7 @@ async def create_response(
                 elif t.get("type") == "image_generation":
                     image_tools.append(ImageGeneration.model_validate(t))
 
-    img_instr = _build_image_generation_instruction(
+    img_instr = build_image_generation_instruction(
         image_tools,
         request.tool_choice if isinstance(request.tool_choice, ToolChoiceFunction) else None,
     )
@@ -2658,7 +2364,7 @@ async def create_response(
 
     assert isinstance(resp_or_stream, ModelOutput)
 
-    thoughts, assistant_text, storage_output, tool_calls = _process_llm_output(
+    thoughts, assistant_text, storage_output, tool_calls = process_llm_output(
         normalize_llm_text(resp_or_stream.thoughts or ""),
         normalize_llm_text(resp_or_stream.text or ""),
         structured_requirement,
@@ -2774,7 +2480,7 @@ async def create_response(
     if not contents:
         contents.append(ResponseOutputText(type="output_text", text=""))
 
-    p_tok, c_tok, t_tok, r_tok = _calculate_usage(messages, storage_output, tool_calls, thoughts)
+    p_tok, c_tok, t_tok, r_tok = calculate_usage(messages, storage_output, tool_calls, thoughts)
     usage = ResponseUsage(
         input_tokens=p_tok,
         output_tokens=c_tok,
