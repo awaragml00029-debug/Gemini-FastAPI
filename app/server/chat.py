@@ -938,6 +938,25 @@ def _get_model_by_name(name: str) -> Model:
     return Model.from_name(name)
 
 
+def _resolve_model_and_gem(name: str) -> tuple[Model, str | None, str]:
+    """Resolve model aliases like `<model>-gems-<gem_id>` for chat sessions."""
+    gem_id: str | None = None
+    base_name = name
+
+    if "-gems-" in name:
+        candidate_base, candidate_gem_id = name.rsplit("-gems-", 1)
+        if not candidate_base or not candidate_gem_id:
+            raise ValueError(
+                f"Model alias '{name}' is invalid. Expected format '<model>-gems-<gem_id>'."
+            )
+        base_name = candidate_base
+        gem_id = candidate_gem_id
+
+    model = _get_model_by_name(base_name)
+    conversation_model_key = name if gem_id else model.model_name
+    return model, gem_id, conversation_model_key
+
+
 async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
     """Build the available model list from configured models and currently running clients."""
     now = int(datetime.now(tz=UTC).timestamp())
@@ -1001,19 +1020,23 @@ async def _find_reusable_session(
     pool: GeminiClientPool,
     model: Model,
     messages: list[AppMessage],
+    conversation_model_key: str | None = None,
+    gem_id: str | None = None,
 ) -> tuple[ChatSession | None, GeminiClientWrapper | None, list[AppMessage]]:
     """Find an existing chat session matching the longest suitable history prefix."""
     if len(messages) < 2:
         return None, None, messages
+
+    model_key = conversation_model_key or model.model_name
 
     search_end = len(messages)
     while search_end >= 2:
         search_history = messages[:search_end]
         if search_history[-1].role in {"assistant", "system", "tool"}:
             try:
-                if conv := db.find(model.model_name, search_history):
+                if conv := db.find(model_key, search_history):
                     client = await pool.acquire(conv.client_id)
-                    session = client.start_chat(metadata=conv.metadata, model=model)
+                    session = client.start_chat(metadata=conv.metadata, model=model, gem=gem_id)
                     remain = messages[search_end:]
                     logger.debug(
                         f"Match found at prefix length {search_end}/{len(messages)}. Client: {conv.client_id}"
@@ -1365,6 +1388,7 @@ def _create_real_streaming_response(
     model_name: str,
     messages: list[AppMessage],
     db: LMDBConversationStore,
+    conversation_model_key: str,
     model: Model,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
@@ -1596,7 +1620,7 @@ def _create_real_streaming_response(
         )
         _persist_conversation(
             db,
-            model.model_name,
+            conversation_model_key,
             client_wrapper.id,
             session.metadata,
             messages,
@@ -1622,6 +1646,7 @@ def _create_responses_real_streaming_response(
     model_name: str,
     messages: list[AppMessage],
     db: LMDBConversationStore,
+    conversation_model_key: str,
     model: Model,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
@@ -2400,7 +2425,7 @@ def _create_responses_real_streaming_response(
         )
         _persist_conversation(
             db,
-            model.model_name,
+            conversation_model_key,
             client_wrapper.id,
             session.metadata,
             messages,
@@ -2442,7 +2467,7 @@ async def create_chat_completion(
     base_url = str(raw_request.base_url)
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        model, gem_id, conversation_model_key = _resolve_model_and_gem(request.model)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if not request.messages:
@@ -2460,7 +2485,14 @@ async def create_chat_completion(
         extra_instr,
     )
 
-    session, client, remain = await _find_reusable_session(db, pool, model, msgs)
+    session, client, remain = await _find_reusable_session(
+        db,
+        pool,
+        model,
+        msgs,
+        conversation_model_key,
+        gem_id,
+    )
 
     if session:
         if not remain:
@@ -2481,7 +2513,7 @@ async def create_chat_completion(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=model, gem=gem_id)
             m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2519,6 +2551,7 @@ async def create_chat_completion(
             request.model,
             msgs,
             db,
+            conversation_model_key,
             model,
             client,
             session,
@@ -2656,7 +2689,7 @@ async def create_chat_completion(
     )
     _persist_conversation(
         db,
-        model.model_name,
+        conversation_model_key,
         client.id,
         session.metadata,
         msgs,
@@ -2713,11 +2746,18 @@ async def create_response(
     )
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        model, gem_id, conversation_model_key = _resolve_model_and_gem(request.model)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    session, client, remain = await _find_reusable_session(db, pool, model, messages)
+    session, client, remain = await _find_reusable_session(
+        db,
+        pool,
+        model,
+        messages,
+        conversation_model_key,
+        gem_id,
+    )
     if session:
         msgs = _prepare_messages_for_model(
             remain,
@@ -2735,7 +2775,7 @@ async def create_response(
     else:
         try:
             client = await pool.acquire()
-            session = client.start_chat(model=model)
+            session = client.start_chat(model=model, gem=gem_id)
             m_input, files = await _process_conversation_with_timeout(messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2773,6 +2813,7 @@ async def create_response(
             request.model,
             messages,
             db,
+            conversation_model_key,
             model,
             client,
             session,
@@ -2925,7 +2966,7 @@ async def create_response(
     )
     _persist_conversation(
         db,
-        model.model_name,
+        conversation_model_key,
         client.id,
         session.metadata,
         messages,

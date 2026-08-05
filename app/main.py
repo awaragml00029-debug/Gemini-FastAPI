@@ -6,6 +6,7 @@ from loguru import logger
 
 from .server.chat import refresh_available_models_cache
 from .server.chat import router as chat_router
+from .server.gems import router as gems_router
 from .server.health import router as health_router
 from .server.media import router as media_router
 from .server.middleware import (
@@ -137,5 +138,6 @@ def create_app() -> FastAPI:
     app.include_router(health_router, tags=["Health"])
     app.include_router(chat_router, tags=["Chat"])
     app.include_router(media_router, tags=["Media"])
+    app.include_router(gems_router, tags=["Gems"])
 
     return app

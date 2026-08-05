@@ -453,6 +453,31 @@ class HealthCheckResponse(BaseModel):
     error: str | None = Field(default=None)
 
 
+class GemModel(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    prompt: str | None = None
+    predefined: bool
+
+
+class GemListResponse(BaseModel):
+    object: str = "list"
+    data: list[GemModel]
+
+
+class GemCreateRequest(BaseModel):
+    name: str
+    prompt: str
+    description: str = ""
+
+
+class GemUpdateRequest(BaseModel):
+    name: str
+    prompt: str
+    description: str = ""
+
+
 ChatCompletionMessage.model_rebuild()
 ChatCompletionMessageToolCall.model_rebuild()
 ChatCompletionRequest.model_rebuild()
