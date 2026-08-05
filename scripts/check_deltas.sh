@@ -70,6 +70,45 @@ else
     pass "health_router is not double-prefixed"
 fi
 
+# --- Stability hardening (commit a32782d) -----------------------------------
+#
+# "Stabilize Gemini request lifecycle": request timeouts, stream idle
+# detection, and client revival, so a stalled Gemini session fails fast
+# instead of blocking the server. This is why the fork runs more reliably
+# than upstream. Every symbol below is fork-only -- upstream has no
+# equivalent, so an upstream sync that overwrites these files silently
+# removes the hardening and the service degrades with no visible error.
+
+require_symbol() {
+    local symbol="$1" file="$2" why="$3"
+    if grep -q -- "$symbol" "$file"; then
+        pass "$symbol in $file"
+    else
+        fail "$file lost $symbol -- $why"
+    fi
+}
+
+require_symbol '_process_conversation_with_timeout' app/server/chat.py \
+    "input preprocessing can hang forever"
+require_symbol '_stream_with_idle_timeout' app/server/chat.py \
+    "a stalled stream never fails, holding the connection open"
+require_symbol '_send_stream_with_split' app/server/chat.py \
+    "oversized payloads are no longer split before sending"
+require_symbol 'INPUT_PREPROCESS_TIMEOUT_SECONDS' app/server/chat.py \
+    "the preprocessing timeout bound is gone"
+require_symbol 'STREAM_CHUNK_HEARTBEAT_SECONDS' app/server/chat.py \
+    "chunk heartbeat detection is gone"
+require_symbol 'def request_scope' app/services/client.py \
+    "in-flight requests are no longer tracked, so close() can cut them off"
+require_symbol 'def active_requests' app/services/client.py \
+    "the pool cannot tell which clients are busy"
+require_symbol 'def mark_unavailable' app/services/client.py \
+    "dead clients cannot be taken out of rotation"
+require_symbol '_restart_client' app/services/pool.py \
+    "dead clients are never revived"
+require_symbol '_run_pool_init_in_background' app/main.py \
+    "startup blocks on client init instead of serving immediately"
+
 echo
 
 if [ "$failed" -ne 0 ]; then
