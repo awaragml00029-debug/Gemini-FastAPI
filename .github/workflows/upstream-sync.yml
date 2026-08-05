@@ -1,0 +1,118 @@
+name: Sync Upstream
+
+# Tracks https://github.com/luuquangvu/Gemini-FastAPI and opens a PR when it moves.
+# This workflow NEVER writes to main directly -- every upstream change arrives as a
+# reviewable PR, so the fork's custom deltas can never be silently overwritten.
+
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_URL: https://github.com/luuquangvu/Gemini-FastAPI.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Skip if a sync PR is already open
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OPEN=$(gh pr list --state open --label upstream-sync --json number --jq 'length')
+          if [ "$OPEN" -gt 0 ]; then
+            echo "An upstream-sync PR is already open; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch upstream
+        if: steps.guard.outputs.skip == 'false'
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream --no-tags
+
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "Already up to date with upstream."
+            echo "behind=0" >> "$GITHUB_OUTPUT"
+          else
+            BEHIND=$(git rev-list --count origin/main..upstream/main)
+            echo "Upstream is $BEHIND commit(s) ahead."
+            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt merge
+        if: steps.fetch.outputs.behind != '0' && steps.guard.outputs.skip == 'false'
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="sync/upstream-$(date +%Y%m%d)-${GITHUB_RUN_ID}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH" origin/main
+
+          if git merge --no-edit upstream/main; then
+            echo "Merge is clean."
+            echo "state=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merge conflicts -- publishing upstream verbatim so the conflict is visible in the PR."
+            git merge --abort
+            git checkout -B "$BRANCH" upstream/main
+            echo "state=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+          git push origin "$BRANCH"
+
+      - name: Open pull request
+        if: steps.fetch.outputs.behind != '0' && steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          STATE: ${{ steps.merge.outputs.state }}
+          BEHIND: ${{ steps.fetch.outputs.behind }}
+          SHA: ${{ steps.fetch.outputs.sha }}
+        run: |
+          if [ "$STATE" = "clean" ]; then
+            TITLE=":arrows_counterclockwise: Sync upstream ($BEHIND commits, $SHA)"
+            LABELS="upstream-sync,automated"
+            BODY="Upstream \`luuquangvu/Gemini-FastAPI\` is **$BEHIND commit(s)** ahead (\`$SHA\`).
+
+          The merge applied cleanly. Review the diff, confirm the fork's custom deltas
+          survived (\`scripts/check_deltas.sh\` runs in CI), then merge."
+          else
+            TITLE=":warning: Sync upstream ($BEHIND commits, $SHA) -- CONFLICTS"
+            LABELS="upstream-sync,automated,conflict"
+            BODY="Upstream \`luuquangvu/Gemini-FastAPI\` is **$BEHIND commit(s)** ahead (\`$SHA\`).
+
+          The automatic merge **conflicted**, so this branch is upstream's \`main\` verbatim.
+          Resolve the conflicts locally:
+
+          \`\`\`bash
+          git fetch origin
+          git checkout -b resolve-upstream origin/main
+          git merge origin/$BRANCH
+          \`\`\`"
+          fi
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "$LABELS"
