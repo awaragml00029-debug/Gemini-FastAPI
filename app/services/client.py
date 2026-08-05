@@ -66,6 +66,22 @@ class GeminiClientWrapper(GeminiClient):
     def active_requests(self) -> int:
         return self._active_requests
 
+    @property
+    def curl_cffi_fetch_options(self) -> dict[str, str | None]:
+        """Proxy and TLS fingerprint to reuse when fetching a request's remote media.
+
+        Without this the media fetch leaves from the server's own address with a
+        generic fingerprint, while the chat traffic for the same account goes
+        through its configured SOCKS proxy -- two different identities for one
+        conversation. The configured value is checked first because the parent
+        sets self.impersonate to "chrome" in __init__, before init() overwrites
+        it, so it is truthy even when a per-client fingerprint is configured.
+        """
+        return {
+            "proxy": self.proxy,
+            "impersonate": self._cfg_impersonate or self.impersonate or "chrome",
+        }
+
     @asynccontextmanager
     async def request_scope(self) -> AsyncIterator[None]:
         async with self._active_requests_changed:
@@ -147,7 +163,12 @@ class GeminiClientWrapper(GeminiClient):
 
     @staticmethod
     async def _process_content_item(
-        item: Any, role: str, tempdir: Path | None
+        item: Any,
+        role: str,
+        tempdir: Path | None,
+        *,
+        fetch_proxy: str | None = None,
+        fetch_impersonate: str | None = None,
     ) -> tuple[str | None, Path | str | None]:
         """
         Process a single content item (text, image_url, file, input_audio).
@@ -160,7 +181,12 @@ class GeminiClientWrapper(GeminiClient):
         elif item.type == "image_url":
             if item_media_url := getattr(item, "url", None):
                 started = time.perf_counter()
-                path = await save_url_to_tempfile(item_media_url, tempdir)
+                path = await save_url_to_tempfile(
+                    item_media_url,
+                    tempdir,
+                    proxy=fetch_proxy,
+                    impersonate=fetch_impersonate,
+                )
                 logger.info(
                     "Processed image_url content item: path={}, bytes={}, elapsed={:.3f}s",
                     path,
@@ -199,7 +225,11 @@ class GeminiClientWrapper(GeminiClient):
 
     @staticmethod
     async def _extract_content_and_files(
-        message: AppMessage, tempdir: Path | None
+        message: AppMessage,
+        tempdir: Path | None,
+        *,
+        fetch_proxy: str | None = None,
+        fetch_impersonate: str | None = None,
     ) -> tuple[list[str], list[Path | str]]:
         """
         Extract text fragments and files from message content.
@@ -213,7 +243,11 @@ class GeminiClientWrapper(GeminiClient):
         elif isinstance(message.content, list):
             for item in message.content:
                 text, file = await GeminiClientWrapper._process_content_item(
-                    item, message.role, tempdir
+                    item,
+                    message.role,
+                    tempdir,
+                    fetch_proxy=fetch_proxy,
+                    fetch_impersonate=fetch_impersonate,
                 )
                 if text is not None:
                     text_fragments.append(text)
@@ -276,13 +310,19 @@ class GeminiClientWrapper(GeminiClient):
         tempdir: Path | None = None,
         tagged: bool = True,
         wrap_tool: bool = True,
+        *,
+        fetch_proxy: str | None = None,
+        fetch_impersonate: str | None = None,
     ) -> tuple[str, list[Path | str]]:
         """
         Process a Message into Gemini API format using the PascalCase technical protocol.
         Extracts text, handles files, and appends ToolCalls/ToolResults blocks.
         """
         text_fragments, files = await GeminiClientWrapper._extract_content_and_files(
-            message, tempdir
+            message,
+            tempdir,
+            fetch_proxy=fetch_proxy,
+            fetch_impersonate=fetch_impersonate,
         )
 
         if message.role == "tool":
@@ -302,7 +342,11 @@ class GeminiClientWrapper(GeminiClient):
 
     @staticmethod
     async def process_conversation(
-        messages: list[AppMessage], tempdir: Path | None = None
+        messages: list[AppMessage],
+        tempdir: Path | None = None,
+        *,
+        fetch_proxy: str | None = None,
+        fetch_impersonate: str | None = None,
     ) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
         started = time.perf_counter()
         conversation: list[str] = []
@@ -315,7 +359,12 @@ class GeminiClientWrapper(GeminiClient):
                 tool_blocks: list[str] = []
                 while i < len(messages) and messages[i].role == "tool":
                     part, part_files = await GeminiClientWrapper.process_message(
-                        messages[i], tempdir, tagged=False, wrap_tool=False
+                        messages[i],
+                        tempdir,
+                        tagged=False,
+                        wrap_tool=False,
+                        fetch_proxy=fetch_proxy,
+                        fetch_impersonate=fetch_impersonate,
                     )
                     tool_blocks.append(part)
                     files.extend(part_files)
@@ -326,7 +375,11 @@ class GeminiClientWrapper(GeminiClient):
                 conversation.append(add_tag("tool", wrapped_content))
             else:
                 input_part, files_part = await GeminiClientWrapper.process_message(
-                    msg, tempdir, tagged=True
+                    msg,
+                    tempdir,
+                    tagged=True,
+                    fetch_proxy=fetch_proxy,
+                    fetch_impersonate=fetch_impersonate,
                 )
                 conversation.append(input_part)
                 files.extend(files_part)

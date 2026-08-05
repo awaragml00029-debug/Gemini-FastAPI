@@ -1054,10 +1054,19 @@ async def _find_reusable_session(
 
 
 async def _process_conversation_with_timeout(
-    messages: list[AppMessage], tmp_dir: Path
+    messages: list[AppMessage],
+    tmp_dir: Path,
+    *,
+    fetch_proxy: str | None = None,
+    fetch_impersonate: str | None = None,
 ) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
     return await asyncio.wait_for(
-        GeminiClientWrapper.process_conversation(messages, tmp_dir),
+        GeminiClientWrapper.process_conversation(
+            messages,
+            tmp_dir,
+            fetch_proxy=fetch_proxy,
+            fetch_impersonate=fetch_impersonate,
+        ),
         timeout=INPUT_PREPROCESS_TIMEOUT_SECONDS,
     )
 
@@ -2505,7 +2514,14 @@ async def create_chat_completion(
             extra_instr,
             False,
         )
-        m_input, files = await _process_conversation_with_timeout(input_msgs, tmp_dir)
+        assert client is not None
+        fetch_options = client.curl_cffi_fetch_options
+        m_input, files = await _process_conversation_with_timeout(
+            input_msgs,
+            tmp_dir,
+            fetch_proxy=fetch_options["proxy"],
+            fetch_impersonate=fetch_options["impersonate"],
+        )
 
         logger.debug(
             f"Reused session {reprlib.repr(session.metadata)} - sending {len(input_msgs)} prepared messages."
@@ -2514,7 +2530,13 @@ async def create_chat_completion(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model, gem=gem_id)
-            m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
+            fetch_options = client.curl_cffi_fetch_options
+            m_input, files = await _process_conversation_with_timeout(
+                msgs,
+                tmp_dir,
+                fetch_proxy=fetch_options["proxy"],
+                fetch_impersonate=fetch_options["impersonate"],
+            )
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
@@ -2768,7 +2790,14 @@ async def create_response(
         )
         if not msgs:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No new messages.")
-        m_input, files = await _process_conversation_with_timeout(msgs, tmp_dir)
+        assert client is not None
+        fetch_options = client.curl_cffi_fetch_options
+        m_input, files = await _process_conversation_with_timeout(
+            msgs,
+            tmp_dir,
+            fetch_proxy=fetch_options["proxy"],
+            fetch_impersonate=fetch_options["impersonate"],
+        )
         logger.debug(
             f"Reused session {reprlib.repr(session.metadata)} - sending {len(msgs)} prepared messages."
         )
@@ -2776,7 +2805,13 @@ async def create_response(
         try:
             client = await pool.acquire()
             session = client.start_chat(model=model, gem=gem_id)
-            m_input, files = await _process_conversation_with_timeout(messages, tmp_dir)
+            fetch_options = client.curl_cffi_fetch_options
+            m_input, files = await _process_conversation_with_timeout(
+                messages,
+                tmp_dir,
+                fetch_proxy=fetch_options["proxy"],
+                fetch_impersonate=fetch_options["impersonate"],
+            )
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(

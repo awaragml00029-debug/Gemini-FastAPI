@@ -1,24 +1,34 @@
+import asyncio
 import base64
+import binascii
 import hashlib
 import html
+import ipaddress
 import mimetypes
 import re
 import reprlib
+import socket
 import struct
 import tempfile
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
+from typing import Any, cast
+from urllib.parse import urljoin, urlparse
 
 import orjson
-from curl_cffi import CurlFollow, CurlHttpVersion, requests
+from curl_cffi import BrowserTypeLiteral, CurlHttpVersion, requests
 from loguru import logger
 
 from app.models import AppMessage, AppToolCall, AppToolCallFunction
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+
+MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
+MAX_REMOTE_REDIRECTS = 5
+REMOTE_FETCH_TIMEOUT_SECONDS = 30
+REMOTE_URL_SCHEMES = {"http", "https"}
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
 TOOL_WRAP_HINT = (
@@ -225,53 +235,163 @@ async def save_file_to_tempfile(
     return path
 
 
-async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
-    """Download content from a URL and save to a temporary file."""
-    started = time.perf_counter()
-    data: bytes | None = None
-    suffix: str | None = None
-    source = "data_url" if url.startswith("data:") else "remote_url"
-    if url.startswith("data:"):
-        decode_started = time.perf_counter()
-        metadata_part, encoded_data = url.split(",", 1)
-        mime_type = metadata_part.split(":")[1].split(";")[0]
-        data = base64.b64decode(encoded_data)
-        suffix = mimetypes.guess_extension(mime_type) or (
-            f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
-        )
-        logger.info(
-            "Decoded image data URL: mime_type={}, encoded_bytes={}, decoded_bytes={}, elapsed={:.3f}s",
-            mime_type,
-            len(encoded_data),
-            len(data),
-            time.perf_counter() - decode_started,
-        )
-    else:
-        download_started = time.perf_counter()
-        async with requests.AsyncSession(
-            impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.V3
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.content
-            content_type = resp.headers.get("content-type")
-            if content_type:
-                suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
-            if not suffix:
-                suffix = Path(urlparse(url).path).suffix or ".bin"
-            logger.info(
-                "Downloaded upload URL: url={}, status_code={}, content_type={}, bytes={}, elapsed={:.3f}s",
-                reprlib.repr(url),
-                resp.status_code,
-                content_type,
-                len(data),
-                time.perf_counter() - download_started,
-            )
+def _is_public_ip(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    if mapped := getattr(ip, "ipv4_mapped", None):
+        ip = mapped
+    return ip.is_global
 
-    write_started = time.perf_counter()
+
+def _validate_remote_url(url: str) -> str:
+    """Reject URLs that resolve anywhere other than a public address (SSRF guard)."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in REMOTE_URL_SCHEMES:
+        raise ValueError("Unsupported or unsafe URL")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Unsupported or unsafe URL")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise ValueError("Unsupported or unsafe URL")
+
+    if _is_public_ip(hostname):
+        return url
+
+    if hostname == parsed.hostname and not re.fullmatch(r"[A-Za-z0-9.-]+", hostname):
+        raise ValueError("Unsupported or unsafe URL")
+
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        addr_infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError("Unsupported or unsafe URL") from exc
+
+    resolved_ips = {str(info[4][0]) for info in addr_infos}
+    if not resolved_ips or any(not _is_public_ip(ip) for ip in resolved_ips):
+        raise ValueError("Unsupported or unsafe URL")
+    return url
+
+
+def _suffix_from_mime_or_url(mime_type: str | None, url: str | None = None) -> str:
+    if mime_type:
+        suffix = mimetypes.guess_extension(mime_type.split(";")[0].strip())
+        if suffix:
+            return suffix
+    if url:
+        suffix = Path(urlparse(url).path).suffix
+        if suffix and re.fullmatch(r"\.[A-Za-z0-9]{1,10}", suffix):
+            return suffix
+    return ".bin"
+
+
+def _write_bytes_to_tempfile(data: bytes, suffix: str, tempdir: Path | None = None) -> Path:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
         tmp.write(data)
-        path = Path(tmp.name)
+        return Path(tmp.name)
+
+
+async def _decode_data_url(url: str) -> tuple[bytes, str]:
+    decode_started = time.perf_counter()
+    try:
+        metadata_part, payload = url.split(",", 1)
+    except ValueError as exc:
+        raise ValueError("Invalid data URL") from exc
+
+    if len(payload) > ((MAX_REMOTE_MEDIA_BYTES + 2) // 3) * 4 + 8192:
+        raise ValueError("Remote media is too large")
+
+    metadata = metadata_part[5:]
+    parts = metadata.split(";") if metadata else []
+    mime_type = parts[0] if parts and "/" in parts[0] else "application/octet-stream"
+    if "base64" not in {part.lower() for part in parts[1:]}:
+        raise ValueError("Invalid data URL")
+
+    try:
+        data = await asyncio.to_thread(base64.b64decode, payload, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("Invalid data URL") from exc
+    if len(data) > MAX_REMOTE_MEDIA_BYTES:
+        raise ValueError("Remote media is too large")
+
+    logger.info(
+        "Decoded image data URL: mime_type={}, encoded_bytes={}, decoded_bytes={}, elapsed={:.3f}s",
+        mime_type,
+        len(payload),
+        len(data),
+        time.perf_counter() - decode_started,
+    )
+    return data, _suffix_from_mime_or_url(mime_type)
+
+
+async def save_url_to_tempfile(
+    url: str,
+    tempdir: Path | None = None,
+    *,
+    proxy: str | None = None,
+    impersonate: str | None = None,
+) -> Path:
+    """Download content from a URL and save to a temporary file.
+
+    Redirects are followed manually so every hop is re-validated -- letting
+    curl follow them would let a public URL bounce into the private network.
+    """
+    started = time.perf_counter()
+    data: bytes
+    suffix: str
+    source = "data_url" if url.startswith("data:") else "remote_url"
+
+    if url.startswith("data:"):
+        data, suffix = await _decode_data_url(url)
+    else:
+        download_started = time.perf_counter()
+        current_url = _validate_remote_url(url)
+        async with requests.AsyncSession(
+            impersonate=cast(BrowserTypeLiteral, impersonate or "chrome"),
+            proxy=proxy,
+            allow_redirects=False,
+            http_version=CurlHttpVersion.V3,
+            timeout=REMOTE_FETCH_TIMEOUT_SECONDS,
+        ) as client:
+            for _ in range(MAX_REMOTE_REDIRECTS + 1):
+                resp = await client.get(current_url)
+                if resp.status_code in REDIRECT_STATUS_CODES:
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise ValueError("Unsafe redirect")
+                    current_url = _validate_remote_url(urljoin(current_url, location))
+                    continue
+
+                resp.raise_for_status()
+                if content_length := resp.headers.get("content-length"):
+                    try:
+                        if int(content_length) > MAX_REMOTE_MEDIA_BYTES:
+                            raise ValueError("Remote media is too large")
+                    except ValueError as exc:
+                        raise ValueError("Remote media is too large") from exc
+                data = resp.content
+                if len(data) > MAX_REMOTE_MEDIA_BYTES:
+                    raise ValueError("Remote media is too large")
+                content_type = resp.headers.get("content-type")
+                suffix = _suffix_from_mime_or_url(content_type, current_url)
+                logger.info(
+                    "Downloaded upload URL: url={}, status_code={}, content_type={}, bytes={}, proxied={}, impersonate={}, elapsed={:.3f}s",
+                    reprlib.repr(current_url),
+                    resp.status_code,
+                    content_type,
+                    len(data),
+                    bool(proxy),
+                    impersonate or "chrome",
+                    time.perf_counter() - download_started,
+                )
+                break
+            else:
+                raise ValueError("Too many redirects")
+
+    write_started = time.perf_counter()
+    path = await asyncio.to_thread(_write_bytes_to_tempfile, data, suffix, tempdir)
     logger.info(
         "Saved URL upload to temp file: source={}, suffix={}, bytes={}, path={}, write_elapsed={:.3f}s,total_elapsed={:.3f}s",
         source,
