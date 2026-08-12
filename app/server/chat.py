@@ -2085,8 +2085,13 @@ async def create_chat_completion(
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     created_time = int(datetime.now(tz=UTC).timestamp())
 
+    if session is None or client is None:
+        logger.error("No Gemini session or client available after preparing conversation.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No available Gemini client."
+        )
+
     try:
-        assert session and client
         logger.debug(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
@@ -2098,7 +2103,11 @@ async def create_chat_completion(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
     if request.stream:
-        assert not isinstance(resp_or_stream, ModelOutput)
+        if isinstance(resp_or_stream, ModelOutput):
+            logger.error("Expected a streaming response from Gemini but got a complete output.")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail="Streaming response unavailable."
+            )
         return _create_real_streaming_response(
             resp_or_stream,
             completion_id,
@@ -2113,7 +2122,11 @@ async def create_chat_completion(
             structured_requirement,
         )
 
-    assert isinstance(resp_or_stream, ModelOutput)
+    if not isinstance(resp_or_stream, ModelOutput):
+        logger.error("Expected a complete output from Gemini but got a stream.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected streaming response."
+        )
 
     thoughts, visible_output, storage_output, tool_calls = process_llm_output(
         normalize_llm_text(resp_or_stream.thoughts or ""),
@@ -2325,8 +2338,13 @@ async def create_response(
     response_id = f"resp_{uuid.uuid4().hex}"
     created_time = int(datetime.now(tz=UTC).timestamp())
 
+    if session is None or client is None:
+        logger.error("No Gemini session or client available after preparing conversation.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="No available Gemini client."
+        )
+
     try:
-        assert session and client
         logger.debug(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
@@ -2338,7 +2356,11 @@ async def create_response(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
     if request.stream:
-        assert not isinstance(resp_or_stream, ModelOutput)
+        if isinstance(resp_or_stream, ModelOutput):
+            logger.error("Expected a streaming response from Gemini but got a complete output.")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY, detail="Streaming response unavailable."
+            )
         return _create_responses_real_streaming_response(
             resp_or_stream,
             response_id,
@@ -2354,7 +2376,11 @@ async def create_response(
             structured_requirement,
         )
 
-    assert isinstance(resp_or_stream, ModelOutput)
+    if not isinstance(resp_or_stream, ModelOutput):
+        logger.error("Expected a complete output from Gemini but got a stream.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected streaming response."
+        )
 
     thoughts, assistant_text, storage_output, tool_calls = process_llm_output(
         normalize_llm_text(resp_or_stream.thoughts or ""),

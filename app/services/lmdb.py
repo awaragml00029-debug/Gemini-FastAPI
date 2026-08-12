@@ -446,9 +446,7 @@ class LMDBConversationStore(metaclass=Singleton):
                 for key, _ in cursor:
                     key_str = bytes(key).decode("utf-8")
                     # Skip internal index mappings
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
-                        self.FUZZY_LOOKUP_PREFIX
-                    ):
+                    if key_str.startswith((self.HASH_LOOKUP_PREFIX, self.FUZZY_LOOKUP_PREFIX)):
                         continue
 
                     if not prefix or key_str.startswith(prefix):
@@ -477,9 +475,7 @@ class LMDBConversationStore(metaclass=Singleton):
                 cursor = txn.cursor()
                 for key_bytes, value_bytes in cursor:
                     key_str = bytes(key_bytes).decode("utf-8")
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
-                        self.FUZZY_LOOKUP_PREFIX
-                    ):
+                    if key_str.startswith((self.HASH_LOOKUP_PREFIX, self.FUZZY_LOOKUP_PREFIX)):
                         continue
 
                     try:
