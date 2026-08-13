@@ -36,8 +36,6 @@ gemini:
   # WARNING: Google may close a temporary window at any time mid-conversation. The reply can then come back without the earlier
   # context instead of erroring, so the loss may be silent. Prefer "normal" for long or context-sensitive conversations.
   chat_mode: "normal"
-  model_strategy: "append" # Strategy: 'append' (default + custom) or 'overwrite' (custom only)
-  models: []
 
 storage:
   path: "data/lmdb" # Database storage path

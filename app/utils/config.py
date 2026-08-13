@@ -1,10 +1,8 @@
-import ast
 import os
 import sys
 from enum import StrEnum
 from typing import Any, Literal, cast, get_args
 
-import orjson
 from curl_cffi import BrowserTypeLiteral
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -72,28 +70,6 @@ class GeminiClientSettings(BaseModel):
         return value
 
 
-class GeminiModelConfig(BaseModel):
-    """Configuration for a custom Gemini model."""
-
-    model_name: str | None = Field(default=None, description="Name of the model")
-    model_header: dict[str, str | None] | None = Field(
-        default=None, description="Header for the model"
-    )
-
-    @field_validator("model_header", mode="before")
-    @classmethod
-    def _parse_json_string(cls, v: Any) -> Any:
-        if isinstance(v, str) and v.strip().startswith("{"):
-            try:
-                return orjson.loads(v)
-            except orjson.JSONDecodeError:
-                try:
-                    return ast.literal_eval(v)
-                except (ValueError, SyntaxError):
-                    return v
-        return v
-
-
 class ChatMode(StrEnum):
     """Chat mode options for Gemini conversation handling."""
 
@@ -106,11 +82,6 @@ class GeminiConfig(BaseModel):
 
     clients: list[GeminiClientSettings] = Field(
         ..., description="List of Gemini client credential pairs"
-    )
-    models: list[GeminiModelConfig] = Field(default=[], description="List of custom Gemini models")
-    model_strategy: Literal["append", "overwrite"] = Field(
-        default="append",
-        description="Strategy for loading models: 'append' merges custom with default, 'overwrite' uses only custom",
     )
     timeout: int = Field(default=450, ge=30, description="Init timeout in seconds")
     watchdog_timeout: int = Field(default=120, ge=30, description="Watchdog timeout in seconds")
@@ -145,39 +116,6 @@ class GeminiConfig(BaseModel):
             "reply can then come back without the earlier context instead of erroring"
         ),
     )
-
-    @field_validator("models", mode="before")
-    @classmethod
-    def _parse_models_json(cls, v: Any) -> Any:
-        if isinstance(v, str) and v.strip().startswith("["):
-            try:
-                return orjson.loads(v)
-            except orjson.JSONDecodeError:
-                try:
-                    return ast.literal_eval(v)
-                except (ValueError, SyntaxError) as e:
-                    logger.warning(f"Failed to parse models JSON or Python literal: {e}")
-                    return v
-        return v
-
-    @field_validator("models")
-    @classmethod
-    def _filter_valid_models(cls, v: list[GeminiModelConfig]) -> list[GeminiModelConfig]:
-        """Filter out models that don't have all required fields set."""
-        valid_models = []
-        for model in v:
-            if model.model_name and model.model_header:
-                valid_models.append(model)
-            else:
-                missing = []
-                if not model.model_name:
-                    missing.append("model_name")
-                if not model.model_header:
-                    missing.append("model_header")
-                logger.warning(
-                    f"Discarding custom model due to missing {', '.join(missing)}: {model}"
-                )
-        return valid_models
 
 
 class CORSConfig(BaseModel):
@@ -329,81 +267,21 @@ def _merge_clients_with_env(
     return result_clients or base_clients or []
 
 
-def extract_gemini_models_env() -> dict[int, dict[str, Any]]:
-    """Extract and remove all Gemini models related environment variables, supporting nested fields."""
-    root_key = "CONFIG_GEMINI__MODELS"
-    env_overrides: dict[int, dict[str, Any]] = {}
-
-    if root_key in os.environ:
-        val = os.environ[root_key]
-        models_list = None
-        parsed_successfully = False
-
-        try:
-            models_list = orjson.loads(val)
-            parsed_successfully = True
-        except orjson.JSONDecodeError:
-            try:
-                models_list = ast.literal_eval(val)
-                parsed_successfully = True
-            except (ValueError, SyntaxError) as e:
-                logger.warning(f"Failed to parse {root_key} as JSON or Python literal: {e}")
-
-        if parsed_successfully and isinstance(models_list, list):
-            for idx, model_data in enumerate(models_list):
-                if isinstance(model_data, dict):
-                    env_overrides[idx] = cast(dict[str, Any], model_data)
-
-            del os.environ[root_key]
-
-    return env_overrides
-
-
-def _merge_models_with_env(
-    base_models: list[GeminiModelConfig] | None,
-    env_overrides: dict[int, dict[str, Any]],
-):
-    """Override base_models with env_overrides using standard update (replace whole fields)."""
-    if not env_overrides:
-        return base_models or []
-    result_models: list[GeminiModelConfig] = []
-    if base_models:
-        result_models = [model.model_copy() for model in base_models]
-
-    for idx in sorted(env_overrides):
-        overrides = env_overrides[idx]
-        if idx < len(result_models):
-            model_dict = result_models[idx].model_dump()
-            model_dict.update(overrides)
-            result_models[idx] = GeminiModelConfig(**model_dict)
-        elif idx == len(result_models):
-            new_model = GeminiModelConfig(**overrides)
-            result_models.append(new_model)
-        else:
-            raise IndexError(
-                f"Model index {idx} in env is out of range (current count: {len(result_models)}). "
-                "Model indices must be contiguous starting from 0."
-            )
-    return result_models
-
-
 def initialize_config() -> Config:
     """
     Initialize configuration from environment variables and the YAML settings source.
 
     Returns:
-        Config: Configuration object with Gemini client and model overrides merged
+        Config: Configuration object with Gemini client overrides merged
     """
     try:
         env_clients_overrides = extract_gemini_clients_env()
-        env_models_overrides = extract_gemini_models_env()
         settings_cls: type[Any] = Config
         config = cast(Config, settings_cls())
 
         config.gemini.clients = _merge_clients_with_env(
             config.gemini.clients, env_clients_overrides
         )
-        config.gemini.models = _merge_models_with_env(config.gemini.models, env_models_overrides)
 
         return config
     except ValidationError as e:

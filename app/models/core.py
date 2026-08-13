@@ -49,3 +49,10 @@ class ConversationInStore(BaseModel):
     messages: list[AppMessage] = Field(
         ..., description="Canonical message contents in the conversation"
     )
+    chat_scope: str | None = Field(
+        default=None,
+        description=(
+            "Identity of the ephemeral window this chat lives in, or None for a normal chat kept "
+            "in the account's history. Reusable only while the client still reports this scope"
+        ),
+    )

@@ -14,7 +14,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from gemini_webapi import ModelOutput
 from gemini_webapi.client import ChatSession
-from gemini_webapi.constants import Model
 from gemini_webapi.exceptions import ModelInvalidError
 from gemini_webapi.types.image import GeneratedImage, Image
 from gemini_webapi.types.video import GeneratedMedia, GeneratedVideo
@@ -328,11 +327,11 @@ def _persist_conversation(
     tool_calls: list[AppToolCall] | None,
 ) -> str | None:
     """Unified logic to save conversation history to LMDB."""
-    if _use_temporary_chat_mode():
-        # This turn's conversation is now the last chat this client opened; any window it
-        # replaced has been closed by Google and must not be replayed again. Recorded before
-        # the store so a persistence failure cannot leave a closed window looking reusable.
-        client.latest_chat_cid = _cid_of(metadata)
+    # This turn is now the last chat this client opened; any window it replaced is closed. Set
+    # before the store, so a persistence failure cannot leave a closed window looking reusable,
+    # and in every mode, since an expired cookie can turn a client ephemeral without warning.
+    client.latest_chat_cid = _cid_of(metadata)
+    chat_scope = client.chat_scope(_use_temporary_chat_mode())
 
     try:
         current_assistant_message = AppMessage(
@@ -343,13 +342,14 @@ def _persist_conversation(
         )
         full_history = [*messages, current_assistant_message]
 
-        # A temporary chat stays continuable while its window is the live one, so its metadata
-        # is worth keeping and reusing just like a normal chat's.
+        # An ephemeral chat is worth storing like any other while its window is live, tagged with
+        # that window so a later session cannot mistake it for one of its own.
         db.store(
             client_id=client.id,
             model=model_name,
             messages=full_history,
             metadata=metadata,
+            chat_scope=chat_scope,
         )
         logger.debug("Conversation saved to LMDB.")
         return "success"
@@ -664,55 +664,57 @@ def _convert_instructions_to_app_messages(
     return instruction_messages
 
 
-def _get_model_by_name(name: str) -> Model:
-    """Retrieve a Model instance by name."""
-    strategy = g_config.gemini.model_strategy
-    custom_models = {m.model_name: m for m in g_config.gemini.models if m.model_name}
+def _resolve_model_name(pool: GeminiClientPool, name: str) -> str:
+    """Canonical name of the model a request asked for, resolved against a client's registry.
 
-    if name in custom_models:
-        return Model.from_dict(custom_models[name].model_dump())
+    Names, aliases and hex ids all resolve, and every client discovers its own models, so nothing
+    here has to be configured or kept up to date. Resolution is canonical on purpose: two aliases
+    of one model must reach the same conversation records.
 
-    if strategy == "overwrite":
-        raise ValueError(f"Model '{name}' not found in custom models (strategy='overwrite').")
+    The name, not the resolved object, is what callers pass on - each client re-resolves it in its
+    own registry at send time, where the model header carries that account's tier. Preferring an
+    authenticated client keeps a guest, whose registry marks everything but the default
+    unavailable, from narrowing what the whole pool accepts.
+    """
+    # A registry outlives an auto-close, so an idle client still resolves; one that never
+    # initialized has nothing to offer.
+    clients = sorted(pool.clients, key=lambda c: (c.is_guest(), not c.running()))
+    for client in clients:
+        if not client.list_models():
+            continue
 
-    return Model.from_name(name)
+        try:
+            return client.resolve_model(name).model_name
+        except ValueError:
+            continue
+
+    raise ValueError(f"Model '{name}' is not available on any Gemini client.")
 
 
 async def _build_available_models(pool: GeminiClientPool) -> list[ModelData]:
-    """Build the available model list from configured models and currently running clients."""
+    """Build the available model list from the models the clients discovered."""
     now = int(datetime.now(tz=UTC).timestamp())
-    strategy = g_config.gemini.model_strategy
     models_data = []
     seen_model_ids = set()
 
-    for model in g_config.gemini.models:
-        if model.model_name and model.model_name not in seen_model_ids:
-            models_data.append(
-                ModelData(
-                    id=model.model_name,
-                    created=now,
-                    owned_by="custom",
-                )
-            )
-            seen_model_ids.add(model.model_name)
+    for client in pool.clients:
+        if client_models := client.list_models():
+            for model in client_models:
+                # A guest session registers the models it can see but may only use the
+                # default one; advertising the rest would promise what it cannot serve.
+                if not model.is_available:
+                    continue
 
-    if strategy == "append":
-        for client in pool.clients:
-            if not client.running():
-                continue
-
-            if client_models := client.list_models():
-                for model in client_models:
-                    model_id = model.model_name or model.model_id
-                    if model_id and model_id not in seen_model_ids:
-                        models_data.append(
-                            ModelData(
-                                id=model_id,
-                                created=now,
-                                owned_by="google",
-                            )
+                model_id = model.model_name or model.model_id
+                if model_id and model_id not in seen_model_ids:
+                    models_data.append(
+                        ModelData(
+                            id=model_id,
+                            created=now,
+                            owned_by="google",
                         )
-                        seen_model_ids.add(model_id)
+                    )
+                    seen_model_ids.add(model_id)
 
     return models_data
 
@@ -741,21 +743,34 @@ def _cid_of(metadata: list[str | None] | None) -> str | None:
     return metadata[0] if metadata else None
 
 
-def _is_live_temporary_chat(conv: ConversationInStore, client: GeminiClientWrapper) -> bool:
-    """Whether a stored chat can still be the open temporary window on this client.
+def _is_reusable_chat(
+    conv: ConversationInStore, client: GeminiClientWrapper, temporary: bool
+) -> bool:
+    """Whether a stored chat can still be continued on this client.
 
-    Google closes the previous temporary conversation as soon as another one is created, so at
-    most one temporary window per client is alive at a time, and it can only be the last chat
-    the client opened. Replaying an older one makes Google start a fresh chat and answer
-    without the earlier context: a silent loss that raises no error, which is why this is
-    checked up front rather than detected after the fact.
+    A normal chat lives in the account's history and stays continuable indefinitely, so only the
+    ephemeral records need checking: temporary-mode chats, and everything a guest session opened.
+    Those survive only as the one open window of the session that created them, and replaying a
+    closed one makes Google answer from a fresh chat without the earlier context - no error, just
+    silent loss. So an ephemeral record must still carry the client's current scope, which no
+    longer matches once that session is gone (reinitialized, or downgraded to guest by expired
+    cookies, or authenticated again afterwards), and its cid must be the last one this client
+    opened, since a newer conversation has closed anything older.
 
-    `latest_chat_cid` is only that - the last cid this client saw. Its kind is not verified, so
-    a match is a necessary condition rather than proof the window is temporary or still open.
-    It lives in memory and is cleared on every client (re)initialization, so an auto-close,
-    restart or redeploy invalidates every stored window: once the client that opened a window
-    is gone, there is nothing left to vouch for it.
+    A `latest_chat_cid` match is necessary but not proof: the cid's kind is never verified.
     """
+    scope = client.chat_scope(temporary)
+    if conv.chat_scope is None and scope is None:
+        return True
+
+    if conv.chat_scope != scope:
+        logger.debug(
+            f"Stored chat scope {conv.chat_scope!r} no longer matches client {client.id} "
+            f"({scope!r}); the window behind it is gone, so replaying the full history in a "
+            "fresh conversation."
+        )
+        return False
+
     latest = client.latest_chat_cid
     if not latest:
         logger.debug(f"Client {client.id} has no chat on record; starting a fresh conversation.")
@@ -775,9 +790,10 @@ def _is_live_temporary_chat(conv: ConversationInStore, client: GeminiClientWrapp
 async def _find_reusable_session(
     db: LMDBConversationStore,
     pool: GeminiClientPool,
-    model: Model,
+    resolved_model: str,
     messages: list[AppMessage],
     temporary: bool = False,
+    require_account: bool = False,
 ) -> tuple[
     ChatSession | None, GeminiClientWrapper | None, list[AppMessage], ConversationInStore | None
 ]:
@@ -790,15 +806,25 @@ async def _find_reusable_session(
         search_history = messages[:search_end]
         if search_history[-1].role in {"assistant", "system", "tool"}:
             try:
-                if conv := db.find(model.model_name, search_history):
+                if conv := db.find(resolved_model, search_history):
                     client = await pool.acquire(conv.client_id)
-                    # Checked after acquiring: acquire may restart a closed client, which clears
-                    # the tracked cid and is exactly what invalidates a temporary window.
-                    if temporary and not _is_live_temporary_chat(conv, client):
-                        # Every prefix of one conversation carries the same cid, so if the
-                        # longest match is not the live window, no shorter one will be either.
+                    if require_account and client.is_guest():
+                        # Continuing here would fail on the upload; a fresh chat on an
+                        # authenticated client can still serve the request.
+                        logger.debug(
+                            f"Client {client.id} owns the match but is a guest session and this "
+                            "request needs an upload; starting a fresh conversation."
+                        )
                         break
-                    session = client.start_chat(metadata=conv.metadata, model=model)
+                    # Checked after acquiring: acquire may restart a closed client, which rerolls
+                    # the scope and clears the tracked cid, invalidating any ephemeral window.
+                    if not _is_reusable_chat(conv, client, temporary):
+                        # Every prefix of one conversation carries the same cid and scope, so if
+                        # the longest match is not the live window, no shorter one will be either.
+                        break
+                    session = client.start_chat(
+                        metadata=conv.metadata, model=client.usable_model(resolved_model)
+                    )
                     remain = messages[search_end:]
                     logger.debug(
                         f"Match found at prefix length {search_end}/{len(messages)}. Client: {conv.client_id}"
@@ -823,6 +849,32 @@ def _use_temporary_chat_mode() -> bool:
 def _effective_max_chars_per_request(temporary: bool) -> int:
     """Return the payload guardrail for the active chat mode."""
     return TEMPORARY_MAX_CHARS_PER_REQUEST if temporary else MAX_CHARS_PER_REQUEST
+
+
+def _requires_upload(messages: list[AppMessage], temporary: bool) -> bool:
+    """Whether serving these messages needs a file upload, which a guest session cannot do.
+
+    Attachments do; so does input long enough to be sent as `message.txt`. The length is measured
+    before the prompt is assembled, so it slightly underestimates and only steers client choice -
+    `_send_with_split` makes the real call.
+    """
+    total = 0
+    for message in messages:
+        if isinstance(message.content, str):
+            total += len(message.content)
+        elif isinstance(message.content, list):
+            for item in message.content:
+                if item.type != "text":
+                    return True
+                total += len(item.text or "")
+
+    return total > _effective_max_chars_per_request(temporary)
+
+
+def _can_upload(session: ChatSession) -> bool:
+    """Whether the client behind this session may attach files."""
+    client = session.geminiclient
+    return client.can_upload() if isinstance(client, GeminiClientWrapper) else True
 
 
 async def _send_with_split(
@@ -852,6 +904,14 @@ async def _send_with_split(
         except Exception as e:
             logger.error(f"Error sending message to Gemini: {e}")
             raise
+
+    if not _can_upload(session):
+        # Only reachable once every client is a guest, since routing prefers an authenticated one.
+        raise RuntimeError(
+            f"Message length ({len(text)}) exceeds limit ({limit}) and would have to be sent as "
+            "an attachment, which a guest session cannot upload. Refresh the client cookies or "
+            "shorten the request."
+        )
 
     logger.info(
         f"Message length ({len(text)}) exceeds limit ({limit}). Converting text to file attachment."
@@ -928,7 +988,7 @@ async def _send_with_internal_fallback(
     *,
     pool: GeminiClientPool,
     db: LMDBConversationStore,
-    model: Model,
+    resolved_model: str,
     session: ChatSession,
     client: GeminiClientWrapper,
     current_input: str,
@@ -964,10 +1024,16 @@ async def _send_with_internal_fallback(
         logger.warning(
             "Metadata-backed chat reuse failed; retrying with internal history replay in a fresh chat."
         )
-        fallback_client = await pool.acquire()
-        fallback_session = fallback_client.start_chat(model=model)
         fallback_input, fallback_files = await GeminiClientWrapper.process_conversation(
             full_prepared_messages, tmp_dir
+        )
+        # Built before acquiring, so a replay that needs an upload is not handed to a guest.
+        fallback_client = await pool.acquire(
+            require_account=bool(fallback_files)
+            or len(fallback_input) > _effective_max_chars_per_request(temporary)
+        )
+        fallback_session = fallback_client.start_chat(
+            model=fallback_client.usable_model(resolved_model)
         )
         # Keep the caller's streaming mode: the endpoints reject a ModelOutput when the client
         # asked for a stream, so downgrading here would turn a recovery into a 502.
@@ -1118,7 +1184,7 @@ def _create_real_streaming_response(
     model_name: str,
     messages: list[AppMessage],
     db: LMDBConversationStore,
-    model: Model,
+    resolved_model: str,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     base_url: str,
@@ -1346,7 +1412,7 @@ def _create_real_streaming_response(
         )
         _persist_conversation(
             db,
-            model.model_name,
+            resolved_model,
             client_wrapper,
             session.metadata,
             messages,
@@ -1372,7 +1438,7 @@ def _create_responses_real_streaming_response(
     model_name: str,
     messages: list[AppMessage],
     db: LMDBConversationStore,
-    model: Model,
+    resolved_model: str,
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     request: ResponseCreateRequest,
@@ -2163,7 +2229,7 @@ def _create_responses_real_streaming_response(
         )
         _persist_conversation(
             db,
-            model.model_name,
+            resolved_model,
             client_wrapper,
             session.metadata,
             messages,
@@ -2205,7 +2271,7 @@ async def create_chat_completion(
     base_url = str(raw_request.base_url)
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        resolved_model = _resolve_model_name(pool, request.model)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if not request.messages:
@@ -2224,8 +2290,9 @@ async def create_chat_completion(
     )
 
     use_temporary = _use_temporary_chat_mode()
+    needs_upload = _requires_upload(msgs, use_temporary)
     session, client, remain, stored_conv = await _find_reusable_session(
-        db, pool, model, msgs, temporary=use_temporary
+        db, pool, resolved_model, msgs, temporary=use_temporary, require_account=needs_upload
     )
 
     if session:
@@ -2246,8 +2313,8 @@ async def create_chat_completion(
         )
     else:
         try:
-            client = await pool.acquire()
-            session = client.start_chat(model=model)
+            client = await pool.acquire(require_account=needs_upload)
+            session = client.start_chat(model=client.usable_model(resolved_model))
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2271,7 +2338,7 @@ async def create_chat_completion(
         resp_or_stream, session, client = await _send_with_internal_fallback(
             pool=pool,
             db=db,
-            model=model,
+            resolved_model=resolved_model,
             session=session,
             client=client,
             current_input=m_input,
@@ -2299,7 +2366,7 @@ async def create_chat_completion(
             request.model,
             msgs,
             db,
-            model,
+            resolved_model,
             client,
             session,
             base_url,
@@ -2432,7 +2499,7 @@ async def create_chat_completion(
     )
     _persist_conversation(
         db,
-        model.model_name,
+        resolved_model,
         client,
         session.metadata,
         msgs,
@@ -2489,13 +2556,14 @@ async def create_response(
     )
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        model = _get_model_by_name(request.model)
+        resolved_model = _resolve_model_name(pool, request.model)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     use_temporary = _use_temporary_chat_mode()
+    needs_upload = _requires_upload(messages, use_temporary)
     session, client, remain, stored_conv = await _find_reusable_session(
-        db, pool, model, messages, temporary=use_temporary
+        db, pool, resolved_model, messages, temporary=use_temporary, require_account=needs_upload
     )
     if session:
         msgs = _prepare_messages_for_model(
@@ -2513,8 +2581,8 @@ async def create_response(
         )
     else:
         try:
-            client = await pool.acquire()
-            session = client.start_chat(model=model)
+            client = await pool.acquire(require_account=needs_upload)
+            session = client.start_chat(model=client.usable_model(resolved_model))
             m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -2538,7 +2606,7 @@ async def create_response(
         resp_or_stream, session, client = await _send_with_internal_fallback(
             pool=pool,
             db=db,
-            model=model,
+            resolved_model=resolved_model,
             session=session,
             client=client,
             current_input=m_input,
@@ -2566,7 +2634,7 @@ async def create_response(
             request.model,
             messages,
             db,
-            model,
+            resolved_model,
             client,
             session,
             request,
@@ -2716,7 +2784,7 @@ async def create_response(
     )
     _persist_conversation(
         db,
-        model.model_name,
+        resolved_model,
         client,
         session.metadata,
         messages,

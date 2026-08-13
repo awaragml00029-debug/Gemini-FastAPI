@@ -269,8 +269,32 @@ restarts - an `auto_close` after inactivity, a server restart, or a redeploy. Af
 those, no window can be vouched for and every stored temporary conversation is replayed rather
 than reused.
 
-This applies **only** in temporary mode. A normal chat is kept by Google until you delete it,
-so its metadata stays reusable indefinitely and across restarts.
+The same rule applies to a client running as a guest, regardless of `chat_mode`. When every
+cookie group fails, or an authenticated session is rejected mid-flight because its cookies
+expired, the client keeps serving text prompts without an account - and a guest chat is never
+written to any history, so it behaves exactly like a temporary one. Each stored conversation
+records the session window it belongs to, so chats opened while authenticated are never replayed
+into a guest session and chats opened as a guest are never replayed once cookies are restored;
+either crossing falls back to a full history replay in a fresh chat.
+
+A guest session keeps the service up rather than taking it down, and requests degrade instead of
+failing:
+
+- The pool prefers authenticated clients, so a downgraded one only receives traffic when no
+  authenticated client is left.
+- Requests that need a file upload - attachments, or input long enough to be sent as
+  `message.txt` - are routed to an authenticated client, including when a stored session would
+  otherwise pin them to a guest one. If none exists, the request fails with an explicit message
+  instead of Google's `Permission denied`.
+- Google gives a guest no model choice, so the requested model is replaced by the default one it
+  is allowed to use, logged as a warning. `/v1/models` advertises only models a client can
+  actually serve.
+
+`/health` reports a guest client as unhealthy - refresh its cookies to restore full capability.
+
+Otherwise this applies **only** in temporary mode. A normal chat opened by an authenticated
+client is kept by Google until you delete it, so its metadata stays reusable indefinitely and
+across restarts.
 
 > [!WARNING]
 > Google can close a temporary chat window at any time, without notice and mid-conversation.
@@ -290,31 +314,26 @@ Environment variable equivalent:
 export CONFIG_GEMINI__CHAT_MODE="temporary"
 ```
 
-### Custom Models
+### Models
 
-You can define custom models in `config/config.yaml` or via environment variables.
+Models are discovered from Google at startup - there is nothing to configure. Each client reads
+the models its own account may use and builds the request headers for them at runtime, so a newly
+launched model is served as soon as Google offers it. `GET /v1/models` lists what the running
+clients can actually serve.
 
-#### YAML Configuration
+Requests may name a model by its canonical name (currently `gemini-pro`, `gemini-flash` and
+`gemini-flash-lite`), by an alias or display name (`pro`, `Flash Lite`) or by its internal id;
+all forms resolve to the same conversation history. Call `GET /v1/models` for the list your own
+accounts see - the names come from Google, not from this project. Only discovered models are
+served: a name no client offers is rejected with `400` rather than quietly answered by a
+different model.
 
-```yaml
-gemini:
-  model_strategy: "append" # "append" (default + custom) or "overwrite" (custom only)
-  models:
-    - model_name: "xxx"
-      model_header:
-        x-goog-ext-525001261-jspb: '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8],null,null,1,null,null,1,1,"EA3C5672-E422-4A5F-BE26-B5B57D3B9AC3"]'
-        x-goog-ext-73010989-jspb: "[0]"
-        x-goog-ext-73010990-jspb: "[0,0,0]"
-```
-
-#### Environment Variables
-
-You can supply models as a JSON string or list structure via `CONFIG_GEMINI__MODELS`. This provides a flexible way to override settings via the shell or in automated environments (e.g. Docker) without modifying the configuration file.
-
-```bash
-export CONFIG_GEMINI__MODEL_STRATEGY="overwrite"
-export CONFIG_GEMINI__MODELS='[{"model_name": "xxx", "model_header": {"x-goog-ext-525001261-jspb": "[1,null,null,null,\"fbb127bbb056c959\",null,null,0,\[4,5,6,8\],null,null,1,null,null,1,1,\"EA3C5672-E422-4A5F-BE26-B5B57D3B9AC3\"]", "x-goog-ext-73010989-jspb": "[0]", "x-goog-ext-73010990-jspb": "[0,0,0]"}}]'
-```
+> [!NOTE]
+> The `models` and `model_strategy` settings are gone, as is any use of the library's removed
+> static `Model` name lookups. They existed to hand-write model headers while the library lagged behind
+> new releases, which dynamic discovery has made unnecessary - and hardcoded headers now risk
+> pinning requests to a stale model. Both keys are simply ignored if left in a config file or
+> environment.
 
 ## Acknowledgments
 

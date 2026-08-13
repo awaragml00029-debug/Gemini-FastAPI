@@ -237,6 +237,7 @@ class LMDBConversationStore(metaclass=Singleton):
         model: str,
         messages: list[AppMessage],
         metadata: list[str | None],
+        chat_scope: str | None = None,
     ) -> None:
         """
         Store a conversation model in LMDB.
@@ -246,6 +247,8 @@ class LMDBConversationStore(metaclass=Singleton):
             model: The model name
             messages: Unsanitized API messages
             metadata: Session metadata
+            chat_scope: Identity of the ephemeral window owning the chat, None if it is a normal
+                chat kept in the account's history
         """
         if not messages:
             raise ValueError("Messages list cannot be empty")
@@ -256,6 +259,7 @@ class LMDBConversationStore(metaclass=Singleton):
             client_id=client_id,
             metadata=metadata,
             messages=messages,
+            chat_scope=chat_scope,
             created_at=now,
             updated_at=now,
         )
