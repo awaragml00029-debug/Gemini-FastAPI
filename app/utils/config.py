@@ -1,6 +1,7 @@
 import ast
 import os
 import sys
+from enum import StrEnum
 from typing import Any, Literal, cast, get_args
 
 import orjson
@@ -93,6 +94,13 @@ class GeminiModelConfig(BaseModel):
         return v
 
 
+class ChatMode(StrEnum):
+    """Chat mode options for Gemini conversation handling."""
+
+    NORMAL = "normal"
+    TEMPORARY = "temporary"
+
+
 class GeminiConfig(BaseModel):
     """Gemini API configuration, including session behavior and generation options."""
 
@@ -127,6 +135,15 @@ class GeminiConfig(BaseModel):
         default=1_000_000,
         ge=1,
         description="Maximum characters Gemini Web can accept per request",
+    )
+    chat_mode: ChatMode = Field(
+        default=ChatMode.NORMAL,
+        description=(
+            "Chat mode: 'normal' uses standard chats; 'temporary' sends with Google's temporary "
+            "mode (not saved to the account) and applies a tighter effective input limit. "
+            "Warning: Google may close a temporary window at any time mid-conversation, and the "
+            "reply can then come back without the earlier context instead of erroring"
+        ),
     )
 
     @field_validator("models", mode="before")

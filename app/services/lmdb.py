@@ -398,6 +398,15 @@ class LMDBConversationStore(metaclass=Singleton):
                 return conv
         return None
 
+    def evict(self, conv: ConversationInStore) -> bool:
+        """Delete a stored conversation given the record itself.
+
+        Used to drop metadata that Google has already invalidated, so the next request
+        does not rediscover the same dead session and fail again.
+        """
+        key = _hash_conversation(conv.client_id, conv.model, conv.messages)
+        return self.delete(key) is not None
+
     def exists(self, key: str) -> bool:
         """Check if a key exists in the store."""
         try:
