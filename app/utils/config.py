@@ -116,6 +116,16 @@ class GeminiConfig(BaseModel):
             "reply can then come back without the earlier context instead of erroring"
         ),
     )
+    allow_private_url_fetch: bool = Field(
+        default=False,
+        description="Allow server-side fetching of private/loopback image URLs (SSRF risk; default blocks them)",
+    )
+    url_fetch_timeout: int = Field(
+        default=15,
+        ge=1,
+        le=120,
+        description="Timeout in seconds for server-side URL image fetches",
+    )
 
 
 class CORSConfig(BaseModel):

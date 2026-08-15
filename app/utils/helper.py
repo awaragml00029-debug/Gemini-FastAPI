@@ -1,9 +1,11 @@
 import base64
 import hashlib
 import html
+import ipaddress
 import mimetypes
 import re
 import reprlib
+import socket
 import struct
 import tempfile
 import unicodedata
@@ -30,6 +32,9 @@ from app.models import (
     ToolChoiceFunction,
     ToolChoiceTypes,
 )
+from app.utils import g_config
+
+MAX_REMOTE_FETCH_BYTES = 20 * 1024 * 1024
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
@@ -224,10 +229,44 @@ async def save_file_to_tempfile(
         return Path(tmp.name)
 
 
+def reject_unsafe_url(url: str) -> None:
+    """Reject remote URLs that could target internal/private networks (SSRF guard).
+
+    Allows only http/https. When `gemini.allow_private_url_fetch` is false (default),
+    any resolved address that is loopback, RFC1918-private, link-local, reserved,
+    multicast or unspecified is refused. DNS-rebinding TOCTOU between resolve and
+    fetch is a known residual; the opt-out knob exists for localhost-served images.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r} (only http/https allowed)")
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL must include a hostname")
+
+    if g_config.gemini.allow_private_url_fetch:
+        return
+
+    try:
+        addrinfos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve host {host!r}: {e}") from e
+
+    for addrinfo in addrinfos:
+        ip = ipaddress.ip_address(addrinfo[4][0])
+        # `is_global` covers private, loopback, link-local, reserved, unspecified,
+        # documentation and shared-address ranges. Multicast is the exception:
+        # ipaddress reports it as global even though it is not a valid fetch target.
+        if not ip.is_global or ip.is_multicast:
+            raise ValueError(
+                f"Refusing to fetch private/reserved address {ip} for host {host!r} "
+                "(set gemini.allow_private_url_fetch=true to override)"
+            )
+
+
 async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
     """Download content from a URL and save to a temporary file."""
-    data: bytes | None = None
-    suffix: str | None = None
     if url.startswith("data:"):
         metadata_part = url.split(",")[0]
         mime_type = metadata_part.split(":")[1].split(";")[0]
@@ -235,21 +274,52 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
         suffix = mimetypes.guess_extension(mime_type) or (
             f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
         )
-    else:
-        async with requests.AsyncSession(
-            impersonate="chrome", allow_redirects=CurlFollow.SAFE, http_version=CurlHttpVersion.NONE
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.content
-            if content_type := resp.headers.get("content-type"):
-                suffix = mimetypes.guess_extension(content_type.split(";")[0].strip())
-            if not suffix:
-                suffix = Path(urlparse(url).path).suffix or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
+            tmp.write(data)
+            return Path(tmp.name)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
-        tmp.write(data)
-        return Path(tmp.name)
+    reject_unsafe_url(url)
+    url_suffix = Path(urlparse(url).path).suffix or ".bin"
+    downloaded = 0
+    temp_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=url_suffix, dir=tempdir) as tmp:
+            temp_path = Path(tmp.name)
+
+            def receive_chunk(chunk: bytes) -> None:
+                nonlocal downloaded
+                downloaded += len(chunk)
+                if downloaded > MAX_REMOTE_FETCH_BYTES:
+                    raise ValueError(f"Remote fetch exceeded {MAX_REMOTE_FETCH_BYTES} bytes: {url}")
+                tmp.write(chunk)
+
+            async with requests.AsyncSession(
+                impersonate="chrome",
+                allow_redirects=CurlFollow.SAFE,
+                http_version=CurlHttpVersion.NONE,
+                timeout=g_config.gemini.url_fetch_timeout,
+            ) as client:
+                resp = await client.get(url, content_callback=receive_chunk)
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type")
+
+            suffix = (
+                mimetypes.guess_extension(content_type.split(";")[0].strip())
+                if content_type
+                else None
+            )
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+    assert temp_path is not None
+    if suffix and suffix != temp_path.suffix:
+        final_path = temp_path.with_suffix(suffix)
+        temp_path.rename(final_path)
+        return final_path
+    return temp_path
 
 
 def strip_tagged_blocks(text: str) -> str:
