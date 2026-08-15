@@ -40,11 +40,13 @@ type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValu
 
 VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
 TOOL_WRAP_HINT = (
-    "\n\nSYSTEM: TOOL CALLING PROTOCOL\n"
-    "When required, you MUST output ONLY the complete [ToolCalls] block; otherwise, you MUST NOT emit tool tags and MUST follow the requested format.\n"
-    "Names MUST match the schemas; values MUST use their JSON types. Every parameter value MUST be fenced with 3 backticks by default; use a longer outer fence than any internal backtick sequence.\n"
-    "Tags MUST be balanced and closed in reverse order. No prose or extra protocol tags.\n\n"
-    "FORMAT:\n"
+    "\n\nSYSTEM: TOOL CALLING PROTOCOL (MANDATORY)\n"
+    "Either emit the tool-call block alone, or answer in natural language with no protocol tags. Never both.\n\n"
+    "1. Names MUST match the schemas exactly; every required parameter MUST be present with its declared JSON type.\n"
+    "2. Each value MUST stand alone between two fences of 3 backticks; if it contains a backtick run, both fences MUST be longer.\n"
+    "3. Every opening tag MUST be closed in reverse order of opening. A fence closes only itself, never a tag. An unclosed tag voids the call.\n"
+    "4. Emit the block and nothing else. No preamble or commentary.\n\n"
+    "REQUIRED SYNTAX, reproduce literally:\n"
     "[ToolCalls]\n"
     "[Call:tool_name]\n"
     "[CallParameter:parameter_name]\n"
@@ -54,43 +56,46 @@ TOOL_WRAP_HINT = (
     "[/CallParameter]\n"
     "[/Call]\n"
     "[/ToolCalls]\n\n"
-    "CRITICAL: NEVER mix natural language with the [ToolCalls] block."
+    "END TOOL CALLING PROTOCOL"
 )
 STRUCTURED_JSON_WRAP_HINT = (
-    "\n\nSYSTEM: STRUCTURED JSON PROTOCOL\n"
-    "The structured response MUST be ONLY one fenced block containing exactly one valid JSON document conforming to the JSON Schema below. No prose or extra blocks.\n"
-    "Use ```json; the outer fence MUST exceed any internal backtick sequence.\n"
-    "FORMAT:\n"
+    "\n\nSYSTEM: STRUCTURED JSON PROTOCOL (MANDATORY)\n"
+    "1. Return exactly one fenced block holding one strict JSON document that validates against the JSON Schema below. No prose, no second block.\n"
+    "2. Open with ```json and close with a fence of the same length; if the JSON contains a backtick run, both fences MUST be longer.\n"
+    "3. Emit every required field with its declared type. NEVER truncate the document or omit the closing fence.\n\n"
+    "REQUIRED SYNTAX:\n"
     "```json\n"
     '{"field":"value"}\n'
     "```\n\n"
-    "CRITICAL: The JSON inside the fence MUST be the complete structured response."
+    "END STRUCTURED JSON PROTOCOL"
 )
 TOOL_INTERFACE_PROMPT = (
-    "SYSTEM INTERFACE: You MUST use an available tool when the request requires one, subject to the selected "
-    "tool-choice directive. You MUST follow each tool's JSON Schema exactly."
+    "SYSTEM INTERFACE: Call an available tool whenever the request requires one, with arguments that "
+    "validate against its JSON Schema. Never invent an undeclared tool or parameter."
 )
 TOOL_DESCRIPTION_PROMPT = "Tool `{name}`: {description}"
 TOOL_ARGUMENTS_SCHEMA_PROMPT = "Parameters JSON Schema:"
-TOOL_EMPTY_ARGUMENTS_SCHEMA_PROMPT = "Parameters JSON Schema: {}"
+TOOL_EMPTY_ARGUMENTS_SCHEMA_PROMPT = "Parameters JSON Schema: {} (takes no parameters)"
 TOOL_CHOICE_NONE_PROMPT = (
-    "TOOL CHOICE NONE: You MUST NOT call tools or emit tool tags. Return the requested response."
+    "TOOL CHOICE = none: You MUST NOT call a tool or emit any protocol tag this turn. "
+    "Answer in natural language."
 )
 TOOL_CHOICE_REQUIRED_PROMPT = (
-    "TOOL CHOICE REQUIRED: You MUST call at least one tool before the final response."
+    "TOOL CHOICE = required: You MUST call at least one tool this turn; "
+    "a natural-language answer alone is invalid."
 )
 TOOL_CHOICE_NAMED_PROMPT = (
-    "TOOL CHOICE REQUIRED: You MUST call only `{target_name}`; MUST NOT call any other tool."
+    "TOOL CHOICE = `{target_name}`: You MUST call `{target_name}` this turn and no other tool."
 )
 IMAGE_GENERATION_PROMPT = "\n\n".join(
     (
-        "IMAGE PROTOCOL: Image requests MUST return a generated image.",
-        "New requests MUST produce a new image; edits MUST return the edited image.",
-        "Return NO explanation, apology, placeholder, or text-only status.",
+        "IMAGE PROTOCOL: Every image request MUST be answered with a generated image attachment.",
+        "A new request MUST produce a new image; an edit MUST return the edited image.",
+        "NEVER substitute text for the image: no explanation, apology, progress note, or placeholder.",
     )
 )
 IMAGE_GENERATION_FORCED_PROMPT = (
-    "IMAGE REQUIRED: You MUST return at least one generated image; text-only is invalid."
+    "IMAGE REQUIRED: You MUST return at least one generated image; a text-only reply is a failure."
 )
 TOOL_BLOCK_RE = re.compile(
     r"\\?\[ToolCalls\\?](.*?)\\?\[\\?/ToolCalls\\?]",
@@ -122,23 +127,33 @@ CHATML_END_RE = re.compile(r"\\?<\\?\|im\\?_end\\?\|\\?>", re.IGNORECASE)
 COMMONMARK_UNESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 PARAM_FENCE_RE = re.compile(r"^(?P<fence>`{3,})")
 TOOL_HINT_STRIPPED = TOOL_WRAP_HINT.strip()
-_hint_lines = [line.strip() for line in TOOL_WRAP_HINT.split("\n") if line.strip()]
-TOOL_HINT_LINE_START = _hint_lines[0] if _hint_lines else ""
-TOOL_HINT_LINE_END = _hint_lines[-1] if _hint_lines else ""
-TOOL_HINT_START_ESC = re.escape(TOOL_HINT_LINE_START) if TOOL_HINT_LINE_START else ""
-TOOL_HINT_END_ESC = re.escape(TOOL_HINT_LINE_END) if TOOL_HINT_LINE_END else ""
+SYSTEM_HINTS = (TOOL_WRAP_HINT, STRUCTURED_JSON_WRAP_HINT)
 
-HINT_FULL_RE = (
-    re.compile(rf"\n?{TOOL_HINT_START_ESC}:?.*?{TOOL_HINT_END_ESC}\n?", re.DOTALL | re.IGNORECASE)
-    if TOOL_HINT_START_ESC and TOOL_HINT_END_ESC
-    else None
-)
-HINT_START_RE = (
-    re.compile(rf"\n?{TOOL_HINT_START_ESC}:?\s*", re.IGNORECASE) if TOOL_HINT_START_ESC else None
-)
-HINT_END_RE = (
-    re.compile(rf"\s*{TOOL_HINT_END_ESC}\n?", re.IGNORECASE) if TOOL_HINT_END_ESC else None
-)
+
+def _hint_anchors(hint: str) -> tuple[str, str]:
+    """Return a hint's first and last non-empty lines, used to locate echoed copies."""
+    lines = [line.strip() for line in hint.split("\n") if line.strip()]
+    return (lines[0], lines[-1]) if lines else ("", "")
+
+
+HINT_START_ANCHORS: list[str] = []
+HINT_END_ANCHORS: list[str] = []
+HINT_FULL_RES: list[re.Pattern[str]] = []
+HINT_START_RES: list[re.Pattern[str]] = []
+HINT_END_RES: list[re.Pattern[str]] = []
+
+for _hint in SYSTEM_HINTS:
+    _start, _end = _hint_anchors(_hint)
+    if not _start or not _end:
+        continue
+    _start_esc, _end_esc = re.escape(_start), re.escape(_end)
+    HINT_START_ANCHORS.append(_start)
+    HINT_END_ANCHORS.append(_end)
+    HINT_FULL_RES.append(
+        re.compile(rf"\n?{_start_esc}:?.*?{_end_esc}\n?", re.DOTALL | re.IGNORECASE)
+    )
+    HINT_START_RES.append(re.compile(rf"\n?{_start_esc}:?\s*", re.IGNORECASE))
+    HINT_END_RES.append(re.compile(rf"\s*{_end_esc}\n?", re.IGNORECASE))
 
 # --- Streaming Specific Patterns ---
 _START_PATTERNS = {
@@ -154,16 +169,40 @@ _START_PATTERNS = {
 _PROTOCOL_ENDS = r"\\?\[\\?/(?:ToolCalls|Call|ToolResults|CallParameter|ToolResult|Result)\\?]"
 _TAG_END = r"\\?<\\?\|im\\?_end\\?\|\\?>"
 
-if TOOL_HINT_START_ESC and TOOL_HINT_END_ESC:
-    _START_PATTERNS["HINT"] = rf"\n?{TOOL_HINT_START_ESC}:?\s*"
+if HINT_START_ANCHORS and HINT_END_ANCHORS:
+    _starts = "|".join(re.escape(anchor) for anchor in HINT_START_ANCHORS)
+    _START_PATTERNS["HINT"] = rf"\n?(?:{_starts}):?\s*"
 
 _master_parts = [f"(?P<{name}_START>{pattern})" for name, pattern in _START_PATTERNS.items()]
 _master_parts.extend((f"(?P<PROTOCOL_EXIT>{_PROTOCOL_ENDS})", f"(?P<TAG_EXIT>{_TAG_END})"))
-if TOOL_HINT_START_ESC and TOOL_HINT_END_ESC:
-    _master_parts.append(f"(?P<HINT_EXIT>{TOOL_HINT_END_ESC}\n?)")
+if HINT_START_ANCHORS and HINT_END_ANCHORS:
+    _ends = "|".join(re.escape(anchor) for anchor in HINT_END_ANCHORS)
+    _master_parts.append(f"(?P<HINT_EXIT>(?:{_ends})\n?)")
 
 STREAM_MASTER_RE = re.compile("|".join(_master_parts), re.IGNORECASE)
-STREAM_TAIL_RE = re.compile(
+
+# Partial markers held back until the next chunk completes them.
+_PARTIAL_MARKER = r"\\|\\?\[[^]]*|\\?<\\?\|?i?m?\\?_?(?:s?t?a?r?t?|e?n?d?)\\?\|?\\?>?"
+
+# Hint anchors are prose, so a chunk boundary inside one leaks the header.
+# The line-start requirement spares ordinary words sharing a prefix.
+_partial_anchors = sorted(
+    {
+        anchor[:length]
+        for anchor in (*HINT_START_ANCHORS, *HINT_END_ANCHORS)
+        for length in range(1, len(anchor))
+    },
+    key=len,
+    reverse=True,
+)
+if _partial_anchors:
+    _partial_anchor_alt = "|".join(re.escape(prefix) for prefix in _partial_anchors)
+    _PARTIAL_MARKER = rf"{_PARTIAL_MARKER}|(?:^|\n)(?:{_partial_anchor_alt})"
+
+STREAM_TAIL_RE = re.compile(rf"(?:{_PARTIAL_MARKER})$", re.IGNORECASE)
+
+# Flush discards what it matches, so it may only drop genuine protocol fragments.
+STREAM_FLUSH_TAIL_RE = re.compile(
     r"(?:\\|\\?\[[^]]*|\\?<\\?\|?i?m?\\?_?(?:s?t?a?r?t?|e?n?d?)\\?\|?\\?>?)$",
     re.IGNORECASE,
 )
@@ -387,14 +426,12 @@ def strip_system_hints(text: str) -> str:
 
     t_unescaped = unescape_text(text)
 
-    cleaned = t_unescaped.replace(TOOL_WRAP_HINT, "").replace(TOOL_HINT_STRIPPED, "")
+    cleaned = t_unescaped
+    for hint in SYSTEM_HINTS:
+        cleaned = cleaned.replace(hint, "").replace(hint.strip(), "")
 
-    if HINT_FULL_RE:
-        cleaned = HINT_FULL_RE.sub("", cleaned)
-    if HINT_START_RE:
-        cleaned = HINT_START_RE.sub("", cleaned)
-    if HINT_END_RE:
-        cleaned = HINT_END_RE.sub("", cleaned)
+    for pattern in (*HINT_FULL_RES, *HINT_START_RES, *HINT_END_RES):
+        cleaned = pattern.sub("", cleaned)
 
     cleaned = strip_tagged_blocks(cleaned)
     cleaned = CONTROL_TOKEN_RE.sub("", cleaned)
@@ -426,23 +463,21 @@ def _process_tools_internal(text: str, extract: bool = True) -> tuple[str, list[
         name = unescape_text(name.strip())
         raw_args = unescape_text(raw_args)
 
+        # Leftovers mean the call was cut short: drop it rather than emit partial arguments.
+        residue = TAGGED_ARG_RE.sub("", raw_args).strip()
+        if residue:
+            logger.warning(
+                f"Dropping malformed tool call '{name}'. Unparsed content: {reprlib.repr(residue)}"
+            )
+            return
+
         arg_matches = TAGGED_ARG_RE.findall(raw_args)
-        if arg_matches:
-            args_dict = {
-                arg_name.strip(): _parse_tool_argument_value(arg_value)
-                for arg_name, arg_value in arg_matches
-            }
-            arguments = orjson.dumps(args_dict).decode("utf-8")
-            logger.debug(f"Successfully parsed {len(args_dict)} arguments for tool: {name}")
-        else:
-            cleaned_raw = raw_args.strip()
-            if not cleaned_raw:
-                logger.debug(f"Successfully parsed 0 arguments for tool: {name}")
-            else:
-                logger.warning(
-                    f"Malformed arguments for tool '{name}'. Text found but no valid tags: {reprlib.repr(cleaned_raw)}"
-                )
-            arguments = "{}"
+        args_dict = {
+            arg_name.strip(): _parse_tool_argument_value(arg_value)
+            for arg_name, arg_value in arg_matches
+        }
+        arguments = orjson.dumps(args_dict).decode("utf-8")
+        logger.debug(f"Successfully parsed {len(args_dict)} arguments for tool: {name}")
 
         index = len(tool_calls)
         seed = f"{name}:{arguments}:{index}".encode()

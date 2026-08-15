@@ -65,6 +65,7 @@ from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversation
 from app.utils import g_config
 from app.utils.config import ChatMode
 from app.utils.helper import (
+    STREAM_FLUSH_TAIL_RE,
     STREAM_MASTER_RE,
     STREAM_TAIL_RE,
     STRUCTURED_JSON_WRAP_HINT,
@@ -1140,7 +1141,7 @@ class StreamingOutputFilter:
         res = ""
         if self._is_outputting():
             res = self.buffer
-            if tail_match := STREAM_TAIL_RE.search(res):
+            if tail_match := STREAM_FLUSH_TAIL_RE.search(res):
                 res = res[: -len(tail_match.group(0))]
 
         self.buffer = ""
