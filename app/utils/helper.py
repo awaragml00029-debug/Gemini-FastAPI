@@ -40,12 +40,11 @@ type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValu
 
 VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
 TOOL_WRAP_HINT = (
-    "\n\n### SYSTEM: TOOL CALLING PROTOCOL (MANDATORY) ###\n"
-    "If tool execution is required, you MUST adhere to this EXACT protocol. No exceptions.\n\n"
-    "1. OUTPUT RESTRICTION: Your response MUST contain ONLY the [ToolCalls] block. Conversational filler, preambles, or concluding remarks are STRICTLY PROHIBITED.\n"
-    "2. WRAPPING LOGIC: Every parameter value MUST be enclosed in a markdown code block. Use 3 backticks (```) by default. If the value contains backticks, the outer fence MUST be longer than any sequence inside (e.g., ````).\n"
-    "3. TAG SYMMETRY: All tags MUST be balanced and closed in the exact reverse order of opening. Incomplete or unclosed blocks are strictly prohibited.\n\n"
-    "REQUIRED SYNTAX:\n"
+    "\n\nSYSTEM: TOOL CALLING PROTOCOL\n"
+    "When required, you MUST output ONLY the complete [ToolCalls] block; otherwise, you MUST NOT emit tool tags and MUST follow the requested format.\n"
+    "Names MUST match the schemas; values MUST use their JSON types. Every parameter value MUST be fenced with 3 backticks by default; use a longer outer fence than any internal backtick sequence.\n"
+    "Tags MUST be balanced and closed in reverse order. No prose or extra protocol tags.\n\n"
+    "FORMAT:\n"
     "[ToolCalls]\n"
     "[Call:tool_name]\n"
     "[CallParameter:parameter_name]\n"
@@ -55,17 +54,43 @@ TOOL_WRAP_HINT = (
     "[/CallParameter]\n"
     "[/Call]\n"
     "[/ToolCalls]\n\n"
-    "CRITICAL: Do NOT mix natural language with protocol tags. Either respond naturally OR provide the protocol block alone. There is no middle ground."
+    "CRITICAL: NEVER mix natural language with the [ToolCalls] block."
 )
 STRUCTURED_JSON_WRAP_HINT = (
-    "\n\n### SYSTEM: STRUCTURED JSON PROTOCOL (MANDATORY) ###\n"
-    "Return ONLY one markdown code block containing a single strict JSON document that conforms to the provided JSON Schema.\n"
-    "Use ```json by default. If the JSON contains backticks, the outer fence MUST be longer than any backtick sequence inside (e.g., ````json).\n"
-    "REQUIRED SYNTAX:\n"
+    "\n\nSYSTEM: STRUCTURED JSON PROTOCOL\n"
+    "The structured response MUST be ONLY one fenced block containing exactly one valid JSON document conforming to the JSON Schema below. No prose or extra blocks.\n"
+    "Use ```json; the outer fence MUST exceed any internal backtick sequence.\n"
+    "FORMAT:\n"
     "```json\n"
     '{"field":"value"}\n'
     "```\n\n"
-    "CRITICAL: Do NOT mix natural language with the fenced JSON block. Provide the protocol block alone. There is no middle ground."
+    "CRITICAL: The JSON inside the fence MUST be the complete structured response."
+)
+TOOL_INTERFACE_PROMPT = (
+    "SYSTEM INTERFACE: You MUST use an available tool when the request requires one, subject to the selected "
+    "tool-choice directive. You MUST follow each tool's JSON Schema exactly."
+)
+TOOL_DESCRIPTION_PROMPT = "Tool `{name}`: {description}"
+TOOL_ARGUMENTS_SCHEMA_PROMPT = "Parameters JSON Schema:"
+TOOL_EMPTY_ARGUMENTS_SCHEMA_PROMPT = "Parameters JSON Schema: {}"
+TOOL_CHOICE_NONE_PROMPT = (
+    "TOOL CHOICE NONE: You MUST NOT call tools or emit tool tags. Return the requested response."
+)
+TOOL_CHOICE_REQUIRED_PROMPT = (
+    "TOOL CHOICE REQUIRED: You MUST call at least one tool before the final response."
+)
+TOOL_CHOICE_NAMED_PROMPT = (
+    "TOOL CHOICE REQUIRED: You MUST call only `{target_name}`; MUST NOT call any other tool."
+)
+IMAGE_GENERATION_PROMPT = "\n\n".join(
+    (
+        "IMAGE PROTOCOL: Image requests MUST return a generated image.",
+        "New requests MUST produce a new image; edits MUST return the edited image.",
+        "Return NO explanation, apology, placeholder, or text-only status.",
+    )
+)
+IMAGE_GENERATION_FORCED_PROMPT = (
+    "IMAGE REQUIRED: You MUST return at least one generated image; text-only is invalid."
 )
 TOOL_BLOCK_RE = re.compile(
     r"\\?\[ToolCalls\\?](.*?)\\?\[\\?/ToolCalls\\?]",
@@ -776,33 +801,25 @@ def build_tool_prompt(
     if not tools:
         return ""
 
-    lines: list[str] = [
-        "SYSTEM INTERFACE: You have access to the following technical tools. You MUST invoke them when necessary to fulfill the request, strictly adhering to the provided JSON schemas."
-    ]
+    lines: list[str] = [TOOL_INTERFACE_PROMPT]
 
     for tool in tools:
         name, description, parameters = extract_tool_info(tool)
         if not name:
             continue
-        lines.append(f"Tool `{name}`: {description}")
+        lines.append(TOOL_DESCRIPTION_PROMPT.format(name=name, description=description))
         if parameters:
             schema_text = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS).decode("utf-8")
-            lines.extend(("Arguments JSON schema:", schema_text))
+            lines.extend((TOOL_ARGUMENTS_SCHEMA_PROMPT, schema_text))
         else:
-            lines.append("Arguments JSON schema: {}")
+            lines.append(TOOL_EMPTY_ARGUMENTS_SCHEMA_PROMPT)
 
     if tool_choice == "none":
-        lines.append(
-            "For this request you must not call any tool. Provide the best possible natural language answer."
-        )
+        lines.append(TOOL_CHOICE_NONE_PROMPT)
     elif tool_choice == "required":
-        lines.append(
-            "You must call at least one tool before responding to the user. Do not provide a final user-facing answer until a tool call has been issued."
-        )
+        lines.append(TOOL_CHOICE_REQUIRED_PROMPT)
     elif (target_name := extract_named_tool_choice(tool_choice)) is not None:
-        lines.append(
-            f"You are required to call the tool named `{target_name}`. Do not call any other tool."
-        )
+        lines.append(TOOL_CHOICE_NAMED_PROMPT.format(target_name=target_name))
 
     lines.append(TOOL_WRAP_HINT)
 
@@ -820,18 +837,10 @@ def build_image_generation_instruction(
     if not has_forced_choice and primary is None:
         return None
 
-    instructions: list[str] = [
-        "IMAGE GENERATION ENABLED: When an image is requested, you MUST return a real generated image directly.",
-        "1. For new requests, generate new images matching the description immediately.",
-        "2. For edits to existing images, apply changes and return a new generated version.",
-        "3. CRITICAL: Provide ZERO text explanation, prologue, or apologies. Do not describe the creation process.",
-        "4. NEVER send placeholder text or descriptions like 'Generating image...' without an actual image attachment.",
-    ]
+    instructions = [IMAGE_GENERATION_PROMPT]
 
     if has_forced_choice:
-        instructions.append(
-            "Image generation was explicitly requested. You MUST return at least one generated image. Any response without an image will be treated as a failure."
-        )
+        instructions.append(IMAGE_GENERATION_FORCED_PROMPT)
 
     return "\n\n".join(instructions)
 
