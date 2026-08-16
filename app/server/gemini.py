@@ -1,26 +1,18 @@
-"""Gemini REST API v1beta native endpoints (ported from fork fujunchao, adapted to our tree).
+"""Native Gemini REST API v1beta endpoints.
 
-Endpoints (Google Gemini API compatible):
-- GET  /v1beta/models             — list models
-- GET  /v1beta/models/{model}     — get one model
-- POST /v1beta/models/{model}:generateContent       — non-streaming generation
+- GET  /v1beta/models                                — list models
+- GET  /v1beta/models/{model}                        — get one model
+- POST /v1beta/models/{model}:generateContent        — non-streaming generation
 - POST /v1beta/models/{model}:streamGenerateContent  — streaming (SSE)
 
-Reuses OUR chat.py helpers; no chat.py changes were made (C1 parallel-safety).
-Adaptation deltas vs the fork (see .metacog/fork-evals/fujunchao.md §5):
-- helpers live in app/utils/helper.py as calculate_usage / process_llm_output /
-  normalize_llm_text (no _-prefix, no chat.py copies)
-- image store helpers are get_media_store_dir / get_media_token; media served at
-  /media/{fname}?token= (not /images/)
-- _find_reusable_session returns a 4-tuple here (session, client, remain, conv)
-- _persist_conversation takes the client wrapper and no thoughts argument here
-- _get_available_models requires a pool: pass GeminiClientPool() (a singleton that
-  lifespan already initialized)
-- GeminiClientWrapper.extract_output does not exist here; use normalize_llm_text
-- internal message types are AppMessage/AppContentItem/AppToolCall(+Function),
-  tools are FunctionTool (flat schema)
-- Gemini fileData (Files API URI) parts are logged and skipped: our pipeline only
-  accepts base64 file_data items, and a Google fileUri cannot be fetched locally.
+Requests are translated into the same internal AppMessage/FunctionTool pipeline the
+OpenAI-shaped routes use, so this module owns only the Gemini wire format: it converts
+`contents` in, converts candidates back out, and renders errors in Google's envelope.
+
+Two Gemini features have no local equivalent and are refused rather than dropped, because
+silently ignoring them would change what the model is answering: `fileData` (a Files API URI
+this process cannot fetch) and `cachedContent`. Generation controls Gemini Web does not expose
+are accepted and logged instead - see `_log_ignored_gemini_options`.
 """
 
 from __future__ import annotations
@@ -46,6 +38,7 @@ from app.models import (
     AppToolCall,
     AppToolCallFunction,
     FunctionTool,
+    StructuredOutputRequirement,
     ToolChoiceFunction,
 )
 from app.models.gemini_models import (
@@ -56,6 +49,7 @@ from app.models.gemini_models import (
     GeminiFunctionCall,
     GeminiGenerateContentRequest,
     GeminiGenerateContentResponse,
+    GeminiGenerationConfig,
     GeminiInlineData,
     GeminiModelInfo,
     GeminiModelListResponse,
@@ -63,7 +57,7 @@ from app.models.gemini_models import (
     GeminiUsageMetadata,
 )
 
-# 从 chat.py 导入已有辅助函数(不修改 chat.py)
+# Shared request/response pipeline helpers; this module owns only the Gemini wire format.
 from app.server.chat import (
     StreamingOutputFilter,
     _build_structured_requirement,
@@ -72,8 +66,11 @@ from app.server.chat import (
     _image_to_base64,
     _persist_conversation,
     _prepare_messages_for_model,
+    _requires_upload,
     _resolve_model_name,
-    _send_with_split,
+    _send_with_internal_fallback,
+    _tool_choice_failure,
+    _use_temporary_chat_mode,
 )
 from app.server.middleware import (
     get_media_store_dir,
@@ -82,7 +79,15 @@ from app.server.middleware import (
     verify_gemini_api_key,
 )
 from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
-from app.utils.helper import calculate_usage, normalize_llm_text, process_llm_output
+from app.utils.helper import (
+    StructuredOutputValidationError,
+    calculate_usage,
+    guess_extension_for_mime,
+    normalize_llm_text,
+    normalize_openapi_schema,
+    process_llm_output,
+    validate_json_schema,
+)
 
 router = APIRouter()
 
@@ -173,12 +178,18 @@ def _gemini_contents_to_messages(
                 text_fragments.append(part.text)
 
             if part.inlineData:
-                data_url = f"data:{part.inlineData.mimeType};base64,{part.inlineData.data}"
-                content_items.append(AppContentItem(type="image_url", url=data_url))
+                suffix = guess_extension_for_mime(part.inlineData.mimeType)
+                content_items.append(
+                    AppContentItem(
+                        type="file",
+                        file_data=part.inlineData.data,
+                        filename=f"inline{suffix}",
+                    )
+                )
 
             if part.fileData:
-                # Our pipeline only accepts base64 file_data items; a Google Files API
-                # fileUri cannot be fetched locally. Log and skip (disclosed in C1 report).
+                # Unreachable via the routes, which reject fileData up front; kept so a direct
+                # caller of this converter degrades instead of silently mis-building a prompt.
                 logger.warning(
                     "[Gemini API] Skipping fileData part "
                     f"(unsupported): {reprlib.repr(part.fileData.fileUri)}"
@@ -273,12 +284,29 @@ def _gemini_tools_to_internal(
         )
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceFunction | None = None
     if tool_config and tool_config.functionCallingConfig:
-        mode = tool_config.functionCallingConfig.mode.upper()
+        call_config = tool_config.functionCallingConfig
+        mode = call_config.mode.upper()
+
+        # Google: "This should only be set when the Mode is ANY or VALIDATED." Acting on it
+        # under AUTO or NONE would hide tools the upstream would still have offered.
+        allowed_names = (
+            set(call_config.allowedFunctionNames or [])
+            if mode in {"ANY", "VALIDATED"}
+            else set[str]()
+        )
+        if allowed_names:
+            internal_tools = [tool for tool in internal_tools if tool.name in allowed_names]
+
         if mode == "NONE":
             tool_choice = cast(Literal["none", "auto", "required"], "none")
         elif mode == "ANY":
-            tool_choice = cast(Literal["none", "auto", "required"], "required")
-        else:  # AUTO
+            tool_choice = (
+                ToolChoiceFunction(type="function", name=next(iter(allowed_names)))
+                if len(allowed_names) == 1
+                else cast(Literal["none", "auto", "required"], "required")
+            )
+        else:
+            # AUTO, and VALIDATED - which also permits a natural-language answer.
             tool_choice = "auto"
 
     return internal_tools or None, tool_choice
@@ -348,8 +376,46 @@ def _to_gemini_error(status_code: int, message: str, grpc_status: str) -> Gemini
     )
 
 
+def _log_ignored_gemini_options(
+    request: GeminiGenerateContentRequest, response_schema: dict[str, Any] | None
+) -> None:
+    """Debug-log valid Gemini options that the Gemini Web client cannot forward.
+
+    `response_schema` is the already-translated result of `_gemini_response_schema`, passed in
+    rather than recomputed so the OpenAPI translation and its validation run once per request.
+    """
+    ignored: set[str] = set()
+    if "safetySettings" in request.model_fields_set:
+        ignored.add("safetySettings")
+
+    if gen_cfg := request.generationConfig:
+        supported_structured_fields: set[str] = set()
+        if gen_cfg.responseMimeType == "application/json":
+            supported_structured_fields.add("responseMimeType")
+        # The schema fields count as honored only if one survived translation. An empty schema
+        # is valid and still counts; `None` alone means translation failed or none was supplied.
+        if response_schema is not None:
+            supported_structured_fields.update(("responseSchema", "responseJsonSchema"))
+        ignored.update(
+            name for name in gen_cfg.model_fields_set if name not in supported_structured_fields
+        )
+
+    if request.toolConfig and (call_config := request.toolConfig.functionCallingConfig):
+        mode = call_config.mode.upper()
+        if mode == "VALIDATED":
+            ignored.add("toolConfig.functionCallingConfig.mode")
+        if call_config.allowedFunctionNames and mode not in {"ANY", "VALIDATED"}:
+            ignored.add("toolConfig.functionCallingConfig.allowedFunctionNames")
+
+    if ignored:
+        logger.debug(
+            "[Gemini API] Ignoring option(s) unsupported by the Gemini Web upstream: "
+            f"{', '.join(sorted(ignored))}"
+        )
+
+
 def _validate_gemini_request(request: GeminiGenerateContentRequest) -> str | None:
-    """Reject only structures that would otherwise be silently dropped from the prompt."""
+    """Reject malformed or unrepresentable inputs, not optional generation controls."""
     if not request.contents:
         return "contents is required and cannot be empty."
 
@@ -362,7 +428,87 @@ def _validate_gemini_request(request: GeminiGenerateContentRequest) -> str | Non
         part.fileData is not None for part in request.systemInstruction.parts
     ):
         return "fileData is not supported; provide the data using inlineData instead."
+
+    if request.cachedContent is not None:
+        return "cachedContent is not supported by the Gemini Web upstream."
+
+    if request.toolConfig and request.toolConfig.functionCallingConfig:
+        call_config = request.toolConfig.functionCallingConfig
+        # Only meaningful in the modes that act on it; elsewhere it is ignored, not invalid.
+        if call_config.mode.upper() in {"ANY", "VALIDATED"}:
+            declared_names = {
+                declaration.name
+                for tool in request.tools or []
+                for declaration in tool.functionDeclarations
+            }
+            allowed_names = set(call_config.allowedFunctionNames or [])
+            if unknown_names := allowed_names - declared_names:
+                return (
+                    f"allowedFunctionNames contains undeclared functions: {sorted(unknown_names)}"
+                )
+
+    if request.generationConfig:
+        gen_cfg = request.generationConfig
+        # Only `responseJsonSchema` is JSON Schema, so only it can be judged as such.
+        # `responseSchema` is the OpenAPI subset, translated at use time; a gap in that
+        # translation must not turn a valid Gemini request into a 400.
+        if (
+            gen_cfg.responseMimeType == "application/json"
+            and gen_cfg.responseJsonSchema is not None
+        ):
+            try:
+                validate_json_schema(gen_cfg.responseJsonSchema)
+            except ValueError as exc:
+                return str(exc)
     return None
+
+
+def _gemini_response_schema(gen_cfg: GeminiGenerationConfig) -> dict[str, Any] | None:
+    """Return the requested response schema as JSON Schema, or None if it cannot be used."""
+    if gen_cfg.responseMimeType != "application/json":
+        return None
+
+    if gen_cfg.responseJsonSchema is not None:
+        return gen_cfg.responseJsonSchema
+
+    if gen_cfg.responseSchema is None:
+        return None
+
+    schema = normalize_openapi_schema(gen_cfg.responseSchema)
+    try:
+        validate_json_schema(schema)
+    except ValueError as exc:
+        # Enforcing a schema we could not translate would reject good answers.
+        logger.debug(f"[Gemini API] Ignoring responseSchema that is not representable: {exc}")
+        return None
+    return schema
+
+
+def _gemini_structured_requirement(
+    request: GeminiGenerateContentRequest,
+) -> tuple[dict[str, Any] | None, StructuredOutputRequirement | None]:
+    """Translate the requested response schema once, returning it with its requirement.
+
+    The requirement is deliberately non-strict. Google's own API guarantees conformance through
+    constrained decoding; Gemini Web offers no such control, so the schema can only be asked for
+    in the prompt. Failing the request on a near-miss would throw away an answer the caller can
+    still use, so a violation degrades to the raw text and is logged instead.
+    """
+    if not request.generationConfig:
+        return None, None
+
+    gen_cfg = request.generationConfig
+    if gen_cfg.responseMimeType != "application/json":
+        return None, None
+
+    schema = _gemini_response_schema(gen_cfg)
+    response_format = (
+        {"type": "json_object"}
+        if schema is None
+        else {"type": "json_schema", "json_schema": {"schema": schema, "strict": False}}
+    )
+    requirement = _build_structured_requirement(response_format)
+    return schema, requirement
 
 
 def _strip_model_prefix(model: str) -> str:
@@ -442,27 +588,28 @@ async def gemini_generate_content(
     if validation_error := _validate_gemini_request(request):
         err = _to_gemini_error(400, validation_error, "INVALID_ARGUMENT")
         return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
+    response_schema, structured_requirement = _gemini_structured_requirement(request)
+    _log_ignored_gemini_options(request, response_schema)
 
     messages = _gemini_contents_to_messages(request.contents, request.systemInstruction)
 
     internal_tools, tool_choice = _gemini_tools_to_internal(request.tools, request.toolConfig)
-
-    structured_requirement = None
-    if request.generationConfig:
-        gen_cfg = request.generationConfig
-        schema = gen_cfg.responseSchema or gen_cfg.responseJsonSchema
-        if gen_cfg.responseMimeType == "application/json" and schema:
-            structured_requirement = _build_structured_requirement(
-                {"type": "json_schema", "json_schema": {"schema": schema}}
-            )
 
     extra_instr = [structured_requirement.instruction] if structured_requirement else None
 
     msgs = _prepare_messages_for_model(messages, internal_tools, tool_choice, extra_instr)
 
     pool, db = GeminiClientPool(), LMDBConversationStore()
-
-    session, client, remain, _conv = await _find_reusable_session(db, pool, model_obj, msgs)
+    use_temporary = _use_temporary_chat_mode()
+    needs_upload = _requires_upload(msgs, use_temporary)
+    session, client, remain, stored_conv = await _find_reusable_session(
+        db,
+        pool,
+        model_obj,
+        msgs,
+        temporary=use_temporary,
+        require_account=needs_upload,
+    )
 
     if session:
         if not remain:
@@ -479,8 +626,8 @@ async def gemini_generate_content(
         )
     else:
         try:
-            client = await pool.acquire()
-            session = client.start_chat(model=model_obj)
+            client = await pool.acquire(require_account=needs_upload)
+            session = client.start_chat(model=client.usable_model(model_obj))
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
         except Exception as e:
             logger.exception("[Gemini API] Failed to prepare session")
@@ -493,8 +640,19 @@ async def gemini_generate_content(
         logger.debug(
             f"[Gemini API] Client: {client.id}, input len: {len(m_input)}, files: {len(files)}"
         )
-        resp = await _send_with_split(
-            session, m_input, files=cast("list[Path | str | io.BytesIO]", files), stream=False
+        resp, session, client = await _send_with_internal_fallback(
+            pool=pool,
+            db=db,
+            resolved_model=model_obj,
+            session=session,
+            client=client,
+            current_input=m_input,
+            files=cast("list[Path | str | io.BytesIO]", files),
+            full_prepared_messages=msgs,
+            stored_conversation=stored_conv,
+            tmp_dir=tmp_dir,
+            stream=False,
+            temporary=use_temporary,
         )
     except Exception as e:
         logger.exception("[Gemini API] Gemini call failed")
@@ -510,9 +668,16 @@ async def gemini_generate_content(
         err = _to_gemini_error(502, "Malformed response.", "INTERNAL")
         return JSONResponse(status_code=502, content=err.model_dump(mode="json"))
 
-    thoughts, visible_output, storage_output, tool_calls = process_llm_output(
-        thoughts, raw_clean, structured_requirement
-    )
+    try:
+        thoughts, visible_output, storage_output, tool_calls = process_llm_output(
+            thoughts, raw_clean, structured_requirement
+        )
+    except StructuredOutputValidationError as exc:
+        err = _to_gemini_error(502, str(exc), "INTERNAL")
+        return JSONResponse(status_code=502, content=err.model_dump(mode="json"))
+    if choice_error := _tool_choice_failure(tool_choice, tool_calls):
+        err = _to_gemini_error(502, choice_error, "INTERNAL")
+        return JSONResponse(status_code=502, content=err.model_dump(mode="json"))
 
     # Images: collect Gemini images → inlineData parts + markdown URL for LMDB persistence
     image_parts: list[GeminiPart] = []
@@ -581,24 +746,26 @@ async def gemini_stream_generate_content(
     if validation_error := _validate_gemini_request(request):
         err = _to_gemini_error(400, validation_error, "INVALID_ARGUMENT")
         return JSONResponse(status_code=400, content=err.model_dump(mode="json"))
+    response_schema, structured_requirement = _gemini_structured_requirement(request)
+    _log_ignored_gemini_options(request, response_schema)
 
     messages = _gemini_contents_to_messages(request.contents, request.systemInstruction)
     internal_tools, tool_choice = _gemini_tools_to_internal(request.tools, request.toolConfig)
-
-    structured_requirement = None
-    if request.generationConfig:
-        gen_cfg = request.generationConfig
-        schema = gen_cfg.responseSchema or gen_cfg.responseJsonSchema
-        if gen_cfg.responseMimeType == "application/json" and schema:
-            structured_requirement = _build_structured_requirement(
-                {"type": "json_schema", "json_schema": {"schema": schema}}
-            )
 
     extra_instr = [structured_requirement.instruction] if structured_requirement else None
     msgs = _prepare_messages_for_model(messages, internal_tools, tool_choice, extra_instr)
 
     pool, db = GeminiClientPool(), LMDBConversationStore()
-    session, client, remain, _conv = await _find_reusable_session(db, pool, model_obj, msgs)
+    use_temporary = _use_temporary_chat_mode()
+    needs_upload = _requires_upload(msgs, use_temporary)
+    session, client, remain, stored_conv = await _find_reusable_session(
+        db,
+        pool,
+        model_obj,
+        msgs,
+        temporary=use_temporary,
+        require_account=needs_upload,
+    )
 
     if session:
         if not remain:
@@ -611,8 +778,8 @@ async def gemini_stream_generate_content(
         m_input, files = await GeminiClientWrapper.process_conversation(input_msgs, tmp_dir)
     else:
         try:
-            client = await pool.acquire()
-            session = client.start_chat(model=model_obj)
+            client = await pool.acquire(require_account=needs_upload)
+            session = client.start_chat(model=client.usable_model(model_obj))
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
         except Exception as e:
             logger.exception("[Gemini API] Failed to prepare streaming session")
@@ -622,8 +789,19 @@ async def gemini_stream_generate_content(
     try:
         assert session is not None
         assert client is not None
-        generator = await _send_with_split(
-            session, m_input, files=cast("list[Path | str | io.BytesIO]", files), stream=True
+        generator, session, client = await _send_with_internal_fallback(
+            pool=pool,
+            db=db,
+            resolved_model=model_obj,
+            session=session,
+            client=client,
+            current_input=m_input,
+            files=cast("list[Path | str | io.BytesIO]", files),
+            full_prepared_messages=msgs,
+            stored_conversation=stored_conv,
+            tmp_dir=tmp_dir,
+            stream=True,
+            temporary=use_temporary,
         )
     except Exception as e:
         logger.exception("[Gemini API] Gemini streaming call failed")
@@ -636,9 +814,10 @@ async def gemini_stream_generate_content(
         messages=msgs,
         original_messages=messages,
         db=db,
-        model=model_obj,
+        resolved_model=model_obj,
         client_wrapper=client,
         session=session,
+        tool_choice=tool_choice,
         structured_requirement=structured_requirement,
         base_url=str(raw_request.base_url).rstrip("/"),
     )
@@ -650,9 +829,10 @@ def _create_gemini_streaming_response(
     messages: list[AppMessage],
     original_messages: list[AppMessage],
     db: LMDBConversationStore,
-    model,
+    resolved_model: str,
     client_wrapper: GeminiClientWrapper,
     session,
+    tool_choice: Literal["none", "auto", "required"] | ToolChoiceFunction | None,
     structured_requirement=None,
     base_url: str = "",
 ) -> StreamingResponse:
@@ -692,7 +872,9 @@ def _create_gemini_streaming_response(
 
                 if text_delta := chunk.text_delta:
                     full_text += text_delta
-                    if visible_delta := suppressor.process(text_delta):
+                    if not structured_requirement and (
+                        visible_delta := suppressor.process(text_delta)
+                    ):
                         chunk_resp = GeminiGenerateContentResponse(
                             candidates=[
                                 GeminiCandidate(
@@ -719,7 +901,7 @@ def _create_gemini_streaming_response(
             if last_chunk.thoughts:
                 full_thoughts = last_chunk.thoughts
 
-        if remaining_text := suppressor.flush():
+        if not structured_requirement and (remaining_text := suppressor.flush()):
             chunk_resp = GeminiGenerateContentResponse(
                 candidates=[
                     GeminiCandidate(
@@ -734,10 +916,39 @@ def _create_gemini_streaming_response(
             yield f"data: {orjson.dumps(chunk_resp.model_dump(mode='json', exclude_none=True)).decode('utf-8')}\n\n"
 
         # --- post-processing: protective layer so the SSE tail survives errors ---
+        # The two expected failures are reported with their own message and status, matching the
+        # non-streaming route; only genuinely unexpected errors fall through to the catch-all,
+        # which cannot say anything more useful than that something broke.
         try:
             _thoughts, visible_output, storage_output, tool_calls = process_llm_output(
                 full_thoughts, full_text, structured_requirement
             )
+        except StructuredOutputValidationError as exc:
+            logger.warning(f"[Gemini API] Structured output rejected mid-stream: {exc}")
+            err_resp = _to_gemini_error(502, str(exc), "INTERNAL")
+            yield f"data: {orjson.dumps(err_resp.model_dump(mode='json')).decode('utf-8')}\n\n"
+            return
+
+        if choice_error := _tool_choice_failure(tool_choice, tool_calls):
+            logger.warning(f"[Gemini API] Forced tool choice unmet mid-stream: {choice_error}")
+            err_resp = _to_gemini_error(502, choice_error, "INTERNAL")
+            yield f"data: {orjson.dumps(err_resp.model_dump(mode='json')).decode('utf-8')}\n\n"
+            return
+
+        try:
+            if structured_requirement and visible_output:
+                structured_chunk = GeminiGenerateContentResponse(
+                    candidates=[
+                        GeminiCandidate(
+                            content=GeminiContent(
+                                role="model",
+                                parts=[GeminiPart(text=visible_output)],
+                            ),
+                            index=0,
+                        )
+                    ],
+                )
+                yield f"data: {orjson.dumps(structured_chunk.model_dump(mode='json', exclude_none=True)).decode('utf-8')}\n\n"
 
             image_store = get_media_store_dir()
             seen_hashes: set[str] = set()
@@ -831,7 +1042,7 @@ def _create_gemini_streaming_response(
 
             _persist_conversation(
                 db,
-                model.model_name,
+                resolved_model,
                 client_wrapper,
                 session.metadata,
                 messages,

@@ -140,8 +140,10 @@ class GeminiClientWrapper(GeminiClient):
                 return None, await save_url_to_tempfile(item_media_url, tempdir)
             raise ValueError(f"{item.type} cannot be empty")
         elif item.type == "file":
+            if file_url := getattr(item, "url", None):
+                return None, await save_url_to_tempfile(file_url, tempdir)
             if not (file_data := getattr(item, "file_data", None)):
-                raise ValueError("File must contain 'file_data'")
+                raise ValueError("File must contain 'file_data' or 'url'")
             filename = getattr(item, "filename", "") or ""
             return None, await save_file_to_tempfile(file_data, filename, tempdir)
         elif item.type == "input_audio":

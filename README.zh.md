@@ -24,7 +24,7 @@
 
 ### 前置条件
 
-- Python 3.13
+- Python >= 3.13
 - 拥有网页版 Gemini 访问权限的 Google 账号 (开启 **[Gemini Apps 应用活动](https://myactivity.google.com/product/gemini)** 以获得最佳会话持久化体验)
 - 从 Gemini 网页获取的 `secure_1psid` 和 `secure_1psidts` Cookie
 
@@ -81,22 +81,57 @@ python run.py
 
 ### OpenAI 兼容接口
 
-这些接口遵循 OpenAI 的 API 规范，允许你将 Gemini 作为 **Drop-in 替代方案** 直接接入现有的 AI 应用。
+这些接口使用 OpenAI 兼容的传输格式，并将请求转换后发送给 Gemini 网页端。兼容范围有意
+覆盖 Gemini 网页端客户端实际暴露的控制项：对于客户端无法转发但请求模型已识别的有效选项，
+服务会正常接受并忽略，同时在调试日志中记录选项名称，避免其阻止其他可表示的请求内容执行。
 
 - **`GET /v1/models`**: 列出所有可用的 Gemini 模型。
 - **`POST /v1/chat/completions`**: 统一聊天对话接口。
   - **流式传输**: 设置 `stream: true` 即可实时接收增量响应 (Stream Delta)。
   - **多模态支持**: 支持在消息中包含文本、图片以及文件上传。
   - **工具调用**: 支持通过 `tools` 参数进行函数调用 (Function Calling)。
-  - **结构化输出**: 支持 `response_format`，可严格遵循 JSON Schema。
+  - **结构化输出**: 支持 `response_format` 的全部模式。`json_schema` 会在服务器端按所给
+    Schema 验证；`json_object`（JSON 模式）只要求回复能解析为 JSON；`text` 为默认值，不作限制。
 
 ### 高级接口
 
-- **`POST /v1/responses`**: 用于复杂交互模式的专用接口，支持分步输出、生成图片及工具调用等更丰富的响应项。
+- **`POST /v1/responses`**: 支持当前的 `text.format` 结构化输出（`text`、`json_object`
+  与 `json_schema`）、外部或内联文件输入、图片生成及工具调用。由于本项目没有实现
+  OpenAI Files API，因此会拒绝 `file_id` 引用。
+
+Schema 的强制程度与 OpenAI 自身的承诺保持一致：`strict: true` 时，回复不符合 Schema 即视为
+错误；`strict: false` 或 JSON 模式仅承诺尽力而为，因此不符合的回复会以文本形式返回而不会让
+请求失败。返回工具调用的轮次不受 Schema 约束——Schema 只约束最终答案。
+
+`strict` 在两个 OpenAI 接口上均默认为 `false`，与 OpenAI 自身一致，因此同一个 Schema 在任一
+接口上的行为相同。该开关在本项目中比上游更关键：Gemini 网页端没有受约束解码，Schema 只能
+通过提示词表达，因此一旦启用严格模式，模型的细微偏差就会让调用方彻底失去这次回复。出于同样
+的原因，Gemini 原生接口的 `generationConfig.responseSchema` / `responseJsonSchema` 始终按尽力
+而为处理——它没有可供关闭的 `strict` 开关。
+
+只有模型自身的失败才会被追究。本服务无法求值的 Schema（不是合法的 JSON Schema，或 `$ref`
+无法解析）仍会展示给模型，但不会用于判定回复；正则关键字耗尽
+`server.schema_validation_budget_seconds` 时，回复将保持未校验状态。即使在 `strict` 下，这些
+情况都不会让请求失败——它们是本服务的能力缺口，而非模型的违规。
+
+由于 JSON 文档只有在完整后才能校验，带结构化要求的流式响应会在校验完成后作为单个分块返回，
+而非逐步下发。Gemini 原生接口的 `responseMimeType: application/json` 同样适用。
+
+Gemini 网页端未暴露的生成控制项，例如 `temperature`、`top_p`、最大输出 Token 数、
+`parallel_tool_calls`、Gemini `generationConfig` 字段及安全设置，仍会被接受，但无法影响上游生成。
+服务会忽略这些已识别选项并写入调试日志。只有格式错误的输入，或本服务完全无法解析的内容
+（例如无法解析的 Files API ID、`cachedContent` 句柄）才会被拒绝——静默丢弃这类内容会改变
+模型实际回答的问题。未知字段遵循 Pydantic 的默认忽略行为。
+
+在 Gemini 接口上，`generationConfig.responseSchema` 属于 OpenAPI 3.0 子集（大写类型名、
+`nullable`），使用前会转换为 JSON Schema；`responseJsonSchema` 本身就是 JSON Schema，按其
+标准验证。`toolConfig.functionCallingConfig.allowedFunctionNames` 仅在真正生效的 `ANY` 与
+`VALIDATED` 模式下才会收窄工具列表。
 
 ### 实用工具接口
 
-- **`GET /health`**: 健康检查接口。返回服务器、已配置的 Gemini 客户端以及对话存储的状态。
+- **`GET /health`**: 就绪状态接口。当对话存储不可用或没有任何可用 Gemini 客户端时返回
+  HTTP 503；如果客户端池中仅有个别客户端降级、但仍有其他客户端可用，则不会将整个服务判为不可用。
 - **`GET /media/{filename}`**: 用于分发生成的媒体内容的内部接口。需要有效的 Token（API 返回的图片 URL 中已自动包含该 Token）。
 
 ## Docker 部署
@@ -187,7 +222,17 @@ export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
 
 # 覆盖对话存储大小限制
 export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
+
+# 覆盖本地 HTTP 请求体资源保护上限（设为 0 可禁用）
+export CONFIG_SERVER__MAX_REQUEST_BODY_BYTES=268435456
+
+# 覆盖 JSON Schema 正则求值预算（单位：秒）
+export CONFIG_SERVER__SCHEMA_VALIDATION_BUDGET_SECONDS=1.0
 ```
+
+`max_request_body_bytes` 仅是封装层用于保护内存和本地资源的可配置上限，并非 OpenAI 或
+Gemini API 的兼容性限制，也不代表 Gemini 网页端的容量。通过本地检查后，请求最终是否可被
+接受仍由 Gemini 网页端决定。
 
 ### 客户端 ID 与会话重用
 

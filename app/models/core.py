@@ -1,7 +1,11 @@
+from __future__ import annotations
+
+import base64
+import hashlib
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AppToolCallFunction(BaseModel):
@@ -22,6 +26,36 @@ class AppContentItem(BaseModel):
     file_data: str | bytes | None = Field(default=None, exclude=True)
     filename: str | None = None
     raw_data: dict[str, Any] | None = None
+    content_digest: str | None = None
+
+    @model_validator(mode="after")
+    def populate_content_digest(self) -> AppContentItem:
+        """Persist a digest for inline media whose raw bytes are intentionally excluded.
+
+        Only `file_data` and inline data URLs need one. Every other field survives
+        serialization, so it can be compared directly instead of through a fingerprint.
+        """
+        if self.content_digest:
+            return self
+
+        encoded = self.file_data
+        if encoded is None and self.url and self.url.startswith("data:"):
+            encoded = self.url.partition(",")[2]
+        if encoded is None:
+            return self
+
+        # utf-8, not ascii: a data URL may carry non-Base64 text, and a codec error here
+        # would abort model construction.
+        raw = encoded.encode("utf-8", "surrogatepass") if isinstance(encoded, str) else encoded
+        if raw.startswith(b"data:"):
+            raw = raw.partition(b",")[2]
+        try:
+            digest_input = base64.b64decode(b"".join(raw.split()), validate=True)
+        except ValueError:
+            digest_input = raw
+
+        self.content_digest = hashlib.sha256(digest_input).hexdigest()
+        return self
 
 
 type AppMessageRole = Literal["system", "user", "assistant", "tool"]

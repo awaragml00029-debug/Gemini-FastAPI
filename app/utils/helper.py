@@ -8,14 +8,19 @@ import reprlib
 import socket
 import struct
 import tempfile
+import time
 import unicodedata
 from collections.abc import Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 import orjson
+import regex
 from curl_cffi import CurlFollow, CurlHttpVersion, requests
+from jsonschema import SchemaError, ValidationError, validators
+from jsonschema.validators import validator_for
 from loguru import logger
 from pydantic import BaseModel
 
@@ -60,14 +65,23 @@ TOOL_WRAP_HINT = (
 )
 STRUCTURED_JSON_WRAP_HINT = (
     "\n\nSYSTEM: STRUCTURED JSON PROTOCOL (MANDATORY)\n"
-    "1. Return exactly one fenced block holding one strict JSON document that validates against the JSON Schema below. No prose, no second block.\n"
+    "1. Return exactly one fenced block holding one strict JSON document. No prose, no second block.\n"
     "2. Open with ```json and close with a fence of the same length; if the JSON contains a backtick run, both fences MUST be longer.\n"
-    "3. Emit every required field with its declared type. NEVER truncate the document or omit the closing fence.\n\n"
+    "3. NEVER truncate the document or omit the closing fence.\n\n"
     "REQUIRED SYNTAX:\n"
     "```json\n"
     '{"field":"value"}\n'
     "```\n\n"
     "END STRUCTURED JSON PROTOCOL"
+)
+# Appended to the protocol above when the client supplied a schema; JSON mode sends the
+# protocol alone, because valid JSON of any shape satisfies it.
+SCHEMA_ADHERENCE_PROMPT = (
+    "The JSON document MUST validate against the JSON Schema below. "
+    "Emit every required field with its declared type."
+)
+STRICT_SCHEMA_ADHERENCE_PROMPT = (
+    "Strict schema adherence is required: the JSON must conform exactly to the schema."
 )
 TOOL_INTERFACE_PROMPT = (
     "SYSTEM INTERFACE: Call an available tool whenever the request requires one, with arguments that "
@@ -126,6 +140,7 @@ CHATML_START_RE = re.compile(r"\\?<\\?\|im\\?_start\\?\|\\?>(\w+)\n?", re.IGNORE
 CHATML_END_RE = re.compile(r"\\?<\\?\|im\\?_end\\?\|\\?>", re.IGNORECASE)
 COMMONMARK_UNESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 PARAM_FENCE_RE = re.compile(r"^(?P<fence>`{3,})")
+MIME_SUBTYPE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 TOOL_HINT_STRIPPED = TOOL_WRAP_HINT.strip()
 SYSTEM_HINTS = (TOOL_WRAP_HINT, STRUCTURED_JSON_WRAP_HINT)
 
@@ -282,6 +297,198 @@ def estimate_tokens(text: str | None) -> int:
     return len(text) // 3 if text else 0
 
 
+class StructuredOutputValidationError(ValueError):
+    """Raised when model output cannot satisfy a requested JSON Schema."""
+
+
+class SchemaEvaluationTimeoutError(ValueError):
+    """Raised when a client-provided schema exhausts its regex evaluation budget."""
+
+
+# One cumulative budget for every regex keyword in a response, so it is sized for total workload,
+# not for a single pattern: a large conforming payload is ordinary, not pathological.
+SCHEMA_REGEX_BUDGET_SECONDS: float = g_config.server.schema_validation_budget_seconds
+_schema_regex_deadline: ContextVar[float | None] = ContextVar("schema_regex_deadline", default=None)
+_bounded_validator_classes: dict[type[Any], type[Any]] = {}
+
+
+def _bounded_regex_search(pattern: str, value: str) -> bool:
+    """Search with the remaining request-scoped regex budget."""
+    deadline = _schema_regex_deadline.get()
+    remaining = SCHEMA_REGEX_BUDGET_SECONDS if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise SchemaEvaluationTimeoutError("JSON Schema regex evaluation exceeded its time limit")
+    try:
+        return regex.search(pattern, value, timeout=remaining) is not None
+    except TimeoutError as exc:
+        raise SchemaEvaluationTimeoutError(
+            "JSON Schema regex evaluation exceeded its time limit"
+        ) from exc
+
+
+def _validate_bounded_pattern(validator, pattern, instance, schema):
+    if validator.is_type(instance, "string") and not _bounded_regex_search(pattern, instance):
+        yield ValidationError(f"{instance!r} does not match {pattern!r}")
+
+
+def _validate_bounded_pattern_properties(validator, pattern_properties, instance, schema):
+    if not validator.is_type(instance, "object"):
+        return
+    for pattern, subschema in pattern_properties.items():
+        for key, value in instance.items():
+            if _bounded_regex_search(pattern, key):
+                yield from validator.descend(
+                    value,
+                    subschema,
+                    path=key,
+                    schema_path=pattern,
+                )
+
+
+def _validate_bounded_additional_properties(validator, additional, instance, schema):
+    if not validator.is_type(instance, "object"):
+        return
+
+    properties = schema.get("properties", {})
+    patterns = tuple(schema.get("patternProperties", {}))
+    extras = {
+        key
+        for key in instance
+        if key not in properties
+        and not any(_bounded_regex_search(pattern, key) for pattern in patterns)
+    }
+    if validator.is_type(additional, "object"):
+        for extra in extras:
+            yield from validator.descend(instance[extra], additional, path=extra)
+    elif not additional and extras:
+        joined = ", ".join(repr(each) for each in sorted(extras, key=str))
+        yield ValidationError(f"Additional properties are not allowed ({joined} unexpected)")
+
+
+def _bounded_validator_for(schema: dict[str, Any]):
+    """Return a dialect-appropriate validator with timeout-bounded regex keywords."""
+    base = validator_for(schema)
+    bounded = _bounded_validator_classes.get(base)
+    if bounded is None:
+        bounded = validators.extend(
+            base,
+            {
+                "pattern": _validate_bounded_pattern,
+                "patternProperties": _validate_bounded_pattern_properties,
+                "additionalProperties": _validate_bounded_additional_properties,
+            },
+        )
+        _bounded_validator_classes[base] = bounded
+    return bounded(schema)
+
+
+def validate_json_schema(schema: dict[str, Any]) -> None:
+    """Raise ValueError when a client-provided JSON Schema is not valid."""
+    try:
+        validator_cls = validator_for(schema)
+        validator_cls.check_schema(schema)
+    except SchemaError as exc:
+        raise ValueError(f"Invalid JSON Schema: {exc.message}") from exc
+
+
+_JSON_SCHEMA_TYPE_NAMES = frozenset(
+    {"string", "number", "integer", "boolean", "array", "object", "null"}
+)
+_NESTED_SCHEMA_KEYS = frozenset(
+    {"items", "additionalProperties", "not", "if", "then", "else", "contains", "propertyNames"}
+)
+_SCHEMA_LIST_KEYS = frozenset({"anyOf", "oneOf", "allOf", "prefixItems"})
+_SCHEMA_MAP_KEYS = frozenset({"properties", "$defs", "definitions", "patternProperties"})
+# OpenAPI-only annotations with no JSON Schema equivalent.
+_OPENAPI_ONLY_KEYS = frozenset({"propertyOrdering", "example"})
+
+
+def normalize_openapi_schema(schema: Any) -> Any:
+    """Translate Gemini's OpenAPI 3.0 Schema subset into equivalent JSON Schema.
+
+    `generationConfig.responseSchema` spells its types in uppercase (`STRING`, `OBJECT`) and
+    marks optional values with OpenAPI's `nullable` flag. Neither is valid JSON Schema, so the
+    schema has to be translated before it can be checked or used to validate a response.
+    `responseJsonSchema` is already JSON Schema and does not go through here.
+    """
+    if isinstance(schema, list):
+        return [normalize_openapi_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    result: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _OPENAPI_ONLY_KEYS:
+            continue
+        if key == "type" and isinstance(value, str) and value.lower() in _JSON_SCHEMA_TYPE_NAMES:
+            result[key] = value.lower()
+        elif key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
+            result[key] = {name: normalize_openapi_schema(sub) for name, sub in value.items()}
+        elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
+            result[key] = [normalize_openapi_schema(sub) for sub in value]
+        elif key in _NESTED_SCHEMA_KEYS:
+            result[key] = normalize_openapi_schema(value)
+        else:
+            result[key] = value
+
+    if result.pop("nullable", None) is True:
+        declared = result.get("type")
+        if isinstance(declared, str):
+            result["type"] = [declared, "null"]
+        elif isinstance(declared, list) and "null" not in declared:
+            result["type"] = [*declared, "null"]
+    return result
+
+
+def decode_base64_data(value: str | bytes) -> bytes:
+    """Decode raw or data-URL Base64 strictly, ignoring transport whitespace.
+
+    Both the standard and URL-safe alphabets are accepted, since clients that build a payload
+    with `base64.urlsafe_b64encode` send `-` and `_`. Validation stays on either way: a decode
+    that silently discarded stray characters would hand Gemini a corrupt file - which is also
+    why a non-ASCII character is an error rather than something to strip, since dropping it
+    could turn a corrupt payload into one that decodes cleanly to the wrong bytes.
+    """
+    if isinstance(value, str):
+        try:
+            raw = value.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Base64 payload contains non-ASCII characters") from exc
+    else:
+        raw = value
+    if raw.startswith(b"data:"):
+        metadata, separator, raw = raw.partition(b",")
+        if not separator or b";base64" not in metadata.lower():
+            raise ValueError("Data URL must contain a Base64 payload")
+
+    payload = b"".join(raw.split())
+    for altchars in (None, b"-_"):
+        try:
+            return base64.b64decode(payload, altchars=altchars, validate=True)
+        except ValueError:
+            continue
+    raise ValueError("Invalid Base64 payload")
+
+
+def guess_extension_for_mime(mime_type: str | None) -> str:
+    """Best-effort filename extension for a MIME type, never empty.
+
+    `mimetypes` only knows registered types, so unregistered but widely sent ones (`audio/mp3`,
+    `application/x-*`) fall back to the subtype. That subtype is client-controlled and ends up in
+    a `NamedTemporaryFile` suffix, so it is scrubbed of anything that could escape the directory.
+    """
+    if not mime_type:
+        return ".bin"
+
+    mime_type = mime_type.split(";")[0].strip()
+    if suffix := mimetypes.guess_extension(mime_type):
+        return suffix
+
+    _, _, subtype = mime_type.partition("/")
+    subtype = MIME_SUBTYPE_UNSAFE_RE.sub("", subtype).lstrip(".")
+    return f".{subtype}" if subtype else ".bin"
+
+
 async def save_file_to_tempfile(
     file_in_base64: str | bytes, file_name: str = "", tempdir: Path | None = None
 ) -> Path:
@@ -289,7 +496,7 @@ async def save_file_to_tempfile(
     with tempfile.NamedTemporaryFile(
         delete=False, suffix=Path(file_name).suffix if file_name else ".bin", dir=tempdir
     ) as tmp:
-        tmp.write(base64.b64decode(file_in_base64))
+        tmp.write(decode_base64_data(file_in_base64))
         return Path(tmp.name)
 
 
@@ -334,10 +541,8 @@ async def save_url_to_tempfile(url: str, tempdir: Path | None = None) -> Path:
     if url.startswith("data:"):
         metadata_part = url.split(",")[0]
         mime_type = metadata_part.split(":")[1].split(";")[0]
-        data = base64.b64decode(url.split(",")[1])
-        suffix = mimetypes.guess_extension(mime_type) or (
-            f".{mime_type.split('/')[1]}" if "/" in mime_type else ".bin"
-        )
+        data = decode_base64_data(url)
+        suffix = guess_extension_for_mime(mime_type)
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempdir) as tmp:
             tmp.write(data)
             return Path(tmp.name)
@@ -726,7 +931,12 @@ def convert_to_app_messages(messages: list[ChatCompletionMessage]) -> list[AppMe
 def canonicalize_structured_output(
     visible_output: str, structured_requirement: StructuredOutputRequirement
 ) -> str | None:
-    """Parse raw or fenced structured JSON and return its canonical JSON representation."""
+    """Parse raw or fenced structured JSON and return its canonical JSON representation.
+
+    `None` means the model failed the format, never that this wrapper could not run the check:
+    a schema that cannot be evaluated still yields the canonical payload, so only the model's
+    own failures can be enforced against it.
+    """
     candidate = strip_markdown_fence(visible_output)
     try:
         structured_payload = orjson.loads(candidate)
@@ -735,6 +945,37 @@ def canonicalize_structured_output(
             f"Failed to decode JSON for structured response (schema={structured_requirement.schema_name})."
         )
         return None
+
+    # An empty schema is JSON mode: parsing was the whole requirement.
+    if structured_requirement.schema:
+        try:
+            deadline_token = _schema_regex_deadline.set(
+                time.monotonic() + SCHEMA_REGEX_BUDGET_SECONDS
+            )
+            try:
+                _bounded_validator_for(structured_requirement.schema).validate(structured_payload)
+            finally:
+                _schema_regex_deadline.reset(deadline_token)
+        except ValidationError as exc:
+            logger.warning(
+                f"Structured response failed schema validation "
+                f"(schema={structured_requirement.schema_name}): {exc.message}"
+            )
+            return None
+        # Both branches below are this wrapper failing to check, not the model failing to comply,
+        # so neither reports a violation: under `strict` that would 502 a conforming reply.
+        except SchemaEvaluationTimeoutError as exc:
+            logger.warning(
+                f"Structured response left unverified, schema evaluation timed out "
+                f"(schema={structured_requirement.schema_name}): {exc}"
+            )
+        except Exception as exc:
+            # `check_schema` does not resolve `$ref`s, so unresolvable references and foreign
+            # dialects surface only here.
+            logger.warning(
+                f"Structured response left unverified, schema is not usable "
+                f"({structured_requirement.schema_name!r}): {exc}"
+            )
 
     canonical_output = orjson.dumps(structured_payload).decode("utf-8")
     logger.debug(f"Structured response fulfilled (schema={structured_requirement.schema_name}).")
@@ -760,17 +1001,25 @@ def process_llm_output(
     visible_output = visible_output.strip()
     storage_output = visible_output
 
-    if (
-        structured_requirement
-        and visible_output
-        and (
-            canonical_output := canonicalize_structured_output(
-                visible_output, structured_requirement
+    if structured_requirement and visible_output:
+        canonical_output = canonicalize_structured_output(visible_output, structured_requirement)
+        if canonical_output is not None:
+            visible_output = canonical_output
+            storage_output = canonical_output
+        elif tool_calls:
+            # The format constrains the final answer, not a turn that asks for a tool.
+            logger.debug(
+                "Skipping structured-output enforcement for a turn that returned tool call(s)."
             )
-        )
-    ):
-        visible_output = canonical_output
-        storage_output = canonical_output
+        elif structured_requirement.strict:
+            raise StructuredOutputValidationError(
+                f"Model output did not satisfy JSON Schema {structured_requirement.schema_name!r}"
+            )
+        else:
+            logger.warning(
+                f"Returning unstructured text for best-effort response format "
+                f"{structured_requirement.schema_name!r}."
+            )
 
     return thoughts, visible_output, storage_output, tool_calls
 
@@ -863,7 +1112,7 @@ def build_tool_prompt(
 
 def build_image_generation_instruction(
     tools: list[ImageGeneration] | None,
-    tool_choice: ToolChoiceFunction | None,
+    tool_choice: ToolChoiceTypes | None,
 ) -> str | None:
     """Construct explicit guidance so Gemini emits images when requested."""
     has_forced_choice = tool_choice is not None and tool_choice.type == "image_generation"

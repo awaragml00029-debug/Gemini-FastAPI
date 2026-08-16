@@ -32,6 +32,23 @@ class ServerConfig(BaseModel):
         default=None,
         description="API key for authentication, if set, will enable API key validation",
     )
+    max_request_body_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        ge=0,
+        description=(
+            "Local HTTP body safety ceiling in bytes (0 disables it). This protects wrapper "
+            "resources and does not define Gemini Web's upstream acceptance limit"
+        ),
+    )
+    schema_validation_budget_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        description=(
+            "Wall-clock budget for evaluating the regex keywords of a client-supplied JSON "
+            "Schema against one response. Guards against catastrophic backtracking; exhausting "
+            "it leaves the reply unverified rather than treating it as a schema violation"
+        ),
+    )
     https: HTTPSConfig = Field(default=HTTPSConfig(), description="HTTPS configuration")
 
 

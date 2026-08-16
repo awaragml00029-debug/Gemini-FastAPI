@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictBool, model_validator
 
 
 @dataclass
@@ -15,6 +15,13 @@ class StructuredOutputRequirement:
     schema: dict[str, Any]
     instruction: str
     raw_format: dict[str, Any]
+    strict: bool = True
+    """Whether schema adherence is guaranteed to the client.
+
+    Mirrors OpenAI's `strict` flag: Structured Outputs (`strict: true`) promise the response
+    matches the schema, so a violation has to surface as an error. JSON mode and `strict: false`
+    only promise a best effort, so a violation degrades to the raw text instead.
+    """
 
 
 class FunctionCall(BaseModel):
@@ -388,6 +395,12 @@ class ResponseFormatText(BaseModel):
     type: Literal["text"] = Field(default="text")
 
 
+class ResponseFormatJSONObject(BaseModel):
+    """Legacy JSON mode: valid JSON is promised, schema conformance is not."""
+
+    type: Literal["json_object"] = Field(default="json_object")
+
+
 class ResponseFormatTextJSONSchemaConfig(BaseModel):
     """JSON-schema-constrained output format."""
 
@@ -399,13 +412,15 @@ class ResponseFormatTextJSONSchemaConfig(BaseModel):
         default=None, alias="schema", serialization_alias="schema"
     )
     description: str | None = Field(default=None)
+    # Unset, not False: the resolved value is stamped back onto the echoed response.
+    strict: StrictBool | None = Field(default=None)
 
 
 class ResponseTextConfig(BaseModel):
     """Top-level text configuration block in a Responses API response."""
 
-    format: ResponseFormatText | ResponseFormatTextJSONSchemaConfig = Field(
-        default_factory=ResponseFormatText
+    format: ResponseFormatTextJSONSchemaConfig | ResponseFormatJSONObject | ResponseFormatText = (
+        Field(default_factory=ResponseFormatText)
     )
 
 
@@ -438,6 +453,8 @@ class ResponseCreateRequest(BaseModel):
     )
     store: bool | None = Field(default=None)
     prompt_cache_key: str | None = Field(default=None)
+    text: ResponseTextConfig | None = Field(default=None)
+    # Backward-compatible project extension. Current OpenAI Responses requests use `text.format`.
     response_format: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] | None = Field(default=None)
     parallel_tool_calls: bool | None = Field(default=True)

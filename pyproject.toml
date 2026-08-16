@@ -3,16 +3,18 @@ name = "gemini-fastapi"
 version = "1.0.0"
 description = "FastAPI Server built on Gemini Web API"
 readme = "README.md"
-requires-python = "==3.13.*"
+requires-python = ">=3.13"
 dependencies = [
   "curl-cffi>=0.16.0",
   "fastapi>=0.141.1",
-  "gemini-webapi>=2.0.0",
+  "gemini-webapi>=2.1.0,<3",
   "httptools>=0.8.0",
+  "jsonschema>=4.26.0",
   "lmdb>=2.3.0",
   "loguru>=0.7.3",
   "orjson>=3.11.9",
   "pydantic-settings[yaml]>=2.15.0",
+  "regex>=2026.7.19",
   "uvicorn>=0.52.3",
   "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
@@ -21,7 +23,7 @@ dependencies = [
 Repository = "https://github.com/Nativu5/Gemini-FastAPI"
 
 [project.optional-dependencies]
-dev = ["pyright", "ruff", "ty"]
+dev = ["httpx2", "pyright", "pytest", "ruff", "ty"]
 
 [dependency-groups]
 dev = ["gemini-fastapi[dev]"]
@@ -67,5 +69,6 @@ indent-style = "space"
 [tool.pyright]
 typeCheckingMode = "standard"
 
-[tool.uv.sources]
-gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git", rev = "enable-guest-mode" }
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

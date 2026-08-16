@@ -15,6 +15,7 @@ from .server.media import router as media_router
 from .server.middleware import (
     add_cors_middleware,
     add_exception_handler,
+    add_request_size_limit_middleware,
     cleanup_expired_media,
 )
 from .services import GeminiClientPool, LMDBConversationStore
@@ -78,6 +79,11 @@ async def lifespan(app: FastAPI):
         logger.exception(f"Failed to initialize Gemini clients: {e}")
         raise
 
+    try:
+        LMDBConversationStore().prune_stale_indexes()
+    except Exception:
+        logger.exception("Failed to prune stale LMDB indexes; continuing with startup.")
+
     cleanup_task = asyncio.create_task(_run_retention_cleanup(cleanup_stop_event))
 
     # Give the tasks a chance to start and surface immediate failures.
@@ -121,6 +127,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Order matters: the last middleware added is the outermost, so the body limit has to be
+    # registered first for its 413 to still pass back out through CORS.
+    add_request_size_limit_middleware(app)
     add_cors_middleware(app)
     add_exception_handler(app)
     add_gemini_exception_handlers(app)

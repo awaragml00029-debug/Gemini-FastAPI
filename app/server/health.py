@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Response, status
 from loguru import logger
 
 from app.models import HealthCheckResponse
@@ -8,7 +8,7 @@ router = APIRouter()
 
 
 @router.get("/health", response_model=HealthCheckResponse)
-async def health_check():
+async def health_check(response: Response):
     pool = GeminiClientPool()
     db = LMDBConversationStore()
     client_status = pool.status()
@@ -20,8 +20,18 @@ async def health_check():
 
     if not stat:
         logger.error("Failed to retrieve LMDB conversation store stats")
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return HealthCheckResponse(
             ok=False, error="LMDB conversation store unavailable", clients=client_status
         )
 
-    return HealthCheckResponse(ok=all(client_status.values()), storage=stat, clients=client_status)
+    if not any(client_status.values()):
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return HealthCheckResponse(
+            ok=False,
+            error="No usable Gemini client is available",
+            storage=stat,
+            clients=client_status,
+        )
+
+    return HealthCheckResponse(ok=True, storage=stat, clients=client_status)

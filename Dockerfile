@@ -1,4 +1,16 @@
-FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim
+FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim AS builder
+
+WORKDIR /app
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-install-project --no-dev
+
+FROM python:3.13-slim-trixie AS runtime
 
 LABEL org.opencontainers.image.title="Gemini-FastAPI" \
       org.opencontainers.image.description="Web-based Gemini models wrapped into an OpenAI-compatible API."
@@ -8,26 +20,22 @@ USER root
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tini curl ca-certificates git \
+    ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
-ENV UV_COMPILE_BYTECODE=1 \
+ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-COPY pyproject.toml uv.lock ./
-RUN uv sync --refresh --frozen --no-install-project --no-dev
-
+COPY --from=builder /app/.venv .venv/
 COPY app/ app/
 COPY config/ config/
 COPY run.py .
 
-ENV PATH="/app/.venv/bin:$PATH"
-
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; from app.utils import g_config; urllib.request.urlopen(f'http://127.0.0.1:{g_config.server.port}/health', timeout=5).close()"]
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 

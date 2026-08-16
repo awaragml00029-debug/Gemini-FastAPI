@@ -91,7 +91,7 @@ class GeminiTool(BaseModel):
 class GeminiFunctionCallingConfig(BaseModel):
     """函数调用配置。"""
 
-    mode: Literal["AUTO", "NONE", "ANY"] = "AUTO"
+    mode: Literal["AUTO", "NONE", "ANY", "VALIDATED"] = "AUTO"
     allowedFunctionNames: list[str] | None = None
 
 
@@ -129,6 +129,7 @@ class GeminiGenerationConfig(BaseModel):
     responseJsonSchema: dict[str, Any] | None = None
     candidateCount: int | None = None
     thinkingConfig: GeminiThinkingConfig | None = None
+    responseFormat: dict[str, Any] | None = None
 
 
 class GeminiGenerateContentRequest(BaseModel):

@@ -24,7 +24,7 @@ Web-based Gemini models wrapped into an OpenAI-compatible API. Powered by [Hanao
 
 ### Prerequisites
 
-- Python 3.13
+- Python >= 3.13
 - Google account with Gemini access on web (Enable **[Gemini Apps activity](https://myactivity.google.com/product/gemini)** for best conversation persistence)
 - `secure_1psid` and `secure_1psidts` cookies from Gemini web interface
 
@@ -81,22 +81,65 @@ The server provides several endpoints, including OpenAI-compatible ones.
 
 ### OpenAI-Compatible Endpoints
 
-These endpoints are designed to be compatible with OpenAI's API structure, allowing you to use Gemini as a drop-in replacement.
+These endpoints use OpenAI-compatible wire formats while translating requests to Gemini Web.
+Compatibility is intentionally broader than the controls exposed by the Gemini Web client. Valid
+but unforwardable options are accepted for client compatibility, ignored, and recorded at debug
+level so they do not prevent an otherwise representable request from running.
 
 - **`GET /v1/models`**: Lists all supported Gemini models.
 - **`POST /v1/chat/completions`**: Unified chat interface.
   - **Streaming**: Set `stream: true` to receive real-time delta chunks.
   - **Multi-modal**: Supports text, images, and file uploads.
   - **Tool Calling**: Supports function calling via the `tools` parameter.
-  - **Structured Output**: Supports `response_format` for JSON schema enforcement.
+  - **Structured Output**: Supports every `response_format` mode. `json_schema` is validated
+    server-side against the supplied schema; `json_object` (JSON mode) only requires that the
+    reply parses as JSON; `text` is the default and imposes nothing.
 
 ### Advanced Endpoints
 
-- **`POST /v1/responses`**: An alternative endpoint for complex interaction patterns, supporting rich output items including generated images and tool calls.
+- **`POST /v1/responses`**: Supports current `text.format` structured output (`text`,
+  `json_object` and `json_schema`), external/inline file inputs, generated images, and tool
+  calls. Files API `file_id` references are rejected because this wrapper does not expose an
+  OpenAI Files API.
+
+Schema enforcement follows OpenAI's own guarantee. With `strict: true`, a reply that does not
+match the schema is an error. With `strict: false` or JSON mode, only a best effort is promised,
+so a non-conforming reply is returned as text instead of failing the request. A turn that returns
+a tool call is never judged against the schema, which constrains the final answer only.
+
+`strict` defaults to `false` on both OpenAI surfaces, matching OpenAI itself, so one schema
+behaves the same whichever endpoint it is sent to. The flag matters more here than upstream,
+because Gemini Web has no constrained decoding — the schema is asked for in the prompt, so a
+strict requirement the model narrowly misses costs the caller the whole reply. The Gemini-native
+`generationConfig.responseSchema` / `responseJsonSchema` is always best-effort for the same
+reason: it has no `strict` flag to turn off.
+
+Only the model's own failures are enforced. A schema this wrapper cannot evaluate — one that is
+not valid JSON Schema, or whose `$ref`s do not resolve — is still shown to the model but is not
+used to judge the reply, and a schema whose regex keywords exhaust
+`server.schema_validation_budget_seconds` leaves the reply unverified. None of these fail the
+request, even under `strict`: they are gaps on this side, not violations by the model.
+
+Because a JSON document can only be validated once it is complete, a streamed response carrying
+a structured requirement is delivered as a single chunk after validation rather than
+incrementally. This applies to Gemini-native `responseMimeType: application/json` as well.
+
+Generation controls that Gemini Web does not expose—such as `temperature`, `top_p`, maximum
+output-token limits, `parallel_tool_calls`, Gemini `generationConfig` fields, and safety settings—are
+accepted but cannot affect upstream generation. They are ignored with a debug log. Only malformed
+input, or content this wrapper cannot resolve at all (an unresolved Files API ID, a `cachedContent`
+handle), is rejected—dropping those silently would change what the model is answering.
+
+On the Gemini surface, `generationConfig.responseSchema` is the OpenAPI 3.0 subset (uppercase
+type names, `nullable`) and is translated to JSON Schema before use; `responseJsonSchema` is
+already JSON Schema and is validated as such. `toolConfig.functionCallingConfig.allowedFunctionNames`
+narrows the tool list only in the `ANY` and `VALIDATED` modes that act on it.
 
 ### Utility Endpoints
 
-- **`GET /health`**: Health check endpoint. Returns the status of the server, configured Gemini clients, and conversation storage.
+- **`GET /health`**: Readiness endpoint. Returns HTTP 503 when conversation storage is unavailable
+  or no Gemini client is usable; individual degraded clients are reported without taking a pool
+  with another usable client out of service.
 - **`GET /media/{filename}`**: Internal endpoint to serve generated media. Requires a valid token (automatically included in image URLs returned by the API).
 
 ## Docker Deployment
@@ -187,7 +230,17 @@ export CONFIG_GEMINI__CLIENTS__0__IMPERSONATE="chrome"
 
 # Override conversation storage size limit
 export CONFIG_STORAGE__MAX_SIZE=268435456  # 256 MB
+
+# Override the local HTTP-body resource guard (0 disables it)
+export CONFIG_SERVER__MAX_REQUEST_BODY_BYTES=268435456
+
+# Override the JSON Schema regex evaluation budget, in seconds
+export CONFIG_SERVER__SCHEMA_VALIDATION_BUDGET_SECONDS=1.0
 ```
+
+`max_request_body_bytes` is only a wrapper-side memory/resource safety ceiling. It is not an
+OpenAI or Gemini API compatibility limit and does not claim to describe Gemini Web capacity.
+Gemini Web remains authoritative for whether a request that passes this local guard is accepted.
 
 ### Client IDs and Conversation Reuse
 
