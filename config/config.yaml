@@ -43,6 +43,8 @@ gemini:
   # WARNING: Google may close a temporary window at any time mid-conversation. The reply can then come back without the earlier
   # context instead of erroring, so the loss may be silent. Prefer "normal" for long or context-sensitive conversations.
   chat_mode: "normal"
+  # Guest client health policy: "strict" fails if any client is unhealthy; "adaptive" fails only if all are unhealthy; "permissive" only logs a warning.
+  guest_mode: "adaptive"
 
 storage:
   path: "data/lmdb" # Database storage path

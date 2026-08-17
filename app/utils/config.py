@@ -94,6 +94,14 @@ class ChatMode(StrEnum):
     TEMPORARY = "temporary"
 
 
+class GuestMode(StrEnum):
+    """Health-check policy for Gemini clients running as guests."""
+
+    STRICT = "strict"
+    ADAPTIVE = "adaptive"
+    PERMISSIVE = "permissive"
+
+
 class GeminiConfig(BaseModel):
     """Gemini API configuration, including session behavior and generation options."""
 
@@ -131,6 +139,14 @@ class GeminiConfig(BaseModel):
             "mode (not saved to the account) and applies a tighter effective input limit. "
             "Warning: Google may close a temporary window at any time mid-conversation, and the "
             "reply can then come back without the earlier context instead of erroring"
+        ),
+    )
+    guest_mode: GuestMode = Field(
+        default=GuestMode.ADAPTIVE,
+        description=(
+            "Guest client health policy: 'strict' fails health checks when any client is "
+            "unhealthy; 'adaptive' fails only when all clients are unhealthy; 'permissive' "
+            "only logs a warning"
         ),
     )
     allow_private_url_fetch: bool = Field(

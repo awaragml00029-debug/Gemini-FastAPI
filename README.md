@@ -137,9 +137,9 @@ narrows the tool list only in the `ANY` and `VALIDATED` modes that act on it.
 
 ### Utility Endpoints
 
-- **`GET /health`**: Readiness endpoint. Returns HTTP 503 when conversation storage is unavailable
-  or no Gemini client is usable; individual degraded clients are reported without taking a pool
-  with another usable client out of service.
+- **`GET /health`**: Readiness endpoint. Conversation storage failures always return HTTP 503.
+  Client failures follow the configured `gemini.guest_mode` health policy; the default
+  `adaptive` policy returns 503 only when every Gemini client is unhealthy.
 - **`GET /media/{filename}`**: Internal endpoint to serve generated media. Requires a valid token (automatically included in image URLs returned by the API).
 
 ## Docker Deployment
@@ -300,6 +300,7 @@ You can control whether requests use normal Google chats or Google's temporary c
 ```yaml
 gemini:
   chat_mode: "normal" # "normal" or "temporary"
+  guest_mode: "adaptive" # "strict", "adaptive", or "permissive"
   max_chars_per_request: 1000000
 ```
 
@@ -344,6 +345,15 @@ failing:
   actually serve.
 
 `/health` reports a guest client as unhealthy - refresh its cookies to restore full capability.
+The `guest_mode` setting controls how those unhealthy clients affect the readiness response:
+
+- `strict`: return HTTP 503 when any client is unhealthy.
+- `adaptive` (default): return HTTP 503 only when all clients are unhealthy; otherwise log a
+  warning and remain ready.
+- `permissive`: log a warning but do not change readiness, even when all clients are unhealthy.
+
+All three modes log unhealthy clients. Conversation storage failures still return HTTP 503
+regardless of `guest_mode`.
 
 Otherwise this applies **only** in temporary mode. A normal chat opened by an authenticated
 client is kept by Google until you delete it, so its metadata stays reusable indefinitely and
@@ -365,6 +375,7 @@ Environment variable equivalent:
 
 ```bash
 export CONFIG_GEMINI__CHAT_MODE="temporary"
+export CONFIG_GEMINI__GUEST_MODE="adaptive"
 ```
 
 ### Models

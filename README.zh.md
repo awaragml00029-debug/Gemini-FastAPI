@@ -130,8 +130,8 @@ Gemini 网页端未暴露的生成控制项，例如 `temperature`、`top_p`、�
 
 ### 实用工具接口
 
-- **`GET /health`**: 就绪状态接口。当对话存储不可用或没有任何可用 Gemini 客户端时返回
-  HTTP 503；如果客户端池中仅有个别客户端降级、但仍有其他客户端可用，则不会将整个服务判为不可用。
+- **`GET /health`**: 就绪状态接口。对话存储不可用时始终返回 HTTP 503。客户端故障则遵循
+  `gemini.guest_mode` 健康策略；默认的 `adaptive` 策略仅在所有 Gemini 客户端均不健康时返回 503。
 - **`GET /media/{filename}`**: 用于分发生成的媒体内容的内部接口。需要有效的 Token（API 返回的图片 URL 中已自动包含该 Token）。
 
 ## Docker 部署
@@ -286,6 +286,7 @@ gemini:
 ```yaml
 gemini:
   chat_mode: "normal" # "normal"（普通）或 "temporary"（临时）
+  guest_mode: "adaptive" # "strict"（严格）、"adaptive"（自适应）或 "permissive"（宽松）
   max_chars_per_request: 1000000
 ```
 
@@ -322,6 +323,14 @@ gemini:
   一条警告。`/v1/models` 只会公布客户端确实能够提供服务的模型。
 
 `/health` 会将访客客户端报告为不健康——请刷新其 Cookie 以恢复完整能力。
+`guest_mode` 设置决定这些不健康客户端如何影响就绪状态响应：
+
+- `strict`（严格）：任一客户端不健康时返回 HTTP 503。
+- `adaptive`（自适应，默认）：仅当所有客户端均不健康时返回 HTTP 503；若仍有健康客户端，
+  则只记录警告并保持就绪。
+- `permissive`（宽松）：只记录警告，不改变就绪状态，即使所有客户端均不健康也是如此。
+
+三种模式都会记录不健康客户端。无论 `guest_mode` 为何，对话存储不可用时仍会返回 HTTP 503。
 
 除此之外，以上规则**仅**在临时模式下生效：由已认证客户端开启的普通会话在用户手动删除之前
 会一直由 Google 保留，因此其元数据可以长期重用，并且不受重启影响。
@@ -340,6 +349,7 @@ gemini:
 
 ```bash
 export CONFIG_GEMINI__CHAT_MODE="temporary"
+export CONFIG_GEMINI__GUEST_MODE="adaptive"
 ```
 
 ### 模型
