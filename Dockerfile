@@ -18,6 +18,7 @@ FROM python:3.13-slim-trixie AS runtime
 LABEL org.opencontainers.image.title="Gemini-FastAPI" \
       org.opencontainers.image.description="Web-based Gemini models wrapped into an OpenAI-compatible API."
 
+# tally ignore=hadolint/DL3002
 USER root
 
 WORKDIR /app
