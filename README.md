@@ -253,6 +253,11 @@ when you update the cookie list.
 > [!WARNING]
 > Keep these credentials secure and never commit them to version control. These cookies provide access to your Google account.
 
+<!-- Keeps the credential warnings as separate blockquotes (markdownlint MD028). -->
+
+> [!WARNING]
+> **Session Stability**: If cookies expire frequently, use Firefox to extract cookies. Recent versions of Chromium-based browsers use "Device Bound Session Credentials", which improves security but causes cookies to remain valid for only a few hours and prevents them from being renewed.
+
 To use Gemini-FastAPI, you need to extract your Gemini session cookies:
 
 1. Open [Gemini](https://gemini.google.com/) in a private/incognito browser window and sign in

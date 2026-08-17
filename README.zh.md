@@ -244,6 +244,11 @@ Gemini API 的兼容性限制，也不代表 Gemini 网页端的容量。通过�
 > [!WARNING]
 > 请妥善保管这些凭据，切勿提交到版本控制。这些 Cookie 可访问你的 Google 账号。
 
+<!-- 使用注释将凭据警告分隔为独立的引用块（markdownlint MD028）。 -->
+
+> [!WARNING]
+> **会话稳定性**：如果 Cookie 频繁过期，请使用 Firefox 提取 Cookie。较新的 Chromium 内核浏览器版本使用“设备绑定会话凭据”（Device Bound Session Credentials），虽然提高了安全性，但会使 Cookie 仅在几小时内有效且无法续期。
+
 使用 Gemini-FastAPI 需提取 Gemini 会话 Cookie：
 
 1. 在无痕/隐私窗口打开 [Gemini](https://gemini.google.com/) 并登录
