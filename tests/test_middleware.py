@@ -130,8 +130,6 @@ def test_requests_without_a_body_are_untouched():
         assert client.get("/v1/ping").status_code == 200
 
 
-# --------------------------------------------------------------------------------- media serving
-
 STEM = "img_" + "0" * 32
 
 

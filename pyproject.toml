@@ -15,7 +15,7 @@ dependencies = [
   "orjson>=3.11.9",
   "pydantic-settings[yaml]>=2.15.0",
   "regex>=2026.7.19",
-  "uvicorn>=0.52.3",
+  "uvicorn>=0.52.4",
   "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
 

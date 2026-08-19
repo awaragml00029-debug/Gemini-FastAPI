@@ -127,11 +127,6 @@ def add_gemini_exception_handlers(app: FastAPI) -> None:
         return await request_validation_exception_handler(request, exc)
 
 
-# ---------------------------------------------------------------------------
-# Gemini ↔ 内部格式转换函数
-# ---------------------------------------------------------------------------
-
-
 def _gemini_contents_to_messages(
     contents: list[GeminiContent],
     system_instruction: Any | None = None,
@@ -524,11 +519,6 @@ def _model_data_to_gemini_info(model_data: Any) -> GeminiModelInfo:
         description=f"Gemini model: {model_data.id}",
         supportedGenerationMethods=["generateContent", "streamGenerateContent"],
     )
-
-
-# ---------------------------------------------------------------------------
-# 路由端点
-# ---------------------------------------------------------------------------
 
 
 @router.get("/v1beta/models")

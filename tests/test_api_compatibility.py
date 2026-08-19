@@ -76,9 +76,6 @@ def _generation_config(request: GeminiGenerateContentRequest) -> GeminiGeneratio
     return config
 
 
-# --------------------------------------------------------------------------- response_format
-
-
 @pytest.mark.parametrize("format_type", ["text", "json_object"])
 def test_non_json_schema_response_formats_are_accepted(format_type):
     """`text` is the API default and `json_object` is JSON mode; neither may 400."""
@@ -168,9 +165,6 @@ def test_non_strict_schema_omits_the_exact_conformance_line():
     )
     assert requirement is not None
     assert STRICT_SCHEMA_ADHERENCE_PROMPT not in requirement.instruction
-
-
-# --------------------------------------------------------------------------- output enforcement
 
 
 def test_tool_call_turn_is_not_failed_by_a_response_format():
@@ -291,9 +285,6 @@ def test_bounded_validator_preserves_pattern_properties_and_additional_propertie
     )
     assert canonicalize_structured_output('{"item_1": 1}', requirement) == '{"item_1":1}'
     assert canonicalize_structured_output('{"other": 1}', requirement) is None
-
-
-# --------------------------------------------------------------------------- Responses text.format
 
 
 @pytest.mark.parametrize(
@@ -433,9 +424,6 @@ def test_the_echoed_strict_reports_what_was_enforced(requested, applied):
     text_format = payload.text.format if payload.text else None
     assert isinstance(text_format, ResponseFormatTextJSONSchemaConfig)
     assert text_format.strict is applied
-
-
-# --------------------------------------------------------------------------- Gemini generationConfig
 
 
 def test_openapi_response_schema_is_translated_not_rejected():
@@ -610,8 +598,6 @@ def test_file_data_in_system_instruction_is_refused():
     assert "fileData is not supported" in (_validate_gemini_request(request) or "")
 
 
-# --------------------------------------------------------------------------- Gemini toolConfig
-
 _TOOLS = [
     {"functionDeclarations": [{"name": "a", "description": "d"}, {"name": "b", "description": "d"}]}
 ]
@@ -677,8 +663,6 @@ def test_no_tools_yields_no_tool_choice():
     assert _gemini_tools_to_internal(None, None) == (None, None)
 
 
-# --------------------------------------------------------------------------- forced tool_choice
-
 _CALL = AppToolCall(id="1", type="function", function=AppToolCallFunction(name="a", arguments="{}"))
 _NAMED = ChatCompletionNamedToolChoice.model_validate(
     {"type": "function", "function": {"name": "a"}}
@@ -741,9 +725,6 @@ def test_forced_tool_choice_must_name_a_declared_tool(names, has_image_tool, too
         assert expected in (result or "")
 
 
-# --------------------------------------------------------------------------- Responses input
-
-
 def _input_message(*parts) -> ResponseInputMessage:
     return ResponseInputMessage.model_validate({"role": "user", "content": list(parts)})
 
@@ -795,9 +776,6 @@ def test_tool_result_parts_are_validated_too(output, expected):
         assert result is None
     else:
         assert expected in (result or "")
-
-
-# --------------------------------------------------------------------------- content digests
 
 
 def test_non_ascii_data_url_does_not_abort_model_construction():
