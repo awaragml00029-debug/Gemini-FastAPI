@@ -1,5 +1,61 @@
 # 开发日志
 
+## 2026-08-20（下午）第二步：整体迁移到上游基线
+
+分支 `migrate/upstream-20260819`，**未合入 main**。合并上游 `7d1744e`，50 个文件、**+11530 / −1918**。
+
+### 做法：chat.py 取上游整份，再逐条重接
+
+27 处冲突原地解会在最不容易发现错误的文件里留下半合并状态（上游重写了 2802 行）。改为取上游整份作基线，把我们的 delta 逐条重新接线。
+
+### gems 按新契约重写
+
+上游模型系统改为动态 `AvailableModel`，`_get_model_by_name` 已删，`_resolve_model_name` 返回**名字字符串**而非 `Model` 对象。
+
+新的 `_resolve_model_and_gem(pool, name)` 返回 `(resolved_model, gem_id, conversation_key)`：拆别名 → 用上游方式解析基础模型名 → gem 会话用**完整别名**作 LMDB 键，与普通会话隔离。键透传进 `_find_reusable_session` 和两个流式构建器（其 `resolved_model` 参数改名 `conversation_key`，名副其实）。
+
+### 重接的加固（全部仍是 fork 独有）
+
+| 项 | 说明 |
+|---|---|
+| 输入预处理超时 | `_process_conversation_with_timeout`；新增 `_process_conversation_for_client` 下发账号自己的代理+指纹 |
+| 流式空闲超时 | `_stream_with_idle_timeout` + `: ping` 心跳。两个 SSE 消费点学会把 `None` 当"暂无数据"；`_send_and_await_first_chunk` 跳过心跳，保证起始错误仍在响应头提交前暴露 |
+| **`request_scope`** | **合并后的树里一处都没有** —— `active_requests` 会恒为 0，auto-close 不等在途请求、池的"忙客户端拒绝重启"永不触发。新增 `_hold_request_scope` 让 scope 覆盖整个流消费期，而不只是发送 |
+| `mark_unavailable` | 端点错误路径上恢复 |
+| 后台启动 | 保留我们的后台 init（上游改回阻塞，会让慢账号导致服务永不就绪）；吸收上游新增的 `prune_stale_indexes` |
+| `pool.py` | 保留我们的 `_restart_client`（拒绝重启有在途请求的客户端、先 close、init 带超时），上游的 `_init_attempt` 三样都没有 |
+
+### 从上游拿来的
+
+`/v1beta` 原生接口、guest/temporary 聊天模式、动态模型注册表、多阶段 Dockerfile、**1726 行测试**。
+
+**上游自己的 SSRF 防护弃用** —— 它只校验初始 URL 且让 curl 跟重定向，公网 URL 仍可 302 进内网；保留我们的逐跳校验。
+
+### 合并中发现并修掉的三个问题
+
+1. `config.py` 自动合并出**重复的 `url_fetch_timeout`**（pydantic 里后者静默覆盖前者）。去重，保留 30s（上游 15s）—— 这是本 fork 实际在跑并验证过的值。
+2. `allow_private_url_fetch` 是**死配置**（上游有字段，我们的校验器不认）。已接入 `_validate_remote_url`。
+3. 上游新增的 **file 类型 URL 抓取没传代理/指纹**（`client.py`），账号隔离在那里有洞。已补。
+4. `lint.yaml` 被上游的 `ci.yaml` 取代（超集，多跑 pytest），删除以免重复；守卫步骤并入 `ci.yaml`。
+
+### 验证
+
+- **上游测试 188/188 全通过**
+- `ruff` / `ty` / `pyright` 全清
+- 守卫 **26/26**
+- 路由含 `/v1/gems` 与 `/v1beta/*`，无 `/v1/v1/health`
+- 别名拆分正确（普通模型键用解析名，gem 会话键用完整别名），畸形别名拒绝
+- 远程抓取：正常下载通过、超限中途拦截、`127.0.0.1` 与 `169.254.169.254` 拒绝、计时埋点 `perf_counter` 仍为 10
+
+### 产出
+
+镜像 `ghcr.io/awaragml00029-debug/clean:20260820-120423`
+digest `sha256:e26942a6f9e8094c626ed18b090be2150484ec08a0a4a63bbd41e6718c50039c`，已推 ghcr，镜像内 22/22 文件与分支 HEAD 一致。**未上线，未合 main。**
+
+回滚：`clean:20260820-113832`（第一步产物）或 `clean:20260805-091753`（当前线上）。
+
+---
+
 ## 2026-08-20
 
 上游追赶第一步：只摘不碰模型系统的抓取路径修复，gems 与全部加固零风险。完整迁移留到第二步。
