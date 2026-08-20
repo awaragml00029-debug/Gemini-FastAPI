@@ -17,7 +17,37 @@
 
 附带发现：上游改用动态模型注册表后，线上模型列表从 9 个（含 `-plus` / `-advanced` 思维等级变体）变成 3 个 —— `gemini-pro` / `gemini-flash` / `gemini-flash-lite`。`model_strategy` 配置项也被上游删除。
 
-### 2. 生图时出现 `_451` / `_499` —— 真 bug，已修（`9acf234`）
+### 2. 生图时出现 `_451` / `_455` —— 真 bug，两轮才修对（`9acf234` → `d601814`）
+
+**第一轮诊断错了。** 我当时认为是流式增量把 artifact URL 逐块漏出，做了 `StreamingOutputFilter` 扣留（`9acf234`）。部署后仍然复现，且**非流式端点一模一样会漏** —— 说明泄漏在库返回的最终文本里就有，与流式无关。
+
+**真正的原因**（关掉库的剥离、抓原始候选文本得到）：Google 现在发的 artifact URL 是
+
+```
+http://googleusercontent.com/image_generation_content/0_452
+```
+
+末段是 `0_452`（数字_数字）。而 gemini-webapi 的正则以 `\d+` 结尾：
+
+```python
+ARTIFACTS_RE = r"https?://googleusercontent\.com/(?:\w+/)+\d+\n*"
+```
+
+只吃掉 `0`，遇到下划线就停，`_452` 留在正文里。**Google 改了路径形状，库的正则没跟上。**
+
+对比验证：
+```
+库的正则  -> '自画像。\n\n_452\n\n'
+我们的正则 -> '自画像。\n\n'
+```
+
+**修法**：自己的 `ARTIFACT_URL_RE` 末段用 `[\w-]+` 吃整段，并放进 `process_llm_output` —— 这样非流式和存储路径一起覆盖，不只是流式。`9acf234` 的扣留逻辑保留（流式下仍需要），只是不够。
+
+**为什么第一轮测试全绿却没发现**：我用的测试样本是旧的纯数字形式 `/451`，那个形状库的正则本来就能处理。现在测试用生产实测的形状，并保留一条旧格式做兼容。
+
+---
+
+<details><summary>第一轮的分析（已被推翻，留作记录）</summary>
 
 **成因**：生图时 Google 正文里带一个 artifact URL，形如
 `http://googleusercontent.com/image_generation_content/451`。
@@ -36,16 +66,20 @@ delta='ntent'
 
 **一个易踩的细节**：结尾处的匹配不能剥。`ARTIFACTS_RE` 接受单个数字，`.../4` 就已经匹配，而 `51` 还在路上；此时剥离会让这两个字符漏成正文 —— 这正是第一版修法失败的原因。所以边缘匹配一律留到下一块或 flush 再定。
 
-**测试**：`tests/test_artifact_filter.py` 覆盖 1~100 各种分块粒度、一条响应里多个 artifact、普通文本保真（含不带数字尾巴的 googleusercontent 链接必须存活）、以及流在 URL 中途结束。
+**测试**：`tests/test_artifact_filter.py` 覆盖 1~100 各种分块粒度、一条响应里多个 artifact、普通文本保真、以及流在 URL 中途结束。
+
+</details>
+
+**测试补充**：新增 `_452` 形状的流式与非流式用例，断言 `_452` 与 `googleusercontent` 都不出现。
 
 ### 产出
 
-镜像 `ghcr.io/awaragml00029-debug/clean:20260820-122943`
-digest `sha256:9b74e068d7b4e8fa7204278fb6ef41ac3392bfe862281d16e9f8bc59c8255c2e`，已推 ghcr，镜像内 22/22 文件与 `main`（`9acf234`）一致。**未上线。**
+镜像 `ghcr.io/awaragml00029-debug/clean:20260820-143627`
+digest `sha256:db0d5f988d2779f274cbe4f6f2017d3047148dbf7d3912924a996c54e0deb06c`，已推 ghcr，镜像内 22/22 文件与 `main`（`d601814`）一致。**未上线。**
 
-验证：**207/207 测试通过**（188 上游 + 19 新增）、ruff/ty/pyright 全清、守卫 **27/27**。
+验证：**212/212 测试通过**（188 上游 + 24 新增）、ruff/ty/pyright 全清、守卫 **27/27**、镜像内实测剥离干净。
 
-回滚：`20260820-120423`（当前线上）、`20260820-113832`、`20260805-091753`。
+回滚：`20260820-122943`（当前线上，仍会漏 `_452`）、`20260820-120423`、`20260805-091753`。
 
 ---
 
