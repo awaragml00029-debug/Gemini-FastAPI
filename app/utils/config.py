@@ -106,6 +106,12 @@ class GeminiConfig(BaseModel):
     )
     timeout: int = Field(default=450, ge=30, description="Init timeout in seconds")
     watchdog_timeout: int = Field(default=120, ge=30, description="Watchdog timeout in seconds")
+    url_fetch_timeout: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        description="Timeout in seconds for server-side fetches of remote media URLs",
+    )
     auto_refresh: bool = Field(True, description="Enable auto-refresh for Gemini sessions")
     refresh_interval: int = Field(
         default=600,

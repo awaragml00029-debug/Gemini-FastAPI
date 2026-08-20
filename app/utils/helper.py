@@ -21,12 +21,12 @@ from curl_cffi import BrowserTypeLiteral, CurlHttpVersion, requests
 from loguru import logger
 
 from app.models import AppMessage, AppToolCall, AppToolCallFunction
+from app.utils import g_config
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
 MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_REDIRECTS = 5
-REMOTE_FETCH_TIMEOUT_SECONDS = 30
 REMOTE_URL_SCHEMES = {"http", "https"}
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
@@ -352,11 +352,36 @@ async def save_url_to_tempfile(
             impersonate=cast(BrowserTypeLiteral, impersonate or "chrome"),
             proxy=proxy,
             allow_redirects=False,
-            http_version=CurlHttpVersion.V3,
-            timeout=REMOTE_FETCH_TIMEOUT_SECONDS,
+            # Upstream hit QUIC idle timeouts forcing HTTP/3 here; let curl
+            # negotiate the version instead (upstream 7b2b32f).
+            http_version=CurlHttpVersion.NONE,
+            timeout=g_config.gemini.url_fetch_timeout,
         ) as client:
+            buffer = bytearray()
+            oversized = False
+
+            def receive_chunk(chunk: bytes) -> None:
+                # Enforced as the body arrives so an oversized response is
+                # aborted mid-transfer rather than buffered in full and then
+                # rejected (upstream 85d7a89 does the same). Raising here is what
+                # aborts the transfer, but curl swallows the exception and
+                # surfaces a generic RequestException, so the flag carries the
+                # real reason back out to the caller.
+                nonlocal oversized
+                if len(buffer) + len(chunk) > MAX_REMOTE_MEDIA_BYTES:
+                    oversized = True
+                    raise ValueError("Remote media is too large")
+                buffer.extend(chunk)
+
             for _ in range(MAX_REMOTE_REDIRECTS + 1):
-                resp = await client.get(current_url)
+                buffer.clear()
+                oversized = False
+                try:
+                    resp = await client.get(current_url, content_callback=receive_chunk)
+                except Exception as exc:
+                    if oversized:
+                        raise ValueError("Remote media is too large") from exc
+                    raise
                 if resp.status_code in REDIRECT_STATUS_CODES:
                     location = resp.headers.get("location")
                     if not location:
@@ -371,9 +396,7 @@ async def save_url_to_tempfile(
                             raise ValueError("Remote media is too large")
                     except ValueError as exc:
                         raise ValueError("Remote media is too large") from exc
-                data = resp.content
-                if len(data) > MAX_REMOTE_MEDIA_BYTES:
-                    raise ValueError("Remote media is too large")
+                data = bytes(buffer)
                 content_type = resp.headers.get("content-type")
                 suffix = _suffix_from_mime_or_url(content_type, current_url)
                 logger.info(

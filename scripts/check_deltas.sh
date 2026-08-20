@@ -120,12 +120,14 @@ require_symbol '_validate_remote_url' app/utils/helper.py \
     "remote fetches can be pointed at localhost, private ranges, or cloud metadata"
 require_symbol '_is_public_ip' app/utils/helper.py \
     "the SSRF guard cannot classify addresses"
-require_symbol 'REMOTE_FETCH_TIMEOUT_SECONDS' app/utils/helper.py \
+require_symbol 'url_fetch_timeout' app/utils/helper.py \
     "a slow remote host can hang the fetch indefinitely"
 require_symbol 'MAX_REMOTE_MEDIA_BYTES' app/utils/helper.py \
     "an oversized remote file can exhaust memory"
 require_symbol 'allow_redirects=False' app/utils/helper.py \
     "curl follows redirects itself, so a public URL can bounce into the private network unchecked"
+require_symbol 'content_callback' app/utils/helper.py \
+    "the size cap is only checked after the whole body is already buffered"
 require_symbol 'curl_cffi_fetch_options' app/services/client.py \
     "media fetches stop using the account's own proxy and TLS fingerprint"
 require_symbol 'fetch_impersonate' app/server/chat.py \
