@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urljoin, urlparse
 
+import gemini_webapi.client as _gemini_client
+import gemini_webapi.constants as _gemini_constants
 import orjson
 import regex
 from curl_cffi import BrowserTypeLiteral, CurlHttpVersion, requests
@@ -50,6 +52,14 @@ type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValu
 # underscore, digits -- so it consumes only the leading `0` and leaves `_452` sitting
 # in the reply just above the image. Match the whole segment instead.
 ARTIFACT_URL_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+[\w-]+\n*")
+
+# The library strips these in _parse_candidate, before any of our code sees the text,
+# and it does so with its own pattern ending in `\d+`. Against `.../0_452` that consumes
+# `0`, stops at the underscore, and hands us an orphaned `_452` whose URL is already
+# gone -- nothing downstream can recognise it any more. So the pattern has to be
+# replaced at the source. client.py binds the name at import time, hence both targets.
+_gemini_client.ARTIFACTS_RE = ARTIFACT_URL_RE
+_gemini_constants.ARTIFACTS_RE = ARTIFACT_URL_RE
 
 MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_REDIRECTS = 5

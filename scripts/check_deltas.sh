@@ -140,6 +140,8 @@ require_symbol 'fetch_impersonate' app/server/chat.py \
     "the per-client fingerprint never reaches the fetch path"
 require_symbol '_artifact_holdback_len' app/server/chat.py \
     "googleusercontent URLs leak into the stream one fragment at a time"
+require_symbol '_gemini_client.ARTIFACTS_RE' app/utils/helper.py \
+    "the library strips artifacts with its own pattern first and leaves an orphaned _452"
 
 echo
 

@@ -66,3 +66,19 @@ def test_non_streaming_path_strips_artifact() -> None:
     assert "_452" not in visible
     assert "_452" not in storage
     assert visible.strip() == "一只猫。"
+
+
+def test_library_pattern_is_replaced_at_source() -> None:
+    """The library strips artifacts before our code runs, so its pattern must be ours.
+
+    gemini_webapi cleans the text inside _parse_candidate. Its own pattern ends in
+    `\\d+`, which against `.../0_452` consumes `0` and hands us an orphaned `_452`
+    with no URL left to recognise. Patching only our side cannot fix that -- verified
+    in production, where the leak survived a filter that looked correct in isolation.
+    """
+    import gemini_webapi.client as gemini_client
+
+    import app.utils.helper as helper  # noqa: F401  (import applies the patch)
+
+    raw = "x\n\nhttp://googleusercontent.com/image_generation_content/0_452\n\n"
+    assert gemini_client.ARTIFACTS_RE.sub("", raw) == "x\n\n"
