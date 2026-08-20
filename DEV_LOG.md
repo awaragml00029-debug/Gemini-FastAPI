@@ -1,5 +1,69 @@
 # 开发日志
 
+## 2026-08-20
+
+上游追赶第一步：只摘不碰模型系统的抓取路径修复，gems 与全部加固零风险。完整迁移留到第二步。
+
+### 上游现状复查
+
+`luuquangvu/Gemini-FastAPI` @ `7d1744e`（8-19）。**落后 28 个提交**（上次记录是 8 个），我们领先 7 个。规模 34 个文件、**+7369 / −1899**，只读试合 **10 处冲突**，承载加固的 6 个文件（`main.py` / `chat.py` / `health.py` / `client.py` / `pool.py` / `helper.py`）全部中招，其中 `chat.py` 变动 **2802 行**，基本重写。
+
+**阻塞项：模型系统被重写。** 上游删除了 `_get_model_by_name`，换成 `_resolve_model_name(pool, name) -> str`（返回字符串，不再是 `Model` 对象），并用动态 `AvailableModel` 取代硬编码 `Model`（`c8e0a83`）。我们的 `_resolve_model_and_gem` 正依赖旧契约 —— **直接合会把 gems 合坏**，必须按新契约重写。
+
+上游仍然**没有**我们任何一个加固符号（8 项全 0），也没有 gems。但它新增了 1726 行测试（`tests/` 5 个文件），第二步可以直接用来验证。
+
+### 上游自己实现了 SSRF 防护（`85d7a89`）
+
+命名不同（`reject_unsafe_url` / `MAX_REMOTE_FETCH_BYTES=20MB`），逐点对比：
+
+| | 我们 | 上游 |
+|---|---|---|
+| 重定向校验 | `allow_redirects=False` **逐跳校验** | `CurlFollow.SAFE`，**只校验初始 URL**，302 到内网可绕过 |
+| 大小限制 | 事后查 content-length + body | **边下边计数**，更好 |
+| 超时 | 硬编码 30s | 可配置，更好 |
+| 每客户端代理+指纹 | **有** | 无，仍是通用 `chrome` 无代理 |
+| `http_version` | 写死 `V3` | `NONE`（QUIC 修复） |
+
+### 本次改动（`f0f4720`）
+
+摘上游三样，保留我们更强的两样：
+
+**摘过来**
+- `http_version: V3 → NONE`（上游 `7b2b32f`）。强制 HTTP/3 正是上游 QUIC 空闲超时的成因（`cc837f9`），改为让 curl 协商。这是上游 diff 里对我们价值最高的一项。
+- 大小上限改为 `content_callback` **流式执行**，超限中途即断，不再整body缓冲后才拒绝。注意：callback 里抛的异常被 curl 吞掉、只报笼统 `RequestException`，所以用 `oversized` 标志把真实原因带出来。
+- 抓取超时从硬编码常量改为 `gemini.url_fetch_timeout`，**默认保持 30s**（上游默认 15），升级后行为不变。
+
+**保留我们的**
+- `allow_redirects=False` + 逐跳 `_validate_remote_url`
+- 每客户端 proxy / impersonate 下发
+
+**实测**：5430 字节正常下载通过；把上限调到 100 字节能中途断开并抛出 `ValueError("Remote media is too large")`；`127.0.0.1` / `169.254.169.254` / `[::1]` 仍拒绝；`ruff` / `ty` / `pyright` 全清；守卫 **24 项断言**全绿（`REMOTE_FETCH_TIMEOUT_SECONDS` 断言换成 `url_fetch_timeout`，新增 `content_callback` 断言）。
+
+### 产出
+
+镜像 `ghcr.io/awaragml00029-debug/clean:20260820-113832`
+digest `sha256:dfe62ea2b7f5c539ff58e8db7faf4b0c57dd07d780f3692870d7a736b00cf648`，已推 ghcr，镜像内 20/20 文件与 `HEAD` 一致。**上线由本人手动执行。**
+回滚可选 `clean:20260805-091753`（当前线上）或 `clean:rollback-20260528`。
+
+### 第二步待办（整体迁移）
+
+以上游 `7d1744e` 为基线重建，按难度顺序重接加固：
+
+| 加固块 | 难度 | 原因 |
+|---|---|---|
+| `request_scope` / `active_requests` / `mark_unavailable` | 低 | 纯 client 生命周期，与模型系统无关，`client.py` 仅改 65 行 |
+| `_restart_client`（pool） | 低 | 同上，66 行 |
+| `_run_pool_init_in_background`（main.py） | 低 | 启动逻辑，28 行 |
+| 抓取加固（逐跳校验 + 每客户端代理指纹） | 中 | 上游已有 SSRF 骨架，我们往上补两块 |
+| `_stream_with_idle_timeout` / `_send_stream_with_split` / `_process_conversation_with_timeout` | 高 | 在被重写的 2802 行 `chat.py` 里，流式逻辑全变 |
+| gems | 高 | 需按 `_resolve_model_name` 新契约重写 |
+
+好消息：加固挂载的底层函数都还在（`process_conversation`、`process_message`、`_extract_content_and_files`、`save_url_to_tempfile`），是重新接线不是重新设计。
+
+**约定：第二步在新分支上做，不动 `main`，跑通上游 `tests/` 再合。**
+
+---
+
 ## 2026-08-05
 
 本轮目标：仓库归位（main = 线上代码）、清理历史分支、建立上游持续追踪、找回被静默丢失的自定义功能。
