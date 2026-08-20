@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from gemini_webapi import ModelOutput
 from gemini_webapi.client import ChatSession
+from gemini_webapi.constants import ARTIFACTS_RE
 from gemini_webapi.exceptions import ModelInvalidError
 from gemini_webapi.types.image import GeneratedImage, Image
 from gemini_webapi.types.video import GeneratedMedia, GeneratedVideo
@@ -1430,6 +1431,25 @@ async def _send_with_internal_fallback(
         return output, fallback_session, fallback_client
 
 
+_ARTIFACT_HOSTS = ("http://googleusercontent.com/", "https://googleusercontent.com/")
+
+
+def _artifact_holdback_len(text: str) -> int:
+    """Length of the trailing run that could still become a googleusercontent artifact URL.
+
+    ARTIFACTS_RE only matches once the trailing digits arrive, so mid-stream the URL is
+    not yet strippable and escapes character by character -- which is what leaves stray
+    fragments like `_451` sitting in front of a generated image. Anything from a
+    possible URL start onwards is withheld until it either completes (and is dropped)
+    or the stream ends (and flush releases it).
+    """
+    for i in range(len(text)):
+        tail = text[i:]
+        if any(tail.startswith(host) or host.startswith(tail) for host in _ARTIFACT_HOSTS):
+            return len(text) - i
+    return 0
+
+
 class StreamingOutputFilter:
     """
     Filter to suppress technical protocol markers, tool calls, and system hints from the stream.
@@ -1440,6 +1460,28 @@ class StreamingOutputFilter:
         self.buffer = ""
         self.stack = ["NORMAL"]
         self.current_role = ""
+        self.artifact_hold = ""
+
+    def _filter_artifacts(self, text: str) -> str:
+        """Drop complete artifact URLs and withhold anything that might still become one."""
+        buf = self.artifact_hold + text
+        # A match that ends at the buffer edge is not necessarily complete: ARTIFACTS_RE
+        # accepts a single digit, so ".../4" matches while "51" is still in flight.
+        # Leave that one held and let the next chunk, or flush, decide.
+        kept: list[str] = []
+        pos = 0
+        for m in ARTIFACTS_RE.finditer(buf):
+            if m.end() == len(buf):
+                break
+            kept.append(buf[pos : m.start()])
+            pos = m.end()
+        buf = "".join(kept) + buf[pos:]
+        keep = _artifact_holdback_len(buf)
+        if keep:
+            self.artifact_hold = buf[len(buf) - keep :]
+            return buf[: len(buf) - keep]
+        self.artifact_hold = ""
+        return buf
 
     @property
     def state(self):
@@ -1516,7 +1558,7 @@ class StreamingOutputFilter:
 
             self.buffer = self.buffer[end:]
 
-        return "".join(output)
+        return self._filter_artifacts("".join(output))
 
     def flush(self) -> str:
         """Release remaining buffer content and perform final cleanup at stream end."""
@@ -1529,6 +1571,8 @@ class StreamingOutputFilter:
         self.buffer = ""
         self.stack = ["NORMAL"]
         self.current_role = ""
+        res = ARTIFACTS_RE.sub("", self.artifact_hold + res)
+        self.artifact_hold = ""
         return strip_system_hints(res)
 
 
@@ -2771,9 +2815,7 @@ async def create_chat_completion(
     base_url = str(raw_request.base_url)
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        resolved_model, gem_id, conversation_key = _resolve_model_and_gem(
-            pool, request.model
-        )
+        resolved_model, gem_id, conversation_key = _resolve_model_and_gem(pool, request.model)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if not request.messages:
@@ -2831,9 +2873,7 @@ async def create_chat_completion(
     else:
         try:
             client = await pool.acquire(require_account=needs_upload)
-            session = client.start_chat(
-                model=client.usable_model(resolved_model), gem=gem_id
-            )
+            session = client.start_chat(model=client.usable_model(resolved_model), gem=gem_id)
             m_input, files = await _process_conversation_for_client(client, msgs, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
@@ -3106,9 +3146,7 @@ async def create_response(
     )
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
-        resolved_model, gem_id, conversation_key = _resolve_model_and_gem(
-            pool, request.model
-        )
+        resolved_model, gem_id, conversation_key = _resolve_model_and_gem(pool, request.model)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -3141,9 +3179,7 @@ async def create_response(
     else:
         try:
             client = await pool.acquire(require_account=needs_upload)
-            session = client.start_chat(
-                model=client.usable_model(resolved_model), gem=gem_id
-            )
+            session = client.start_chat(model=client.usable_model(resolved_model), gem=gem_id)
             m_input, files = await _process_conversation_for_client(client, messages, tmp_dir)
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")

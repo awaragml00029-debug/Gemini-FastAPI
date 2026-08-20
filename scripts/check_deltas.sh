@@ -138,6 +138,8 @@ require_symbol 'curl_cffi_fetch_options' app/services/client.py \
     "media fetches stop using the account's own proxy and TLS fingerprint"
 require_symbol 'fetch_impersonate' app/server/chat.py \
     "the per-client fingerprint never reaches the fetch path"
+require_symbol '_artifact_holdback_len' app/server/chat.py \
+    "googleusercontent URLs leak into the stream one fragment at a time"
 
 echo
 
