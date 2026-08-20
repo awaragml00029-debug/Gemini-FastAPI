@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictBool, model_validator
+
+
+@dataclass
+class StructuredOutputRequirement:
+    """Represents a structured response request from the client."""
+
+    schema_name: str
+    schema: dict[str, Any]
+    instruction: str
+    raw_format: dict[str, Any]
+    strict: bool = True
+    """Whether schema adherence is guaranteed to the client.
+
+    Mirrors OpenAI's `strict` flag: Structured Outputs (`strict: true`) promise the response
+    matches the schema, so a violation has to surface as an error. JSON mode and `strict: false`
+    only promise a best effort, so a violation degrades to the raw text instead.
+    """
 
 
 class FunctionCall(BaseModel):
@@ -83,6 +102,21 @@ class ChatCompletionFunctionTool(BaseModel):
 
     type: Literal["function"]
     function: FunctionDefinition
+
+    @model_validator(mode="before")
+    @classmethod
+    def _nest_flat_function(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "function" not in data and "name" in data:
+            return {
+                "type": data.get("type", "function"),
+                "function": {
+                    "name": data.get("name"),
+                    "description": data.get("description"),
+                    "parameters": data.get("parameters"),
+                    "strict": data.get("strict"),
+                },
+            }
+        return data
 
 
 class ChatCompletionNamedToolChoiceFunction(BaseModel):
@@ -230,6 +264,19 @@ class FunctionTool(BaseModel):
     parameters: dict[str, Any] | None = Field(default=None)
     strict: bool | None = Field(default=None)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_nested_function(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "function" in data and isinstance(data["function"], dict):
+            fn = data["function"]
+            res = dict(data)
+            res.setdefault("name", fn.get("name"))
+            res.setdefault("description", fn.get("description"))
+            res.setdefault("parameters", fn.get("parameters"))
+            res.setdefault("strict", fn.get("strict"))
+            return res
+        return data
+
 
 class ImageGeneration(BaseModel):
     """Image-generation built-in tool for the Responses API."""
@@ -348,6 +395,12 @@ class ResponseFormatText(BaseModel):
     type: Literal["text"] = Field(default="text")
 
 
+class ResponseFormatJSONObject(BaseModel):
+    """Legacy JSON mode: valid JSON is promised, schema conformance is not."""
+
+    type: Literal["json_object"] = Field(default="json_object")
+
+
 class ResponseFormatTextJSONSchemaConfig(BaseModel):
     """JSON-schema-constrained output format."""
 
@@ -359,13 +412,15 @@ class ResponseFormatTextJSONSchemaConfig(BaseModel):
         default=None, alias="schema", serialization_alias="schema"
     )
     description: str | None = Field(default=None)
+    # Unset, not False: the resolved value is stamped back onto the echoed response.
+    strict: StrictBool | None = Field(default=None)
 
 
 class ResponseTextConfig(BaseModel):
     """Top-level text configuration block in a Responses API response."""
 
-    format: ResponseFormatText | ResponseFormatTextJSONSchemaConfig = Field(
-        default_factory=ResponseFormatText
+    format: ResponseFormatTextJSONSchemaConfig | ResponseFormatJSONObject | ResponseFormatText = (
+        Field(default_factory=ResponseFormatText)
     )
 
 
@@ -393,9 +448,13 @@ class ResponseCreateRequest(BaseModel):
     tool_choice: (
         Literal["none", "auto", "required"] | ToolChoiceFunction | ToolChoiceTypes | None
     ) = Field(default=None)
-    tools: list[FunctionTool | ImageGeneration] | None = Field(default=None)
+    tools: list[FunctionTool | ChatCompletionFunctionTool | ImageGeneration] | None = Field(
+        default=None
+    )
     store: bool | None = Field(default=None)
     prompt_cache_key: str | None = Field(default=None)
+    text: ResponseTextConfig | None = Field(default=None)
+    # Backward-compatible project extension. Current OpenAI Responses requests use `text.format`.
     response_format: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] | None = Field(default=None)
     parallel_tool_calls: bool | None = Field(default=True)
@@ -419,9 +478,13 @@ class ResponseCreateResponse(BaseModel):
         Field(default="completed")
     )
     tool_choice: (
-        Literal["none", "auto", "required"] | ToolChoiceFunction | ToolChoiceTypes | None
+        Literal["none", "auto", "required"]
+        | ToolChoiceFunction
+        | ToolChoiceTypes
+        | dict[str, Any]
+        | None
     ) = Field(default=None)
-    tools: list[FunctionTool | ImageGeneration] = Field(default_factory=list)
+    tools: list[dict[str, Any]] = Field(default_factory=list)
     usage: ResponseUsage | None = Field(default=None)
     error: dict[str, Any] | None = Field(default=None)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -448,8 +511,8 @@ class HealthCheckResponse(BaseModel):
     """Response body for the health check endpoint."""
 
     ok: bool
-    storage: dict[str, Any] | None = Field(default=None)
-    clients: dict[str, bool] | None = Field(default=None)
+    storage: Mapping[str, Any] | None = Field(default=None)
+    clients: Mapping[str, bool] | None = Field(default=None)
     error: str | None = Field(default=None)
 
 

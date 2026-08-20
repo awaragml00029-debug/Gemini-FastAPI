@@ -32,6 +32,18 @@ class GeminiClientPool(metaclass=Singleton):
             self._round_robin.append(client)
             self._restart_locks[c.id] = asyncio.Lock()
 
+    async def _init_one(self, client: GeminiClientWrapper) -> bool:
+        """Initialize a single client; returns True on success."""
+        return await self._init_attempt(client)
+
+    async def _init_attempt(self, client: GeminiClientWrapper) -> bool:
+        """Run library init; returns True on success."""
+        try:
+            await client.init()
+            return True
+        except Exception:
+            return False
+
     async def init(self) -> None:
         """Initialize all clients in the pool with staggered start times."""
         clients_to_init = [c for c in self._clients if not self._client_ready(c)]
@@ -59,8 +71,14 @@ class GeminiClientPool(metaclass=Singleton):
         if success_count == 0:
             raise RuntimeError("Failed to initialize any Gemini clients")
 
-    async def acquire(self, client_id: str | None = None) -> GeminiClientWrapper:
-        """Return a healthy client by id or using round-robin."""
+    async def acquire(
+        self, client_id: str | None = None, require_account: bool = False
+    ) -> GeminiClientWrapper:
+        """Return a healthy client by id or using round-robin.
+
+        `require_account` excludes guest sessions, for requests they cannot serve at all - file
+        uploads. Otherwise a guest is used only once no authenticated client is left.
+        """
         if not self._round_robin:
             raise RuntimeError("No Gemini clients configured")
 
@@ -74,12 +92,32 @@ class GeminiClientPool(metaclass=Singleton):
                 f"Gemini client {client_id} is not running and could not be restarted"
             )
 
-        for _ in range(len(self._round_robin)):
-            client = self._round_robin[0]
-            self._round_robin.rotate(-1)
-            if await self._ensure_client_ready(client):
-                return client
+        # Authenticated clients first. A client whose cookies expired keeps answering text
+        # prompts as a guest, so it stays usable and must not take the pool down, but it has no
+        # history, no uploads and no model choice - traffic belongs elsewhere while it can.
+        for account_only in (True,) if require_account else (True, False):
+            for _ in range(len(self._round_robin)):
+                client = self._round_robin[0]
+                self._round_robin.rotate(-1)
+                # Rechecked after readiness: a restart can itself land in a guest session.
+                if account_only and client.is_guest():
+                    continue
+                if await self._ensure_client_ready(client) and not (
+                    account_only and client.is_guest()
+                ):
+                    return client
 
+            if account_only and not require_account and any(c.is_guest() for c in self._clients):
+                logger.warning(
+                    "No authenticated Gemini client is available; falling back to a guest "
+                    "session until cookies are refreshed."
+                )
+
+        if require_account:
+            raise RuntimeError(
+                "No authenticated Gemini client is available. This request needs a file upload, "
+                "which a guest session cannot do - refresh the client cookies."
+            )
         raise RuntimeError("No Gemini clients are currently available")
 
     @staticmethod

@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import mimetypes
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,15 +8,31 @@ from loguru import logger
 
 from .server.chat import refresh_available_models_cache
 from .server.chat import router as chat_router
+from .server.gemini import add_gemini_exception_handlers
+from .server.gemini import router as gemini_router
 from .server.gems import router as gems_router
 from .server.health import router as health_router
 from .server.media import router as media_router
 from .server.middleware import (
     add_cors_middleware,
     add_exception_handler,
+    add_request_size_limit_middleware,
     cleanup_expired_media,
 )
 from .services import GeminiClientPool, LMDBConversationStore
+
+# Canonical audio MIME types: Python's platform mapping yields legacy "x-"
+# types (audio/x-wav, audio/x-aac, audio/x-flac) that Google's upload
+# endpoint does not classify as audio, so the attached file never reaches
+# the model as an audible attachment. Registered at import time, before any upload.
+for _ext, _mime in (
+    (".wav", "audio/wav"),
+    (".aac", "audio/aac"),
+    (".flac", "audio/flac"),
+    (".m4a", "audio/mp4"),
+):
+    with contextlib.suppress(ValueError):
+        mimetypes.add_type(_mime, _ext)
 
 RETENTION_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60  # Check every 6 hours
 
@@ -71,6 +89,14 @@ async def lifespan(app: FastAPI):
     cleanup_stop_event = asyncio.Event()
 
     pool = GeminiClientPool()
+    # Client init deliberately stays off the startup path -- see
+    # _run_pool_init_in_background. Upstream blocks here instead, which turns a
+    # slow or unreachable Gemini account into a server that never becomes ready.
+    try:
+        LMDBConversationStore().prune_stale_indexes()
+    except Exception:
+        logger.exception("Failed to prune stale LMDB indexes; continuing with startup.")
+
     cleanup_task = asyncio.create_task(_run_retention_cleanup(cleanup_stop_event))
     pool_init_task = asyncio.create_task(_run_pool_init_in_background(pool))
 
@@ -132,12 +158,17 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Order matters: the last middleware added is the outermost, so the body limit has to be
+    # registered first for its 413 to still pass back out through CORS.
+    add_request_size_limit_middleware(app)
     add_cors_middleware(app)
     add_exception_handler(app)
+    add_gemini_exception_handlers(app)
 
     app.include_router(health_router, tags=["Health"])
     app.include_router(chat_router, tags=["Chat"])
     app.include_router(media_router, tags=["Media"])
     app.include_router(gems_router, tags=["Gems"])
+    app.include_router(gemini_router, tags=["Gemini"])
 
     return app

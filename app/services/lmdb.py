@@ -1,10 +1,10 @@
 import hashlib
 import string
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Self, cast
 
 import lmdb
 import orjson
@@ -62,16 +62,29 @@ def _hash_message(message: AppMessage, fuzzy: bool = False) -> str:
     elif isinstance(content, str):
         core_data["content"] = _normalize_text(content, fuzzy=fuzzy)
     elif isinstance(content, list):
-        text_parts = []
+        content_items: list[dict[str, Any]] = []
         for item in content:
-            if item.type == "text" and item.text:
-                if normalized_part := _normalize_text(item.text, fuzzy=fuzzy):
-                    text_parts.append(normalized_part)
-            elif item.type != "text" and item.url:
-                text_parts.append(f"[{item.type}:{item.url}]")
+            item_data: dict[str, Any] = {
+                "type": item.type,
+                "filename": item.filename,
+                "url": item.url,
+                "content_digest": item.content_digest,
+            }
+            if item.text is not None:
+                item_data["text"] = _normalize_text(item.text, fuzzy=fuzzy)
+            if item.raw_data is not None:
+                # Included directly: the outer dump sorts keys recursively, so this is already
+                # canonical, and digesting it would only serialize the same data a second time.
+                item_data["raw_data"] = item.raw_data
+            content_items.append(item_data)
 
-        core_data["content"] = "\n".join(text_parts) if text_parts else None
+        core_data["content"] = content_items or None
 
+    # `reasoning_content` is deliberately NOT hashed. `_persist_conversation` stores every
+    # assistant turn it produces with `reasoning_content=None`, while both request converters
+    # populate it from whatever the client echoes back - and this server does emit reasoning on
+    # both surfaces. Hashing it would make the stored turn and the replayed turn disagree by
+    # construction, so the newest prefix could never match and reuse would collapse.
     if message.tool_calls:
         calls_data = []
         for tc in message.tool_calls:
@@ -114,8 +127,42 @@ def _hash_conversation(
 class LMDBConversationStore(metaclass=Singleton):
     """LMDB-based storage for Message lists with hash-based key-value operations."""
 
-    HASH_LOOKUP_PREFIX = "hash:"
-    FUZZY_LOOKUP_PREFIX = "fuzzy:"
+    # Bump when _hash_message changes shape. Entries under an older version can never match
+    # again, and their conversations would otherwise keep index rows no eviction can find,
+    # so startup sweeps them instead of leaving them to accumulate.
+    #
+    # The conversation records themselves are keyed by the hash that produced them, so records
+    # written under an older version stay unreachable after the sweep: a repeat of the same
+    # conversation is replayed in full and stored again under a current key, and the superseded
+    # record is left to expire on the normal retention schedule.
+    INDEX_VERSION = "v2"
+    HASH_LOOKUP_PREFIX = f"hash:{INDEX_VERSION}:"
+    FUZZY_LOOKUP_PREFIX = f"fuzzy:{INDEX_VERSION}:"
+    _INDEX_NAMESPACES = ("hash:", "fuzzy:")
+    _INTERNAL_NAMESPACES = ("hash:", "fuzzy:", "meta:")
+    _INDEX_VERSION_KEY = "meta:index_version"
+
+    @classmethod
+    def open_isolated(
+        cls,
+        db_path: str,
+        max_db_size: int | None = None,
+        retention_days: int | None = None,
+    ) -> Self:
+        """Open a store outside the singleton, for maintenance commands and isolated tests.
+
+        LMDB does not support two environments on one path in a single process, so `db_path`
+        must not be the path the singleton already holds open.
+        """
+        return cast(
+            Self,
+            type.__call__(
+                cls,
+                db_path=db_path,
+                max_db_size=max_db_size,
+                retention_days=retention_days,
+            ),
+        )
 
     def __init__(
         self,
@@ -237,6 +284,7 @@ class LMDBConversationStore(metaclass=Singleton):
         model: str,
         messages: list[AppMessage],
         metadata: list[str | None],
+        chat_scope: str | None = None,
     ) -> None:
         """
         Store a conversation model in LMDB.
@@ -246,6 +294,8 @@ class LMDBConversationStore(metaclass=Singleton):
             model: The model name
             messages: Unsanitized API messages
             metadata: Session metadata
+            chat_scope: Identity of the ephemeral window owning the chat, None if it is a normal
+                chat kept in the account's history
         """
         if not messages:
             raise ValueError("Messages list cannot be empty")
@@ -256,6 +306,7 @@ class LMDBConversationStore(metaclass=Singleton):
             client_id=client_id,
             metadata=metadata,
             messages=messages,
+            chat_scope=chat_scope,
             created_at=now,
             updated_at=now,
         )
@@ -398,6 +449,15 @@ class LMDBConversationStore(metaclass=Singleton):
                 return conv
         return None
 
+    def evict(self, conv: ConversationInStore) -> bool:
+        """Delete a stored conversation given the record itself.
+
+        Used to drop metadata that Google has already invalidated, so the next request
+        does not rediscover the same dead session and fail again.
+        """
+        key = _hash_conversation(conv.client_id, conv.model, conv.messages)
+        return self.delete(key) is not None
+
     def exists(self, key: str) -> bool:
         """Check if a key exists in the store."""
         try:
@@ -434,6 +494,51 @@ class LMDBConversationStore(metaclass=Singleton):
         logger.debug(f"Deleted messages with key: {key[:12]}")
         return conv
 
+    def _is_index_key(self, key: str) -> bool:
+        """Whether a raw key is a lookup entry rather than a stored conversation."""
+        return key.startswith(self._INDEX_NAMESPACES)
+
+    def _is_internal_key(self, key: str) -> bool:
+        """Whether a raw key is bookkeeping rather than a stored conversation."""
+        return key.startswith(self._INTERNAL_NAMESPACES)
+
+    def prune_stale_indexes(self) -> int:
+        """Drop lookup entries written under a superseded INDEX_VERSION.
+
+        Only the lookup entries go: the conversation records they pointed at are keyed by the
+        old hash and cannot be re-indexed under the new one, so they are left to expire under
+        the normal retention window.
+
+        A marker records that the sweep ran for this version, so later startups skip the scan.
+        """
+        version_key = self._INDEX_VERSION_KEY.encode("utf-8")
+        try:
+            with self._get_transaction(write=True) as txn:
+                if txn.get(version_key) == self.INDEX_VERSION.encode("utf-8"):
+                    return 0
+
+                stale = [
+                    bytes(key)
+                    for key, _ in txn.cursor()
+                    if (decoded := bytes(key).decode("utf-8", "replace"))
+                    and self._is_index_key(decoded)
+                    and not decoded.startswith((self.HASH_LOOKUP_PREFIX, self.FUZZY_LOOKUP_PREFIX))
+                ]
+                for key in stale:
+                    txn.delete(key)
+                txn.put(version_key, self.INDEX_VERSION.encode("utf-8"), overwrite=True)
+        except Error as exc:
+            logger.error(f"Failed to prune stale LMDB indexes: {exc}")
+            return 0
+
+        if stale:
+            logger.info(
+                f"Pruned {len(stale)} LMDB lookup entries from a superseded index version; "
+                "the conversations behind them are replayed in full once and stored again "
+                "under a current key, and the superseded records expire under retention."
+            )
+        return len(stale)
+
     def keys(self, prefix: str = "", limit: int | None = None) -> list[str]:
         """List all keys in the store, optionally filtered by prefix."""
         keys = []
@@ -445,10 +550,7 @@ class LMDBConversationStore(metaclass=Singleton):
                 count = 0
                 for key, _ in cursor:
                     key_str = bytes(key).decode("utf-8")
-                    # Skip internal index mappings
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
-                        self.FUZZY_LOOKUP_PREFIX
-                    ):
+                    if self._is_internal_key(key_str):
                         continue
 
                     if not prefix or key_str.startswith(prefix):
@@ -470,6 +572,10 @@ class LMDBConversationStore(metaclass=Singleton):
             return 0
 
         cutoff = datetime.now() - timedelta(days=retention_value)
+        return self.cleanup_before(cutoff)
+
+    def cleanup_before(self, cutoff: datetime) -> int:
+        """Delete conversations older than an explicit timestamp and repair both indexes."""
         expired_entries: list[tuple[str, ConversationInStore]] = []
 
         try:
@@ -477,9 +583,7 @@ class LMDBConversationStore(metaclass=Singleton):
                 cursor = txn.cursor()
                 for key_bytes, value_bytes in cursor:
                     key_str = bytes(key_bytes).decode("utf-8")
-                    if key_str.startswith(self.HASH_LOOKUP_PREFIX) or key_str.startswith(
-                        self.FUZZY_LOOKUP_PREFIX
-                    ):
+                    if self._is_internal_key(key_str):
                         continue
 
                     try:
@@ -489,7 +593,9 @@ class LMDBConversationStore(metaclass=Singleton):
                         logger.warning(f"Failed to decode record for key {key_str}: {exc}")
                         continue
 
-                    timestamp = conv.created_at or conv.updated_at
+                    # Last touched, not first created: a conversation still in active use has
+                    # not expired no matter how long ago it started.
+                    timestamp = conv.updated_at or conv.created_at
                     if not timestamp:
                         continue
 
@@ -530,7 +636,20 @@ class LMDBConversationStore(metaclass=Singleton):
 
         return removed
 
-    def stats(self) -> dict[str, Any]:
+    def clear(self) -> int:
+        """Delete every conversation and index entry from the store."""
+        removed = len(self.keys())
+        try:
+            with self._get_transaction(write=True) as txn:
+                keys = [bytes(key) for key, _ in txn.cursor()]
+                for key in keys:
+                    txn.delete(key)
+        except Error as exc:
+            logger.error(f"Failed to clear LMDB: {exc}")
+            raise
+        return removed
+
+    def stats(self) -> Mapping[str, Any]:
         """Get database statistics."""
         if not self._env:
             logger.error("LMDB environment not initialized")

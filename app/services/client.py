@@ -9,6 +9,7 @@ from typing import Any
 import orjson
 from gemini_webapi import GeminiClient
 from gemini_webapi.constants import AccountStatus
+from gemini_webapi.types import AvailableModel
 from gemini_webapi.utils.rotate_1psidts import save_cookies
 from loguru import logger
 
@@ -19,6 +20,10 @@ from app.utils.helper import (
     save_file_to_tempfile,
     save_url_to_tempfile,
 )
+
+# How a model is addressed: by name, or as one of the models a client discovered. `None` leaves
+# the choice to Google.
+type ModelSpec = str | AvailableModel | None
 
 
 class GeminiClientWrapper(GeminiClient):
@@ -32,6 +37,11 @@ class GeminiClientWrapper(GeminiClient):
         self._needs_restart = False
         self._active_requests = 0
         self._active_requests_changed = asyncio.Condition()
+        # Chat id of the last conversation this client opened, its kind unverified. Google closes
+        # an ephemeral window as soon as another conversation is created, so for those chats this
+        # is the only cid still continuable. In memory and cleared on every (re)initialization:
+        # once the session that opened a window is gone, nothing can vouch for it.
+        self.latest_chat_cid: str | None = None
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
         """
@@ -53,6 +63,7 @@ class GeminiClientWrapper(GeminiClient):
             await super().init(**init_kwargs)
             self._initialized = True
             self._needs_restart = False
+            self.latest_chat_cid = None
         except Exception:
             self._initialized = False
             self._needs_restart = True
@@ -161,6 +172,56 @@ class GeminiClientWrapper(GeminiClient):
             and self.account_status == AccountStatus.AVAILABLE
         )
 
+    def is_guest(self) -> bool:
+        """Whether this client talks to Google without an account.
+
+        Set when initialization falls back to a guest session, or when an authenticated one is
+        rejected mid-flight because its cookies expired. Text generation keeps working, so this
+        has to be asked rather than assumed away: the session just has no history, no uploads
+        and no model choice.
+        """
+        return self.account_status == AccountStatus.UNAUTHENTICATED
+
+    def can_upload(self) -> bool:
+        """Whether files may be attached; Google rejects uploads from a guest session."""
+        return not self.is_guest()
+
+    def usable_model(self, model: ModelSpec) -> ModelSpec:
+        """The requested model, or the only one a guest session may use.
+
+        Google offers a guest no model choice, so honouring the request is impossible; serving
+        its default beats failing outright. Callers keep addressing the request by its original
+        model name, which is what conversation storage stays keyed on.
+        """
+        if not self.is_guest():
+            return model
+
+        # None when the guest registry is empty, which leaves the model unspecified and lets
+        # Google answer with whatever it gives a signed-out visitor.
+        default = next((m for m in self._model_registry.values() if m.is_available), None)
+        requested = model if isinstance(model, str) else getattr(model, "model_name", None)
+        if requested != getattr(default, "model_name", None):
+            logger.warning(
+                f"Client {self.id} is a guest session; serving "
+                f"{default or 'the default model'} instead of the requested {requested}."
+            )
+        return default
+
+    def chat_scope(self, temporary: bool) -> str | None:
+        """Identity of the ephemeral window chats opened now belong to, else None.
+
+        `None` is a normal chat, which Google keeps in the account's history and stays reusable
+        across restarts. Any other value names a window only that exact session can continue, so
+        a stored scope that no longer matches this client's proves the window behind it is gone.
+
+        Keyed on the parent's per-session id, rerolled on every successful initialization, plus
+        guest state. That covers both ways a window dies silently: a reinitialization, and a
+        mid-session downgrade to guest, which keeps the session id but loses the account's chats.
+        """
+        if self.is_guest():
+            return f"guest:{self._sessionid}"
+        return f"temporary:{self._sessionid}" if temporary else None
+
     @staticmethod
     async def _process_content_item(
         item: Any,
@@ -196,8 +257,15 @@ class GeminiClientWrapper(GeminiClient):
                 return None, path
             raise ValueError(f"{item.type} cannot be empty")
         elif item.type == "file":
+            if file_url := getattr(item, "url", None):
+                return None, await save_url_to_tempfile(
+                    file_url,
+                    tempdir,
+                    proxy=fetch_proxy,
+                    impersonate=fetch_impersonate,
+                )
             if not (file_data := getattr(item, "file_data", None)):
-                raise ValueError("File must contain 'file_data'")
+                raise ValueError("File must contain 'file_data' or 'url'")
             filename = getattr(item, "filename", "") or ""
             started = time.perf_counter()
             path = await save_file_to_tempfile(file_data, filename, tempdir)

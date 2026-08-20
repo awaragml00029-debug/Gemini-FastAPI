@@ -92,8 +92,14 @@ require_symbol '_process_conversation_with_timeout' app/server/chat.py \
     "input preprocessing can hang forever"
 require_symbol '_stream_with_idle_timeout' app/server/chat.py \
     "a stalled stream never fails, holding the connection open"
-require_symbol '_send_stream_with_split' app/server/chat.py \
-    "oversized payloads are no longer split before sending"
+# Upstream folded the streaming split into _send_with_split(stream=...), so the
+# fork-only part is no longer the split itself but the scope that has to outlive it.
+require_symbol '_hold_request_scope' app/server/chat.py \
+    "the request scope ends at the send, so auto-close can kill a client mid-stream"
+require_symbol 'request_scope' app/server/chat.py \
+    "sends run outside a request scope, so active_requests never leaves zero"
+require_symbol 'mark_unavailable' app/server/chat.py \
+    "a client that failed a request is never taken out of rotation"
 require_symbol 'INPUT_PREPROCESS_TIMEOUT_SECONDS' app/server/chat.py \
     "the preprocessing timeout bound is gone"
 require_symbol 'STREAM_CHUNK_HEARTBEAT_SECONDS' app/server/chat.py \
