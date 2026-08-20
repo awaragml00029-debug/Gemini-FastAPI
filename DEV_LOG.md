@@ -1,5 +1,54 @@
 # 开发日志
 
+## 2026-08-20（晚）线上问题排查
+
+上线 `20260820-120423` 后报了两个现象，逐个查证。
+
+### 1. flash 模型思维链不显示 —— 不是 bug
+
+实测（线上容器，同一句提问）：
+
+| 提问 | gemini-pro | gemini-flash |
+|---|---|---|
+| 「9.11 和 9.9 哪个大」 | reasoning **0 字** | reasoning **0 字** |
+| 过河问题（狼/羊/白菜） | reasoning 746 字 | reasoning **940 字** |
+
+简单题目下**两个模型都不输出思维链**，难题下**两个都输出**，flash 甚至更多。配置侧 `extended_thinking=true` 生效，库里该参数统一置 `inner_req_list[80]=2`，不按模型区分。结论：Google 按题目难度决定是否思考，不是 flash 被关掉。
+
+附带发现：上游改用动态模型注册表后，线上模型列表从 9 个（含 `-plus` / `-advanced` 思维等级变体）变成 3 个 —— `gemini-pro` / `gemini-flash` / `gemini-flash-lite`。`model_strategy` 配置项也被上游删除。
+
+### 2. 生图时出现 `_451` / `_499` —— 真 bug，已修（`9acf234`）
+
+**成因**：生图时 Google 正文里带一个 artifact URL，形如
+`http://googleusercontent.com/image_generation_content/451`。
+库在 `_parse_candidate` 里用 `ARTIFACTS_RE` 剥离它，但那个正则**要求匹配完整 URL**（末尾必须有 `\d+`），流式下 URL 还没传完就剥不掉，碎片被当正文逐块发出。
+
+用库自己的差分函数复现，输出依次是：
+```
+delta='http:'
+delta='//googleusercontent.com/imag'
+delta='e_generation_co'
+delta='ntent'
+```
+等最后一块凑齐能剥离时，碎片早已发给客户端 —— 这就是图片前面那个 `_451` / `_499`。
+
+**修法**：`StreamingOutputFilter` 增加 artifact 扣留 —— 从可能的 URL 起点开始一律扣住，直到它凑成完整 URL（丢弃）或流结束（`flush` 释放，所以正文里以半截 URL 结尾的响应不会被吃掉）。
+
+**一个易踩的细节**：结尾处的匹配不能剥。`ARTIFACTS_RE` 接受单个数字，`.../4` 就已经匹配，而 `51` 还在路上；此时剥离会让这两个字符漏成正文 —— 这正是第一版修法失败的原因。所以边缘匹配一律留到下一块或 flush 再定。
+
+**测试**：`tests/test_artifact_filter.py` 覆盖 1~100 各种分块粒度、一条响应里多个 artifact、普通文本保真（含不带数字尾巴的 googleusercontent 链接必须存活）、以及流在 URL 中途结束。
+
+### 产出
+
+镜像 `ghcr.io/awaragml00029-debug/clean:20260820-122943`
+digest `sha256:9b74e068d7b4e8fa7204278fb6ef41ac3392bfe862281d16e9f8bc59c8255c2e`，已推 ghcr，镜像内 22/22 文件与 `main`（`9acf234`）一致。**未上线。**
+
+验证：**207/207 测试通过**（188 上游 + 19 新增）、ruff/ty/pyright 全清、守卫 **27/27**。
+
+回滚：`20260820-120423`（当前线上）、`20260820-113832`、`20260805-091753`。
+
+---
+
 ## 2026-08-20（下午）第二步：整体迁移到上游基线
 
 分支 `migrate/upstream-20260819`，**已 fast-forward 合入 `main`（`de6f23d`）**。合并上游 `7d1744e`，50 个文件、**+11530 / −1918**。
