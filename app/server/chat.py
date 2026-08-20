@@ -16,7 +16,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from gemini_webapi import ModelOutput
 from gemini_webapi.client import ChatSession
-from gemini_webapi.constants import ARTIFACTS_RE
 from gemini_webapi.exceptions import ModelInvalidError
 from gemini_webapi.types.image import GeneratedImage, Image
 from gemini_webapi.types.video import GeneratedMedia, GeneratedVideo
@@ -70,6 +69,7 @@ from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversation
 from app.utils import g_config
 from app.utils.config import ChatMode
 from app.utils.helper import (
+    ARTIFACT_URL_RE,
     SCHEMA_ADHERENCE_PROMPT,
     STREAM_FLUSH_TAIL_RE,
     STREAM_MASTER_RE,
@@ -1437,7 +1437,7 @@ _ARTIFACT_HOSTS = ("http://googleusercontent.com/", "https://googleusercontent.c
 def _artifact_holdback_len(text: str) -> int:
     """Length of the trailing run that could still become a googleusercontent artifact URL.
 
-    ARTIFACTS_RE only matches once the trailing digits arrive, so mid-stream the URL is
+    ARTIFACT_URL_RE only matches once the trailing digits arrive, so mid-stream the URL is
     not yet strippable and escapes character by character -- which is what leaves stray
     fragments like `_451` sitting in front of a generated image. Anything from a
     possible URL start onwards is withheld until it either completes (and is dropped)
@@ -1465,12 +1465,12 @@ class StreamingOutputFilter:
     def _filter_artifacts(self, text: str) -> str:
         """Drop complete artifact URLs and withhold anything that might still become one."""
         buf = self.artifact_hold + text
-        # A match that ends at the buffer edge is not necessarily complete: ARTIFACTS_RE
+        # A match that ends at the buffer edge is not necessarily complete: ARTIFACT_URL_RE
         # accepts a single digit, so ".../4" matches while "51" is still in flight.
         # Leave that one held and let the next chunk, or flush, decide.
         kept: list[str] = []
         pos = 0
-        for m in ARTIFACTS_RE.finditer(buf):
+        for m in ARTIFACT_URL_RE.finditer(buf):
             if m.end() == len(buf):
                 break
             kept.append(buf[pos : m.start()])
@@ -1571,7 +1571,7 @@ class StreamingOutputFilter:
         self.buffer = ""
         self.stack = ["NORMAL"]
         self.current_role = ""
-        res = ARTIFACTS_RE.sub("", self.artifact_hold + res)
+        res = ARTIFACT_URL_RE.sub("", self.artifact_hold + res)
         self.artifact_hold = ""
         return strip_system_hints(res)
 

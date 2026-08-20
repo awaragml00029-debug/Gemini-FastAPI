@@ -45,6 +45,12 @@ MAX_REMOTE_FETCH_BYTES = 20 * 1024 * 1024
 
 type JsonValue = bool | int | float | str | list[JsonValue] | dict[str, JsonValue] | None
 
+# Google emits an artifact URL alongside a generated image. The library's own
+# ARTIFACTS_RE ends in `\d+`, but the final path segment is now `0_452` -- digits,
+# underscore, digits -- so it consumes only the leading `0` and leaves `_452` sitting
+# in the reply just above the image. Match the whole segment instead.
+ARTIFACT_URL_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+[\w-]+\n*")
+
 MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_REDIRECTS = 5
 REMOTE_URL_SCHEMES = {"http", "https"}
@@ -1116,6 +1122,7 @@ def process_llm_output(
     if thoughts:
         thoughts = thoughts.strip()
 
+    raw_text = ARTIFACT_URL_RE.sub("", raw_text)
     visible_output, tool_calls = extract_tool_calls(raw_text)
     if tool_calls:
         logger.debug(f"Detected {len(tool_calls)} tool call(s) in model output.")

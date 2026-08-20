@@ -9,7 +9,10 @@ import pytest
 
 from app.server.chat import StreamingOutputFilter
 
-ARTIFACT = "http://googleusercontent.com/image_generation_content/451"
+# Observed live on 2026-08-20. The final segment is `0_452`, not bare digits -- the
+# library's own ARTIFACTS_RE ends in `\d+` and so leaves `_452` behind.
+ARTIFACT = "http://googleusercontent.com/image_generation_content/0_452"
+LEGACY_ARTIFACT = "http://googleusercontent.com/image_generation_content/451"
 
 
 def _stream(text: str, size: int) -> str:
@@ -28,7 +31,7 @@ def test_artifact_url_never_leaks(size: int) -> None:
 
 @pytest.mark.parametrize("size", [1, 4, 11, 64])
 def test_multiple_artifacts_are_all_dropped(size: int) -> None:
-    text = f"a\n{ARTIFACT}\nb\nhttp://googleusercontent.com/other_content/499\nc"
+    text = f"a\n{ARTIFACT}\nb\n{LEGACY_ARTIFACT}\nc"
     assert _stream(text, size) == "a\nb\nc"
 
 
@@ -44,3 +47,22 @@ def test_trailing_partial_url_is_released_on_flush(size: int) -> None:
     """A stream that ends mid-URL must still hand the text over rather than eat it."""
     text = "看 http://googleusercontent.com/image_gen"
     assert _stream(text, size) == text
+
+
+@pytest.mark.parametrize("size", [1, 5, 17, 200])
+def test_underscored_segment_leaves_nothing(size: int) -> None:
+    """The `_452` tail is the actual production symptom; nothing may survive."""
+    out = _stream(f"自画像。\n\n{ARTIFACT}\n\n", size)
+    assert "_452" not in out
+    assert "googleusercontent" not in out
+    assert out.strip() == "自画像。"
+
+
+def test_non_streaming_path_strips_artifact() -> None:
+    """process_llm_output feeds the non-streaming reply, which showed the same tail."""
+    from app.utils.helper import process_llm_output
+
+    _, visible, storage, _ = process_llm_output(None, f"一只猫。\n\n{ARTIFACT}\n\n", None)
+    assert "_452" not in visible
+    assert "_452" not in storage
+    assert visible.strip() == "一只猫。"
