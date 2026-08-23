@@ -134,6 +134,23 @@ require_symbol 'allow_redirects=False' app/utils/helper.py \
     "curl follows redirects itself, so a public URL can bounce into the private network unchecked"
 require_symbol 'content_callback' app/utils/helper.py \
     "the size cap is only checked after the whole body is already buffered"
+
+# Attachment decoding, lost the same way on 2026-08-20 (f0f4720, "Adopt upstream's
+# remote-fetch fixes") and shipped broken until 2026-08-23. Upstream decodes
+# `file_data` with a bare base64.b64decode, which does not strip the `data:<mime>;base64,`
+# prefix that OpenAI-format clients actually send -- it silently keeps whichever prefix
+# characters sit in the Base64 alphabet and yields a corrupt file instead of raising.
+# The tell that it had regressed: decode_base64_data existed with zero call sites.
+require_symbol 'decode_base64_data(file_in_base64)' app/utils/helper.py \
+    "data-URL file_data decodes to garbage, so every PDF/PNG/CSV/docx attachment reaches Gemini corrupt"
+require_symbol '_suffix_for_upload' app/utils/helper.py \
+    "an attachment with no filename is saved as .bin, which Gemini refuses to read even when the bytes are intact"
+require_symbol 'to_thread(decode_base64_data' app/utils/helper.py \
+    "image data URLs go back to a strict decode, 503-ing on newline-wrapped or URL-safe Base64"
+require_symbol '_sniff_suffix' app/utils/helper.py \
+    "an attachment with no filename and no MIME ships suffix-less, which Google does not reliably classify"
+require_symbol 'raw_audio.get("format")' app/services/client.py \
+    "every audio clip is named audio.wav again, so Google stops classifying mp3/flac uploads as audio"
 require_symbol 'curl_cffi_fetch_options' app/services/client.py \
     "media fetches stop using the account's own proxy and TLS fingerprint"
 require_symbol 'fetch_impersonate' app/server/chat.py \

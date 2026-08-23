@@ -167,9 +167,7 @@ class GeminiClientWrapper(GeminiClient):
         """
         is_active = self._running or (self.auto_close and self._initialized)
         return (
-            is_active
-            and not self._needs_restart
-            and self.account_status == AccountStatus.AVAILABLE
+            is_active and not self._needs_restart and self.account_status == AccountStatus.AVAILABLE
         )
 
     def is_guest(self) -> bool:
@@ -280,7 +278,16 @@ class GeminiClientWrapper(GeminiClient):
         elif item.type == "input_audio":
             if file_data := getattr(item, "file_data", None):
                 started = time.perf_counter()
-                path = await save_file_to_tempfile(file_data, "audio.wav", tempdir)
+                # OpenAI sends the container in `input_audio.format` ("mp3", "wav", ...) and
+                # it is kept on `raw_data`. Naming every clip `audio.wav` hands Google an mp3
+                # wearing a `.wav` suffix, and per the note in `app/main.py` a clip Google
+                # fails to classify as audio never reaches the model as an audible attachment.
+                # `.wav` remains the fallback only when the client declared nothing.
+                raw_audio = getattr(item, "raw_data", None) or {}
+                declared = str(raw_audio.get("format") or "").strip().lstrip(".").lower()
+                # Client-controlled, and it lands in a NamedTemporaryFile suffix.
+                audio_name = f"audio.{declared}" if declared.isalnum() else "audio.wav"
+                path = await save_file_to_tempfile(file_data, audio_name, tempdir)
                 logger.info(
                     "Processed input_audio content item: path={}, bytes={}, elapsed={:.3f}s",
                     path,

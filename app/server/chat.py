@@ -1112,12 +1112,20 @@ async def _process_conversation_for_client(
     two different addresses with two different TLS fingerprints.
     """
     options = client.curl_cffi_fetch_options if client else {"proxy": None, "impersonate": None}
-    return await _process_conversation_with_timeout(
-        messages,
-        tmp_dir,
-        fetch_proxy=options["proxy"],
-        fetch_impersonate=options["impersonate"],
-    )
+    try:
+        return await _process_conversation_with_timeout(
+            messages,
+            tmp_dir,
+            fetch_proxy=options["proxy"],
+            fetch_impersonate=options["impersonate"],
+        )
+    except ValueError as exc:
+        # Malformed caller input: an attachment that will not decode, a content item with no
+        # payload. The callers below answer 503, which is wrong twice over - nothing is
+        # unavailable, and OpenAI SDKs treat 503 as retryable, so a permanently-bad request is
+        # resent against the account's quota instead of failing once.
+        logger.warning(f"Rejecting malformed conversation input: {exc}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 def _effective_max_chars_per_request(temporary: bool) -> int:
@@ -2875,6 +2883,10 @@ async def create_chat_completion(
             client = await pool.acquire(require_account=needs_upload)
             session = client.start_chat(model=client.usable_model(resolved_model), gem=gem_id)
             m_input, files = await _process_conversation_for_client(client, msgs, tmp_dir)
+        except HTTPException:
+            # Already carries a deliberate status (a 400 for malformed input); do not
+            # relabel it as "service unavailable".
+            raise
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(
@@ -3181,6 +3193,10 @@ async def create_response(
             client = await pool.acquire(require_account=needs_upload)
             session = client.start_chat(model=client.usable_model(resolved_model), gem=gem_id)
             m_input, files = await _process_conversation_for_client(client, messages, tmp_dir)
+        except HTTPException:
+            # Already carries a deliberate status (a 400 for malformed input); do not
+            # relabel it as "service unavailable".
+            raise
         except Exception as e:
             logger.error(f"Error in preparing conversation: {e}")
             raise HTTPException(

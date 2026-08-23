@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import binascii
 import hashlib
 import html
 import ipaddress
@@ -512,15 +511,112 @@ def guess_extension_for_mime(mime_type: str | None) -> str:
     return f".{subtype}" if subtype else ".bin"
 
 
+def _mime_from_data_url(value: str | bytes) -> str:
+    """MIME type declared by a data URL, or "" for anything else."""
+    head = value[:200].decode("ascii", "replace") if isinstance(value, bytes) else value[:200]
+    if not head.startswith("data:"):
+        return ""
+    return head[5:].partition(",")[0].split(";")[0].strip()
+
+
+# Leading signatures of the formats that actually arrive as chat attachments. Checked in
+# order, so the longer/more specific patterns come first.
+_MAGIC_SUFFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"%PDF", ".pdf"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+    (b"II*\x00", ".tiff"),
+    (b"MM\x00*", ".tiff"),
+    (b"OggS", ".ogg"),
+    (b"fLaC", ".flac"),
+    (b"ID3", ".mp3"),
+    (b"\x1f\x8b", ".gz"),
+)
+
+# Inside a Zip container the first entry names tell an Office document apart from a plain
+# archive, and Google treats those very differently.
+_ZIP_MEMBER_SUFFIXES: tuple[tuple[bytes, str], ...] = (
+    (b"word/", ".docx"),
+    (b"xl/", ".xlsx"),
+    (b"ppt/", ".pptx"),
+)
+
+
+def _sniff_suffix(data: bytes) -> str:
+    """Extension implied by the bytes themselves, or "" when nothing matches.
+
+    Last resort for a payload that arrived with no filename and no MIME type. Google needs
+    *some* usable extension: a suffix-less upload is not reliably classified, and the same
+    bytes that read fine as `.pdf` come back as "I cannot read this file" with no suffix.
+    """
+    for signature, suffix in _MAGIC_SUFFIXES:
+        if data.startswith(signature):
+            return suffix
+
+    if data.startswith(b"PK\x03\x04"):
+        head = data[:4096]
+        for member, suffix in _ZIP_MEMBER_SUFFIXES:
+            if member in head:
+                return suffix
+        return ".zip"
+
+    if data[:4] == b"RIFF" and len(data) >= 12:
+        return {b"WAVE": ".wav", b"WEBP": ".webp", b"AVI ": ".avi"}.get(data[8:12], "")
+
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return ".m4a" if data[8:12].startswith(b"M4A") else ".mp4"
+
+    # An MPEG audio frame sync, for an mp3 that carries no ID3 tag.
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return ".mp3"
+
+    # Anything that is legible UTF-8 is worth sending as text rather than as an unlabelled
+    # blob; control bytes other than the usual whitespace mean it is not.
+    try:
+        text = data[:4096].decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    if text and not any(ord(c) < 32 and c not in "\t\r\n\f\v" for c in text):
+        return ".txt"
+    return ""
+
+
+def _suffix_for_upload(file_in_base64: str | bytes, file_name: str, data: bytes) -> str:
+    """Pick the temp-file extension to hand Gemini's uploader.
+
+    Gemini will not read an upload whose temp file ends in `.bin` even when the bytes are
+    intact, so `.bin` is never used as a fallback. A caller-supplied filename wins; failing
+    that the data URL's own MIME type is asked, which is the only extension hint an
+    OpenAI-style `file_data` payload carries; failing that the bytes are sniffed. Leaving the
+    file suffix-less is the last resort and not a reliable one - measured against the live
+    API, the same PDF came back readable as `.pdf` and unreadable with no suffix at all.
+    """
+    if file_name and (suffix := Path(file_name).suffix):
+        return suffix
+    mime = _mime_from_data_url(file_in_base64)
+    if mime and (suffix := guess_extension_for_mime(mime)) != ".bin":
+        return suffix
+    return _sniff_suffix(data)
+
+
 async def save_file_to_tempfile(
     file_in_base64: str | bytes, file_name: str = "", tempdir: Path | None = None
 ) -> Path:
-    """Decode base64 file data and save to a temporary file."""
+    """Decode base64 file data and save to a temporary file.
+
+    The payload goes through `decode_base64_data`, not a bare `base64.b64decode`: clients send
+    `file_data` in OpenAI's official form, a `data:<mime>;base64,` URL, and a bare decode keeps
+    only the prefix characters that happen to be in the Base64 alphabet instead of stripping
+    them - silently yielding a corrupt file rather than raising.
+    """
     started = time.perf_counter()
     input_size = len(file_in_base64)
-    decoded = base64.b64decode(file_in_base64)
+    decoded = decode_base64_data(file_in_base64)
     with tempfile.NamedTemporaryFile(
-        delete=False, suffix=Path(file_name).suffix if file_name else ".bin", dir=tempdir
+        delete=False, suffix=_suffix_for_upload(file_in_base64, file_name, decoded), dir=tempdir
     ) as tmp:
         tmp.write(decoded)
         path = Path(tmp.name)
@@ -602,7 +698,10 @@ async def _decode_data_url(url: str) -> tuple[bytes, str]:
     except ValueError as exc:
         raise ValueError("Invalid data URL") from exc
 
-    if len(payload) > ((MAX_REMOTE_MEDIA_BYTES + 2) // 3) * 4 + 8192:
+    # Coarse bound on the raw payload so a hostile one is not decoded just to be measured;
+    # the exact cap is enforced on the decoded bytes below. The doubling is slack for the
+    # line separators a client may have wrapped the Base64 with.
+    if len(payload) > (((MAX_REMOTE_MEDIA_BYTES + 2) // 3) * 4 + 8192) * 2:
         raise ValueError("Remote media is too large")
 
     metadata = metadata_part[5:]
@@ -611,9 +710,13 @@ async def _decode_data_url(url: str) -> tuple[bytes, str]:
     if "base64" not in {part.lower() for part in parts[1:]}:
         raise ValueError("Invalid data URL")
 
+    # `decode_base64_data`, not a bare `b64decode(validate=True)`: the strict form rejects
+    # the newline-wrapped Base64 that 76-column encoders emit and the URL-safe alphabet that
+    # `urlsafe_b64encode` clients send, so a perfectly good image came back as a 503. The
+    # file-attachment path has always accepted both; this one has no reason to be stricter.
     try:
-        data = await asyncio.to_thread(base64.b64decode, payload, validate=True)
-    except binascii.Error as exc:
+        data = await asyncio.to_thread(decode_base64_data, payload)
+    except ValueError as exc:
         raise ValueError("Invalid data URL") from exc
     if len(data) > MAX_REMOTE_MEDIA_BYTES:
         raise ValueError("Remote media is too large")
