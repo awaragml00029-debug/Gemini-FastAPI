@@ -38,6 +38,10 @@ async def health_check(response: Response):
         clients_unavailable = guest_mode == GuestMode.ADAPTIVE and all_clients_unhealthy
         client_error = "No usable Gemini client is available"
 
+    # Reported separately from `clients`: a retired client reads as false there like any
+    # other unhealthy one, but it is the only state that will not resolve on its own.
+    retired = pool.retired_clients or None
+
     if clients_unavailable:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return HealthCheckResponse(
@@ -45,6 +49,7 @@ async def health_check(response: Response):
             error=client_error,
             storage=stat,
             clients=client_status,
+            retired=retired,
         )
 
-    return HealthCheckResponse(ok=True, storage=stat, clients=client_status)
+    return HealthCheckResponse(ok=True, storage=stat, clients=client_status, retired=retired)

@@ -161,6 +161,34 @@ class GeminiConfig(BaseModel):
         le=120,
         description="Timeout in seconds for server-side URL image fetches",
     )
+    startup_init_attempts: int = Field(
+        # The library's own three auth attempts all land inside ~7s, so a proxy or
+        # network that is not up yet when the container starts fails all of them.
+        # Spacing these retries out tells that apart from credentials that are
+        # simply wrong, which no retry can fix.
+        default=3,
+        ge=1,
+        le=10,
+        description="Attempts to bring a Gemini client up at startup before retiring it",
+    )
+    restart_max_failures: int = Field(
+        # A client is taken out of rotation on any request error, so a single blip
+        # must be recoverable. Credentials that are actually dead fail every time,
+        # and only a config change plus a container restart can fix those.
+        default=3,
+        ge=1,
+        le=100,
+        description=(
+            "Consecutive background restart failures before a Gemini client is retired "
+            "for the lifetime of the process"
+        ),
+    )
+    restart_check_interval: int = Field(
+        default=60,
+        ge=5,
+        le=3600,
+        description="How often the background task looks for Gemini clients to revive",
+    )
 
 
 class CORSConfig(BaseModel):

@@ -20,6 +20,7 @@ from .server.middleware import (
     cleanup_expired_media,
 )
 from .services import GeminiClientPool, LMDBConversationStore
+from .utils import g_config
 
 # Canonical audio MIME types: Python's platform mapping yields legacy "x-"
 # types (audio/x-wav, audio/x-aac, audio/x-flac) that Google's upload
@@ -68,6 +69,35 @@ async def _run_retention_cleanup(stop_event: asyncio.Event) -> None:
     logger.info("LMDB retention cleanup task stopped.")
 
 
+async def _run_client_recovery(pool: GeminiClientPool, stop_event: asyncio.Event) -> None:
+    """
+    Periodically revive Gemini clients that dropped out of rotation, until the stop_event is set.
+
+    A request is taken off its client on any error and acquire() only ever checks readiness, so
+    without this nothing would put a client back. Keeping the revival here means the auth retries
+    it can cost never land inside a request.
+
+    The pool raises a signal the moment it takes a client out of rotation, so a revival normally
+    starts within milliseconds; the interval is the backstop for a client that went unhealthy
+    without anyone saying so, such as the library's watchdog changing its account status.
+    """
+    interval = g_config.gemini.restart_check_interval
+    logger.info(f"Starting Gemini client recovery task (backstop interval={interval} seconds).")
+
+    while not stop_event.is_set():
+        await pool.wait_for_recovery_signal(timeout=interval)
+
+        if stop_event.is_set():
+            break
+
+        try:
+            await pool.recover_unavailable_clients()
+        except Exception:
+            logger.exception("Gemini client recovery task failed.")
+
+    logger.info("Gemini client recovery task stopped.")
+
+
 async def _run_pool_init_in_background(pool: GeminiClientPool) -> None:
     try:
         await pool.init()
@@ -76,7 +106,9 @@ async def _run_pool_init_in_background(pool: GeminiClientPool) -> None:
         if healthy_clients:
             logger.info(f"Gemini clients initialized in background: {healthy_clients}.")
         else:
-            logger.warning("Gemini client background initialization finished with no running clients.")
+            logger.warning(
+                "Gemini client background initialization finished with no running clients."
+            )
     except asyncio.CancelledError:
         logger.debug("Gemini client background initialization task cancelled.")
         raise
@@ -87,6 +119,7 @@ async def _run_pool_init_in_background(pool: GeminiClientPool) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cleanup_stop_event = asyncio.Event()
+    recovery_stop_event = asyncio.Event()
 
     pool = GeminiClientPool()
     # Client init deliberately stays off the startup path -- see
@@ -98,6 +131,7 @@ async def lifespan(app: FastAPI):
         logger.exception("Failed to prune stale LMDB indexes; continuing with startup.")
 
     cleanup_task = asyncio.create_task(_run_retention_cleanup(cleanup_stop_event))
+    recovery_task = asyncio.create_task(_run_client_recovery(pool, recovery_stop_event))
     pool_init_task = asyncio.create_task(_run_pool_init_in_background(pool))
 
     # Give the tasks a chance to start and surface immediate failures.
@@ -110,6 +144,13 @@ async def lifespan(app: FastAPI):
             logger.exception("LMDB retention cleanup task failed to start.")
             raise
 
+    if recovery_task.done():
+        try:
+            recovery_task.result()
+        except Exception:
+            logger.exception("Gemini client recovery task failed to start.")
+            raise
+
     if pool_init_task.done():
         try:
             pool_init_task.result()
@@ -118,12 +159,15 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Gemini client background initialization task failed to start.")
 
-    logger.info("Gemini API Server ready to serve requests; Gemini clients initialize in background.")
+    logger.info(
+        "Gemini API Server ready to serve requests; Gemini clients initialize in background."
+    )
 
     try:
         yield
     finally:
         cleanup_stop_event.set()
+        recovery_stop_event.set()
 
         if not pool_init_task.done():
             pool_init_task.cancel()
@@ -134,6 +178,19 @@ async def lifespan(app: FastAPI):
             pass
         except Exception:
             logger.exception("Gemini client background initialization task ended with an error.")
+
+        # Settled before pool.close(): a revival in flight is a client.init() that would
+        # otherwise race the close. Signalling alone is not enough, since that init can sit
+        # there for gemini.timeout seconds.
+        if not recovery_task.done():
+            recovery_task.cancel()
+
+        try:
+            await recovery_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Gemini client recovery task ended with an error.")
 
         try:
             await pool.close()

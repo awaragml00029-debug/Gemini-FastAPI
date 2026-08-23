@@ -2910,8 +2910,8 @@ async def create_chat_completion(
         )
     except Exception as e:
         if client:
-            # Take it out of rotation; the pool revives it on the next acquire.
-            client.mark_unavailable()
+            # Take it out of rotation; the background recovery task revives it.
+            pool.mark_unavailable(client)
         logger.error(f"Gemini API error: {e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
@@ -3216,8 +3216,8 @@ async def create_response(
         )
     except Exception as e:
         if client:
-            # Take it out of rotation; the pool revives it on the next acquire.
-            client.mark_unavailable()
+            # Take it out of rotation; the background recovery task revives it.
+            pool.mark_unavailable(client)
         logger.error(f"Gemini API error: {e}")
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -513,6 +513,10 @@ class HealthCheckResponse(BaseModel):
     ok: bool
     storage: Mapping[str, Any] | None = Field(default=None)
     clients: Mapping[str, bool] | None = Field(default=None)
+    # Clients that will stay down until the container restarts. They read as false in
+    # `clients` like any other unhealthy client, but only these need a human: their
+    # credentials have to be fixed in the config before a restart can bring them back.
+    retired: Sequence[str] | None = Field(default=None)
     error: str | None = Field(default=None)
 
 
