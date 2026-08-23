@@ -1,5 +1,58 @@
 # 开发日志
 
+## 2026-08-24 死账号重启循环与「假装回退 guest」
+
+本人提问：「上一次提交我们完成了出问题的账号直接跳过，为什么我看 docker 日志还是会请求失败的账号？」
+
+### 一、先回答：跳过是生效的
+
+统计容器全生命周期的 `Client ID:` 日志（每条请求实际落在哪个 client）：
+
+| client | 请求数 |
+|---|---|
+| `251d970ca40ebe06e6c2dsfasddddd` | 7 |
+| `beeusman4105a99a6717f839b110931` | 5 |
+| `osdfasdfrange-ubd97083`（死账号） | **0** |
+
+日志里那些行全部来自 `pool.py` 的后台恢复任务，不在请求路径上——正是 `bf48a13` 的设计。
+
+**真正误导人的是日志措辞**：旧代码每次都打 `Restarted Gemini client ... after it became unavailable`，读起来像重启成功了，实际下一秒它又不可用。看着就像"还在往坏账号上打请求"。
+
+### 二、底下确实有个 bug：`restart_max_failures` 对这种失败模式够不着
+
+`_restart_client` 调的 `client.init()` **对这个死账号不抛异常**——库返回 `SUCCESS ... initialized successfully`，随后会话仍是 `UNAUTHENTICATED`。而失败计数只在 `except Exception` 里累加，于是走成功分支把计数清零；下一轮 `is_healthy()` 要求 `AccountStatus.AVAILABLE` 又不满足 → 再重启。**无限循环，`restart_max_failures: 3` 永远到不了。**
+
+这也解释了 `/health` 的 `retired` 为什么会变：早些时候是 `["osdfasdfrange-ubd97083"]`（那次 init 真抛了 AuthError 三次），后来变成 `None`（这次 init "成功"了）。同一个容器 15:40:25 抛 AuthError、15:41:25 就"成功"——**这个账号的 init 是时好时坏的**，所以两种路径都会走到。
+
+**选择退避而不是退休**：退休是整个进程生命周期不可逆，而 `auto_refresh` 仍可能轮换 cookie 把账号救回来。重启后仍不可用则把下次尝试推后，60s → 5min → 30min 封顶；一旦真恢复立刻清空退避重新入列。真异常仍照旧计数并在 3 次后退休，`ClientBusyError` 仍不计数。
+
+模拟一小时（60s 轮询）对照：
+
+| | 旧 | 新 |
+|---|---|---|
+| 无谓认证往返 | **60 次/小时** | **4 次/小时** |
+| 是否退休 | 否 | 否（保留自愈） |
+
+日志也改成说实话：`restarted but is still unusable (round N); next attempt in 1800s`。
+
+### 三、附带查实：guest 回退是死代码
+
+构造「三个 client 全是 guest」跑 `acquire()`：它先打印 *"falling back to a guest session until cookies are refreshed"*，**紧接着抛 `RuntimeError: No Gemini clients are currently available`** —— guest 一次都没被返回过。
+
+原因是两个条件互斥：`_client_ready` → `is_healthy()` 要求 `AccountStatus.AVAILABLE`，而 `is_guest()` 的定义就是 `== UNAUTHENTICATED`。旧代码那个双轮 `for account_only in (True, False)` 因此纯属冗余。`guest_mode` 配置也管不着——它只影响 health 端点的判定。
+
+**本人决策：所有账号都挂时明确失败并提醒用户，不要用 guest 悄悄顶着。** Google 给 guest 没有历史、不能上传、不能选模型，静默降级等于用一个悄悄变差的东西回答请求。
+
+于是拆掉假回退，`_unavailable_reason` 按四种情况分别给话：cookie 全过期（要人改凭据并重启容器）、全部退休、需要上传但无认证账号、普通不可用（重试即可）。前两种要人介入、后两种等一等就好，以前糊成同一句 `No Gemini clients are currently available`。该信息原样进入调用方看到的 503 `detail`，不是只写日志。
+
+顺带：`require_account` 现在只用于选措辞——`_client_ready` 已隐含 `AVAILABLE`，返回的 client 必然非 guest、必然能上传。
+
+### 四、证据等级
+
+退避的 60→4 与 acquire 的新旧报错，均为单元级对照脚本实测。**两条都未在线上容器端到端验证**：触发条件是「所有账号 cookie 同时失效」，不会为了测试去弄坏线上凭据。
+
+`tests/test_pool_recovery.py` 15 个用例；`check_deltas.sh` 增加 `_defer_futile_restart`、`_unavailable_reason` 两条守卫。
+
 ## 2026-08-23 附件上传链路修复（data URL 解码回归 + 四个连带缺陷）
 
 线上反馈「上传附件的功能被破坏了」。查下来是**上游同步冲掉了 fork 自己的解码器**，外加同一条链路上四个独立缺陷。
