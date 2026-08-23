@@ -151,6 +151,10 @@ require_symbol '_sniff_suffix' app/utils/helper.py \
     "an attachment with no filename and no MIME ships suffix-less, which Google does not reliably classify"
 require_symbol 'raw_audio.get("format")' app/services/client.py \
     "every audio clip is named audio.wav again, so Google stops classifying mp3/flac uploads as audio"
+require_symbol '_defer_futile_restart' app/services/pool.py \
+    "a client whose restart succeeds but leaves it unusable is retried every poll forever"
+require_symbol '_unavailable_reason' app/services/pool.py \
+    "expired cookies and a transient outage collapse into one vague message the caller cannot act on"
 require_symbol 'curl_cffi_fetch_options' app/services/client.py \
     "media fetches stop using the account's own proxy and TLS fingerprint"
 require_symbol 'fetch_impersonate' app/server/chat.py \

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import random
+import time
 from collections import deque
 
 from loguru import logger
@@ -12,6 +13,17 @@ from .client import GeminiClientWrapper
 
 # First gap between startup init attempts; tripled on each further attempt (5s, 15s, 45s).
 STARTUP_RETRY_BASE_SECONDS = 5.0
+
+# How long to leave a client alone after a restart that returned cleanly but left it still
+# unusable. That is not the same as a restart that raised: nothing went wrong mechanically,
+# the account simply is not coming back by being re-initialized - typically an expired cookie,
+# where the library reports a successful init and then reports the session UNAUTHENTICATED.
+# Retrying that once a minute forever is pure waste (~54 pointless auth round-trips an hour
+# against Google, on an account already prone to 429s), so each futile round pushes the next
+# attempt further out. It is deliberately a backoff and not a retirement: `auto_refresh` can
+# still rotate the cookies and bring the account back on its own, and a retired client never
+# returns for the life of the process.
+FUTILE_RESTART_BACKOFF_SECONDS = (60.0, 300.0, 1800.0)
 
 
 class ClientBusyError(RuntimeError):
@@ -34,6 +46,10 @@ class GeminiClientPool(metaclass=Singleton):
         self._retired: set[str] = set()
         # client id -> consecutive failed background restarts, reset on success.
         self._restart_failures: dict[str, int] = {}
+        # client id -> consecutive restarts that returned but left the client unusable.
+        self._futile_restarts: dict[str, int] = {}
+        # client id -> monotonic time before which the recovery task leaves it alone.
+        self._restart_not_before: dict[str, float] = {}
         # Raised when a client is known to need reviving, so the recovery task can act
         # at once instead of waiting out its poll interval.
         self._recovery_wanted = asyncio.Event()
@@ -92,8 +108,11 @@ class GeminiClientPool(metaclass=Singleton):
     ) -> GeminiClientWrapper:
         """Return a healthy client by id or using round-robin.
 
-        `require_account` excludes guest sessions, for requests they cannot serve at all - file
-        uploads. Otherwise a guest is used only once no authenticated client is left.
+        `require_account` narrows the search to clients that can serve an upload, which a guest
+        session cannot. It does not otherwise widen it: a guest is never handed out. Google
+        gives a guest no history, no uploads and no model choice, so serving one silently would
+        answer a request with something quietly worse than what was asked for. When every
+        account's cookies have expired the caller is told exactly that instead.
         """
         if not self._round_robin:
             raise RuntimeError("No Gemini clients configured")
@@ -106,35 +125,53 @@ class GeminiClientPool(metaclass=Singleton):
                 return client
             raise RuntimeError(f"Gemini client {client_id} is not currently available")
 
-        # Authenticated clients first. A client whose cookies expired keeps answering text
-        # prompts as a guest, so it stays usable and must not take the pool down, but it has no
-        # history, no uploads and no model choice - traffic belongs elsewhere while it can.
-        #
         # Selection is a pure, non-blocking readiness check on purpose. Restarting a dead client
         # here used to run three auth rounds (~7s) inside the request, and a permanently dead
-        # account made every request that round-robined onto it pay that again. A client that
-        # failed to start is retired instead - see _retire().
-        for account_only in (True,) if require_account else (True, False):
-            for _ in range(len(self._round_robin)):
-                client = self._round_robin[0]
-                self._round_robin.rotate(-1)
-                if account_only and client.is_guest():
-                    continue
-                if self._client_ready(client):
-                    return client
+        # account made every request that round-robined onto it pay that again. Reviving is the
+        # background task's job - see recover_unavailable_clients().
+        #
+        # A guest can never satisfy `_client_ready`: readiness requires AccountStatus.AVAILABLE
+        # and a guest is by definition UNAUTHENTICATED. That is the intended behaviour, so the
+        # loop no longer runs a second pass pretending otherwise - the previous one logged that
+        # it was falling back to a guest and then failed anyway, one line later.
+        for _ in range(len(self._round_robin)):
+            client = self._round_robin[0]
+            self._round_robin.rotate(-1)
+            if self._client_ready(client):
+                return client
 
-            if account_only and not require_account and any(c.is_guest() for c in self._clients):
-                logger.warning(
-                    "No authenticated Gemini client is available; falling back to a guest "
-                    "session until cookies are refreshed."
-                )
+        raise RuntimeError(self._unavailable_reason(require_account))
 
-        if require_account:
-            raise RuntimeError(
-                "No authenticated Gemini client is available. This request needs a file upload, "
-                "which a guest session cannot do - refresh the client cookies."
+    def _unavailable_reason(self, require_account: bool) -> str:
+        """Say which way the pool is down, so the caller is not left guessing.
+
+        Expired cookies and a transient outage need opposite responses - one wants a human
+        editing the container's credentials, the other wants a retry - and they are worth
+        telling apart in the message rather than in the logs only.
+        """
+        live = [c for c in self._clients if c.id not in self._retired]
+        if live and all(c.is_guest() for c in live):
+            logger.error(
+                "Every Gemini account is unauthenticated: their cookies have expired. "
+                "Requests fail until SECURE_1PSID / SECURE_1PSIDTS are updated."
             )
-        raise RuntimeError("No Gemini clients are currently available")
+            return (
+                "Every Gemini account is unauthenticated - the cookies have expired. Update "
+                "SECURE_1PSID / SECURE_1PSIDTS for the configured clients and restart the "
+                "container. Serving these requests from a guest session is not possible: "
+                "Google gives a guest no history, no uploads and no model choice."
+            )
+        if self._retired and len(self._retired) == len(self._clients):
+            return (
+                "Every Gemini client has been retired after repeated failures. Fix their "
+                "credentials and restart the container."
+            )
+        if require_account:
+            return (
+                "No authenticated Gemini client is available. This request needs a file "
+                "upload, which a guest session cannot do - refresh the client cookies."
+            )
+        return "No Gemini clients are currently available"
 
     @staticmethod
     def _client_ready(client: GeminiClientWrapper) -> bool:
@@ -193,12 +230,22 @@ class GeminiClientPool(metaclass=Singleton):
         auth retries a revival can cost belong here, off the critical path.
         """
         limit = g_config.gemini.restart_max_failures
+        now = time.monotonic()
         # Cleared up front: anything that goes wrong from here on re-raises the signal,
         # rather than being swallowed by this pass.
         self._recovery_wanted.clear()
 
         for client in self._clients:
-            if client.id in self._retired or self._client_ready(client):
+            if client.id in self._retired:
+                continue
+
+            if self._client_ready(client):
+                # Back in rotation, whether this task did it or the library's own cookie
+                # refresh did - either way its failure history no longer applies.
+                self._clear_restart_state(client.id)
+                continue
+
+            if now < self._restart_not_before.get(client.id, 0.0):
                 continue
 
             lock = self._restart_locks.get(client.id)
@@ -226,8 +273,33 @@ class GeminiClientPool(metaclass=Singleton):
                         self._retire(client.id)
                     continue
 
+                if not self._client_ready(client):
+                    # `init()` returned without raising, so nothing here failed in the sense
+                    # the counter above measures - the account came back still unusable. Left
+                    # on the poll interval this repeats forever, because the failure it is
+                    # waiting for never arrives.
+                    self._defer_futile_restart(client.id)
+                    continue
+
                 logger.info(f"Restarted Gemini client {client.id} after it became unavailable.")
-                self._restart_failures.pop(client.id, None)
+                self._clear_restart_state(client.id)
+
+    def _clear_restart_state(self, client_id: str) -> None:
+        """Forget a client's failure history once it is usable again."""
+        self._restart_failures.pop(client_id, None)
+        self._futile_restarts.pop(client_id, None)
+        self._restart_not_before.pop(client_id, None)
+
+    def _defer_futile_restart(self, client_id: str) -> None:
+        """Push the next restart attempt out after one that changed nothing."""
+        rounds = self._futile_restarts.get(client_id, 0) + 1
+        self._futile_restarts[client_id] = rounds
+        delay = FUTILE_RESTART_BACKOFF_SECONDS[min(rounds, len(FUTILE_RESTART_BACKOFF_SECONDS)) - 1]
+        self._restart_not_before[client_id] = time.monotonic() + delay
+        logger.info(
+            f"Gemini client {client_id} restarted but is still unusable "
+            f"(round {rounds}); next attempt in {delay:.0f}s."
+        )
 
     async def _restart_client(self, client: GeminiClientWrapper) -> None:
         if client.active_requests > 0:
