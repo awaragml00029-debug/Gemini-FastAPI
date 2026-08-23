@@ -1,5 +1,82 @@
 # 开发日志
 
+## 2026-08-23 附件上传链路修复（data URL 解码回归 + 四个连带缺陷）
+
+线上反馈「上传附件的功能被破坏了」。查下来是**上游同步冲掉了 fork 自己的解码器**，外加同一条链路上四个独立缺陷。
+
+### 一、根因：data URL 前缀没剥就丢给 base64 解码
+
+`save_file_to_tempfile` 原本调用仓库自带的 `decode_base64_data`，`f0f4720`（":arrow_up: Adopt upstream's remote-fetch fixes"，08-20）把它换成了上游的裸 `base64.b64decode`，再由合并 `9a4859c` 带上主线。
+
+OpenAI 官方的 `file.file_data` 格式就是 `data:<mime>;base64,...`。裸 `b64decode` **不剥前缀**，只丢掉前缀里不在 Base64 字母表的字符再解剩下的——**不抛异常，直接产出坏文件**。
+
+坏法随 MIME 长度而变（前缀保留字符数 % 4）：
+
+| MIME | 保留字符数 | %4 | 后果 |
+|---|---|---|---|
+| `text/plain` | 20 | 0 | 仅多 15 字节垃圾头，**内容仍可读** |
+| `image/jpeg` | 20 | 0 | 同上 |
+| `application/pdf` | 25 | 1 | **整体错位，彻底损坏** |
+| `image/png` | 19 | 3 | 整体错位 |
+| `text/csv` | 18 | 2 | 整体错位 |
+| `application/json` | 26 | 2 | 整体错位 |
+| docx | 77 | 1 | 整体错位 |
+
+**排查陷阱**：第一轮用 `.txt` 测试，正好撞上 `%4==0` 这个唯一的良性个例，两个用例全绿、差点放过。换 PDF 才复现：同一份文件纯 base64 读出 marker，data URL 返回 `CANNOT_READ`；容器日志 `decoded_bytes=158` 而原文件 143 字节。
+
+**检测信号**：`decode_base64_data` 定义完好却**零调用点**。同步冲掉的是**调用点**（函数体内一行），定义在文件别处不冲突所以活了下来——孤儿 helper 就是这类回归的指纹。`check_deltas.sh` 只断言符号存在，抓得到丢定义、抓不到丢调用。
+
+### 二、连带缺陷（同一条链路，各自独立）
+
+**`.bin` 兜底后缀有害。** 无 filename 时后缀写死 `.bin`。用字节完全正确的纯 base64 路径隔离验证：`.bin` → `CANNOT_READ`，而无扩展名文件名（后缀为空）→ 正常读出。Gemini 对 `.bin` 拒读。
+
+**图片路径比附件路径更严格。** `_decode_data_url` 用 `b64decode(validate=True)`，不剥空白、不认 urlsafe；而 `decode_base64_data` 的注释明写着要容忍这两者。同一张 PNG：普通 base64 返回 `Red`，76 列折行和 urlsafe 全部 **HTTP 503 `Invalid data URL`**。
+
+**`input_audio` 无视客户端声明的容器格式。** `client.py` 对每个音频写死 `audio.wav`，而 OpenAI 的 `format`（mp3/flac/m4a）存在 `raw_data` 里、还写进了 LMDB，上传点从来不读。依据 `app/main.py:25-36` 已有结论（Google 归类不了就"never reaches the model as an audible attachment"），mp3 套 `.wav` 会坏。
+
+**畸形输入报 503。** `except Exception` 把所有失败糊成 503。这条**与本次第一项修复直接冲突**：静默损坏改成抛 `ValueError` 后，坏附件会变成 503，而 OpenAI SDK 重试 503 —— 一个永远不可能成功的请求会反复重发烧配额。等于把静默 bug 换成了重试风暴。
+
+### 三、一个被证伪的假设（我自己下早了）
+
+第二轮曾断言「无后缀会被内容嗅探，所以空后缀可以当兜底」，依据是**一次** `filename=report` 的观察。切镜像复验时同样是空后缀却 `CANNOT_READ` —— **空后缀不可靠，n=1 的结论不成立**。
+
+正确做法：解码后的字节就在手上，直接嗅 magic bytes。后缀优先级定为 **文件名后缀 → data URL 的 MIME → 嗅探内容 → 空**。
+
+### 四、最终实现
+
+| 位置 | 改动 |
+|---|---|
+| `helper.py` | 换回 `decode_base64_data`；新增 `_suffix_for_upload`（三级优先，永不 `.bin`）与 `_sniff_suffix`（PDF/PNG/JPEG/GIF/WAV/WebP/MP3含裸帧同步/FLAC/M4A/MP4/docx/xlsx/pptx/zip/UTF-8 文本）；`_decode_data_url` 改走 `decode_base64_data`，两道尺寸防护保留 |
+| `client.py` | `input_audio` 按声明的 format 命名，`isalnum()` 挡住客户端可控值落进临时文件后缀；仅在什么都没声明时退回 `.wav` |
+| `chat.py` | 共用的 `_process_conversation_for_client` 把 `ValueError` 映射为 400；两个兜底 handler 不再把已定状态码重贴成 503 |
+
+畸形 payload 现在抛 `ValueError` → 400，而不是静默产出垃圾。
+
+### 五、验证（镜像 `20260823-234514`）
+
+端到端 **13/13**：
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| PDF 走 data URL | `CANNOT_READ` | ✅ |
+| 附件无 filename（纯 b64 / data URL / octet-stream） | `CANNOT_READ` | ✅ 嗅探出 `.pdf` |
+| 图片 base64 折行 / urlsafe | **503** | ✅ |
+| 畸形附件 | 503（会被重试） | ✅ **400** |
+| TXT / PNG 无 filename | — | ✅ 嗅探出 `.txt` / `.png` |
+
+日志佐证：`decoded_bytes` 全部等于原文件大小；临时文件后缀分别来自文件名、MIME、嗅探三条路径；两个 400 是 WARNING 不带堆栈；验证期间零 ERROR。
+
+**证据等级**：上表全部为线上容器实测。**唯一未端到端验证的是音频格式修复**——机器上没有 ffmpeg/lame，造不出真 mp3 样本，其依据是 `main.py` 已有结论加本轮实测的「扩展名决定成败」，逻辑成立但未直接证实。
+
+### 六、防回归
+
+- `tests/test_file_upload.py` 55 个用例；每项修复都 stash 掉验证过会变红（分别 9 / 7 / 2 个），能失败的测试才算数。
+- `scripts/check_deltas.sh` 新增 5 条守卫，断言的是**调用点**而非定义：`decode_base64_data(file_in_base64)`、`_suffix_for_upload`、`_sniff_suffix`、`to_thread(decode_base64_data`、`raw_audio.get("format")`。
+
+### 七、遗留（与本次无关）
+
+`tests/test_api_compatibility.py::test_unusable_schemas_leave_the_reply_unverified_rather_than_failing_it[schema0]` 卡死。把本次改动全部 stash 后在原始代码上复跑同样卡死（exit 124），**是既有问题**，未处理。
+
 ## 2026-08-23 响应延迟根因定位与客户端生命周期重构
 
 线上反馈「有时候很慢，官网直连不论带不带思考都很快」。查下来根因和延迟本身无关，是**死账号的重启重试卡在请求路径上**。
