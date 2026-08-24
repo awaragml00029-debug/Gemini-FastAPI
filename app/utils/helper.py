@@ -66,13 +66,35 @@ REMOTE_URL_SCHEMES = {"http", "https"}
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
+# 上游原版。实测在真实路径上只有 10% 的工具调用命中率（40 轮），代理复现 13%（30 轮）。
+# 把 `SYSTEM: ... (MANDATORY)` 抬头、`END ...` 收尾和 4 条大写 MUST 规则去掉之后，
+# 同一套 [ToolCalls] 语法能跑到 95~100%（38/40、30/30）—— 语法不是瓶颈，措辞才是。
+# 保留原文以便随时回退对照。
+# TOOL_WRAP_HINT = (
+#     "\n\nSYSTEM: TOOL CALLING PROTOCOL (MANDATORY)\n"
+#     "Either emit the tool-call block alone, or answer in natural language with no protocol tags. Never both.\n\n"
+#     "1. Names MUST match the schemas exactly; every required parameter MUST be present with its declared JSON type.\n"
+#     "2. Each value MUST stand alone between two fences of 3 backticks; if it contains a backtick run, both fences MUST be longer.\n"
+#     "3. Every opening tag MUST be closed in reverse order of opening. A fence closes only itself, never a tag. An unclosed tag voids the call.\n"
+#     "4. Emit the block and nothing else. No preamble or commentary.\n\n"
+#     "REQUIRED SYNTAX, reproduce literally:\n"
+#     "[ToolCalls]\n"
+#     "[Call:tool_name]\n"
+#     "[CallParameter:parameter_name]\n"
+#     "```\n"
+#     "value\n"
+#     "```\n"
+#     "[/CallParameter]\n"
+#     "[/Call]\n"
+#     "[/ToolCalls]\n\n"
+#     "END TOOL CALLING PROTOCOL"
+# )
+# 首行和末行会被 _hint_anchors() 拿去构造剥离正则，所以两头必须是独特且非标签的文本：
+# 末行若是 `[/ToolCalls]`，HINT_END_RES 会把输出里任何一个闭合标签都删掉。
 TOOL_WRAP_HINT = (
-    "\n\nSYSTEM: TOOL CALLING PROTOCOL (MANDATORY)\n"
-    "Either emit the tool-call block alone, or answer in natural language with no protocol tags. Never both.\n\n"
-    "1. Names MUST match the schemas exactly; every required parameter MUST be present with its declared JSON type.\n"
-    "2. Each value MUST stand alone between two fences of 3 backticks; if it contains a backtick run, both fences MUST be longer.\n"
-    "3. Every opening tag MUST be closed in reverse order of opening. A fence closes only itself, never a tag. An unclosed tag voids the call.\n"
-    "4. Emit the block and nothing else. No preamble or commentary.\n\n"
+    "\n\nTool call syntax reference\n"
+    "Either emit the tool-call block alone, or answer in natural language. Never both.\n"
+    "Emit the block and nothing else. No preamble or commentary.\n\n"
     "REQUIRED SYNTAX, reproduce literally:\n"
     "[ToolCalls]\n"
     "[Call:tool_name]\n"
@@ -83,7 +105,7 @@ TOOL_WRAP_HINT = (
     "[/CallParameter]\n"
     "[/Call]\n"
     "[/ToolCalls]\n\n"
-    "END TOOL CALLING PROTOCOL"
+    "(end of tool call syntax reference)"
 )
 STRUCTURED_JSON_WRAP_HINT = (
     "\n\nSYSTEM: STRUCTURED JSON PROTOCOL (MANDATORY)\n"
