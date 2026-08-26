@@ -5,7 +5,7 @@ description = "FastAPI Server built on Gemini Web API"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-  "curl-cffi>=0.16.0",
+  "curl-cffi>=0.16.2",
   "fastapi>=0.141.1",
   "gemini-webapi>=2.1.0,<3",
   "httptools>=0.8.0",
@@ -72,3 +72,6 @@ typeCheckingMode = "standard"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.uv.sources]
+gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git", rev = "2026-08-26" }

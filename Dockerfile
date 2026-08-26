@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
     <<EOF
 set -eux
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates tini
+apt-get install -y --no-install-recommends ca-certificates git tini
 mkdir -p /app/cache /app/data
 EOF
 
