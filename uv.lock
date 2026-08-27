@@ -227,7 +227,7 @@ dev = [
 requires-dist = [
     { name = "curl-cffi", specifier = ">=0.16.2" },
     { name = "fastapi", specifier = ">=0.141.1" },
-    { name = "gemini-webapi", git = "https://github.com/luuquangvu/Gemini-API.git" },
+    { name = "gemini-webapi", git = "https://github.com/luuquangvu/Gemini-API.git?rev=2026-08-27" },
     { name = "httptools", specifier = ">=0.8.0" },
     { name = "httpx2", marker = "extra == 'dev'" },
     { name = "jsonschema", specifier = ">=4.26.0" },
@@ -250,8 +250,8 @@ dev = [{ name = "gemini-fastapi", extras = ["dev"] }]
 
 [[package]]
 name = "gemini-webapi"
-version = "0.0.post265"
-source = { git = "https://github.com/luuquangvu/Gemini-API.git#bf2075fb4c88005c00516625e2097216f06dbce1" }
+version = "0.0.post266"
+source = { git = "https://github.com/luuquangvu/Gemini-API.git?rev=2026-08-27#9f871e1c8d74df8642dff0300c60dc76bf9bbc79" }
 dependencies = [
     { name = "curl-cffi" },
     { name = "loguru" },
