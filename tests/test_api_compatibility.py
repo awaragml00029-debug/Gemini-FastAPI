@@ -46,9 +46,11 @@ from app.utils.helper import (
     StructuredOutputValidationError,
     canonicalize_structured_output,
     decode_base64_data,
+    extract_tool_calls,
     guess_extension_for_mime,
     normalize_openapi_schema,
     process_llm_output,
+    strip_markdown_fence,
 )
 
 TOOL_CALL_OUTPUT = (
@@ -871,3 +873,50 @@ def test_digest_survives_a_round_trip_without_the_excluded_bytes():
     restored = AppContentItem.model_validate(original.model_dump())
     assert restored.file_data is None
     assert restored.content_digest == original.content_digest
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('```json\n{"city": "Hanoi"}\n```', '{"city": "Hanoi"}'),
+        ("```python\nprint('hello')\n```", "print('hello')"),
+        ("```sql\nSELECT 1;\n```", "SELECT 1;"),
+        ("```bash\necho hi\n```", "echo hi"),
+        ('```json\n{"city": "Hanoi"}```', '{"city": "Hanoi"}'),
+        ('```json {"city": "Hanoi"}```', '{"city": "Hanoi"}'),
+        ("```yaml key: value```", "key: value"),
+        ("```\nHanoi\n```", "Hanoi"),
+        ("````typescript\nconst x = `inner`;\n````", "const x = `inner`;"),
+        ("plain text without fence", "plain text without fence"),
+        ("```", "```"),
+        ("", ""),
+    ],
+)
+def test_strip_markdown_fence_with_arbitrary_language_tags(payload, expected):
+    assert strip_markdown_fence(payload) == expected
+
+
+def test_tool_call_with_language_tagged_parameter_fences():
+    raw_llm_text = (
+        "[ToolCalls]\n"
+        "[Call:execute_code]\n"
+        "[CallParameter:code]\n"
+        "```python\n"
+        "print('hello world')\n"
+        "```\n"
+        "[/CallParameter]\n"
+        "[CallParameter:config]\n"
+        "```json\n"
+        '{"timeout": 30, "debug": true}\n'
+        "```\n"
+        "[/CallParameter]\n"
+        "[/Call]\n"
+        "[/ToolCalls]"
+    )
+    visible, tool_calls = extract_tool_calls(raw_llm_text)
+    assert visible == ""
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "execute_code"
+    args = orjson.loads(tool_calls[0].function.arguments)
+    assert args["code"] == "print('hello world')"
+    assert args["config"] == {"timeout": 30, "debug": True}

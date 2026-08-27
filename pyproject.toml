@@ -74,4 +74,4 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.uv.sources]
-gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git", rev = "2026-08-26" }
+gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git" }
