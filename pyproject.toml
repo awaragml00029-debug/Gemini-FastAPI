@@ -7,7 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
   "curl-cffi>=0.16.2",
   "fastapi>=0.141.1",
-  "gemini-webapi>=2.1.0,<3",
+  "gemini-webapi>=2.1.1,<3",
   "httptools>=0.8.0",
   "jsonschema>=4.26.0",
   "lmdb>=2.3.0",
@@ -68,10 +68,8 @@ indent-style = "space"
 
 [tool.pyright]
 typeCheckingMode = "standard"
+reportUnreachable = "warning"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-
-[tool.uv.sources]
-gemini-webapi = { git = "https://github.com/luuquangvu/Gemini-API.git", rev = "2026-08-27" }
