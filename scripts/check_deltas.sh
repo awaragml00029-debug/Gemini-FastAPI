@@ -163,6 +163,10 @@ require_symbol '_artifact_holdback_len' app/server/chat.py \
     "googleusercontent URLs leak into the stream one fragment at a time"
 require_symbol '_gemini_client.ARTIFACTS_RE' app/utils/helper.py \
     "the library strips artifacts with its own pattern first and leaves an orphaned _452"
+require_symbol 'was_running' app/services/client.py \
+    "close() overrides the library's, so a failed init writes uninitialized cookies over a valid cache entry"
+require_symbol 'AccountStatus.UNAUTHENTICATED' app/services/client.py \
+    "an unauthenticated session gets cached and shadows the real credentials on the next run"
 
 echo
 

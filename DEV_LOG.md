@@ -1,5 +1,56 @@
 # 开发日志
 
+## 2026-09-03 同步上游 7d1744e → 66dc3f7（gemini-webapi 2.1.1）
+
+### 上游这次改了什么
+
+`luuquangvu/Gemini-FastAPI` main 前进 5 个提交（08-26 ~ 08-28），净改动只有 5 个文件：
+
+| 文件 | 内容 |
+|---|---|
+| `pyproject.toml` / `uv.lock` | gemini-webapi 2.1.0 → **2.1.1**，curl-cffi 0.16.0 → 0.16.2 |
+| `app/utils/helper.py` | `TOOL_WRAP_HINT` 第 2 条加 "no language tag"；`PARAM_FENCE_RE` + `strip_markdown_fence` 修复 |
+| `tests/test_api_compatibility.py` | +49 行 |
+| `.gitattributes` | 1 行 |
+| `Dockerfile` | `c17e912` 加 git、`66dc3f7` 又删掉，**净变化 0** |
+
+中间三个提交把依赖临时指向作者自己的 `luuquangvu/Gemini-API` git 分支，`66dc3f7` 落回 PyPI 稳定版，所以只看首尾差异即可。
+
+### gemini-webapi 2.1.1 的内容（拉 `v2.1.0...v2.1.1` diff 确认）
+
+官方 release 就是上游作者提的两个 PR：
+
+- **#353 `get_access_token` 按失败类型分组** —— 429 立刻抛 `TemporarilyBlockedError`，超时抛 `TimeoutError`，网络错直接向上抛；不再被一个 `except Exception` 吞掉后接着把所有 cookie 组挨个试完。这正对上 08-23 定位的 client0：`GET gemini.google.com/app` 429×18，`_ensure_client_ready` 在请求路径上空转 6.5~7.7s。
+- **#354 `close()` 加 `was_running` 守卫** —— init 失败时不再拿未初始化的 cookie 覆盖有效缓存文件；`init()` 的 except 里补 `self._running = False`。
+
+兼容性已核：我们所有 `client.init()` 调用点都在 `except Exception` 里（`pool.py:79/214/266`、`client.py:67`），新异常类型打不穿。
+
+### 合并结果
+
+`git merge-tree` 预判和实际一致：**全程只有一个冲突**，在 `helper.py` 的 `TOOL_WRAP_HINT`。
+
+- **保留我们的软化版**。上游是在原版硬措辞上加一句 "with no language tag"；我们 `11dcba0` 已把整段换掉（原版实测 10% 命中率／40 轮，软化后 95~100%）。上游那句想解决的问题由下面的正则修复覆盖，措辞不必跟。注释里保留的「上游原文」已同步到 `66dc3f7` 的措辞。
+- **`strip_markdown_fence` 修复照收**。`PARAM_FENCE_RE` 改成允许围栏后面跟语言标签，切片也从 `s[len(fence):]` 改成 `s[len(match.group(0)):]`。我们这两处此前还是上游旧版原样，干净合入。这个修复对我们比对上游更需要：提示词软化之后模型更自由，更可能自己给围栏加语言标签。
+
+### 顺带补上我们自己的洞：`close()` 覆写丢了两个 cookie 守卫
+
+`app/services/client.py:111` 我们**完整覆写了库的 `close()`**（`a32782d` 引入，上游 `7d1744e` 没有这个覆写），结尾无条件 `save_cookies`。而库自己的 `close()`：
+
+- 2.1.0 就有 `if self.account_status == AccountStatus.UNAUTHENTICATED: return`
+- 2.1.1 又加了 `if not was_running: return`
+
+**两个守卫我们一个都没有。** 而库的 `init()` 失败时内部调的是 `self.close()` —— 落到的正是我们这个覆写。所以光升级到 2.1.1 拿不到 #354 的修复，守卫必须手工搬进覆写里，已补。
+
+`_running` 全仓只有库的 `init()`（置 True）和我们的 `close()`（置 False）两个写入点，重复 close 时第二次 `was_running=False` 跳过写盘，正是想要的行为。
+
+证据等级说明：这条只验到「代码路径成立」，**没有线上日志证明真的发生过覆盖**，属于读代码推出来的，不是实测。
+
+`scripts/check_deltas.sh` 补了两条断言（`was_running`、`AccountStatus.UNAUTHENTICATED`）盯住这个覆写，防止下次同步再被抹掉。
+
+### 顺手修的 CI 红灯
+
+`ruff check` 在 `11dcba0` 上就已经红了：12 条 RUF003（中文注释里的全角括号/逗号/冒号被判为易混字符）。本次把这些注释的标点改成 ASCII，`ruff check` / `ruff format --check` 现在全绿。没有动 `pyproject.toml` 的 ruff 配置——那是上游文件，加 ignore 会给以后的同步埋冲突。
+
 ## 2026-08-24 死账号重启循环与「假装回退 guest」
 
 本人提问：「上一次提交我们完成了出问题的账号直接跳过，为什么我看 docker 日志还是会请求失败的账号？」

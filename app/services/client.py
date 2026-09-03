@@ -124,6 +124,11 @@ class GeminiClientWrapper(GeminiClient):
                 f"triggered client closing."
             )
 
+        # The library's own close() guards the cookie cache write with `was_running` and
+        # with AccountStatus.UNAUTHENTICATED. This override replaces that method wholesale,
+        # so neither guard runs unless it is repeated here -- and init() calls self.close()
+        # on failure, which lands in exactly this method.
+        was_running = self._running
         self._running = False
         current_task = asyncio.current_task()
 
@@ -149,6 +154,21 @@ class GeminiClientWrapper(GeminiClient):
             except TimeoutError:
                 logger.warning(f"Timed out closing Gemini client {self.id}; dropping session.")
             self.client = None
+
+        # init() failed before the client ever ran: self._cookies still holds the
+        # uninitialized base cookies, which must never overwrite a valid cache entry.
+        if not was_running:
+            logger.debug(f"Skipping cookie cache write for {self.id}: the client never ran.")
+            return
+
+        # Cached cookies are tried ahead of the ones the caller supplies, so caching an
+        # unauthenticated session would restore an entry just cleared as stale, or create
+        # the very entry that shadows real credentials on the next run.
+        if self.account_status == AccountStatus.UNAUTHENTICATED:
+            logger.debug(
+                f"Skipping cookie cache write for {self.id}: the session is not authenticated."
+            )
+            return
 
         try:
             await asyncio.to_thread(save_cookies, self._cookies, self.verbose)
