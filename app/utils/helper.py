@@ -66,15 +66,15 @@ REMOTE_URL_SCHEMES = {"http", "https"}
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
-# 上游原版。实测在真实路径上只有 10% 的工具调用命中率（40 轮），代理复现 13%（30 轮）。
-# 把 `SYSTEM: ... (MANDATORY)` 抬头、`END ...` 收尾和 4 条大写 MUST 规则去掉之后，
-# 同一套 [ToolCalls] 语法能跑到 95~100%（38/40、30/30）—— 语法不是瓶颈，措辞才是。
-# 保留原文以便随时回退对照。
+# 上游原版。实测在真实路径上只有 10% 的工具调用命中率 (40 轮), 代理复现 13% (30 轮)。
+# 把 `SYSTEM: ... (MANDATORY)` 抬头、`END ...` 收尾和 4 条大写 MUST 规则去掉之后,
+# 同一套 [ToolCalls] 语法能跑到 95~100% (38/40、30/30) —— 语法不是瓶颈, 措辞才是。
+# 保留原文以便随时回退对照, 下面这份对齐上游 66dc3f7。
 # TOOL_WRAP_HINT = (
 #     "\n\nSYSTEM: TOOL CALLING PROTOCOL (MANDATORY)\n"
 #     "Either emit the tool-call block alone, or answer in natural language with no protocol tags. Never both.\n\n"
 #     "1. Names MUST match the schemas exactly; every required parameter MUST be present with its declared JSON type.\n"
-#     "2. Each value MUST stand alone between two fences of 3 backticks; if it contains a backtick run, both fences MUST be longer.\n"
+#     "2. Each value MUST stand alone between two fences of 3 backticks with no language tag; if it contains a backtick run, both fences MUST be longer.\n"
 #     "3. Every opening tag MUST be closed in reverse order of opening. A fence closes only itself, never a tag. An unclosed tag voids the call.\n"
 #     "4. Emit the block and nothing else. No preamble or commentary.\n\n"
 #     "REQUIRED SYNTAX, reproduce literally:\n"
@@ -89,8 +89,8 @@ VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
 #     "[/ToolCalls]\n\n"
 #     "END TOOL CALLING PROTOCOL"
 # )
-# 首行和末行会被 _hint_anchors() 拿去构造剥离正则，所以两头必须是独特且非标签的文本：
-# 末行若是 `[/ToolCalls]`，HINT_END_RES 会把输出里任何一个闭合标签都删掉。
+# 首行和末行会被 _hint_anchors() 拿去构造剥离正则, 所以两头必须是独特且非标签的文本:
+# 末行若是 `[/ToolCalls]`, HINT_END_RES 会把输出里任何一个闭合标签都删掉。
 TOOL_WRAP_HINT = (
     "\n\nTool call syntax reference\n"
     "Either emit the tool-call block alone, or answer in natural language. Never both.\n"
@@ -183,7 +183,7 @@ CONTROL_TOKEN_RE = re.compile(r"\\?<\\?\|im\\?_(?:start|end)\\?\|\\?>", re.IGNOR
 CHATML_START_RE = re.compile(r"\\?<\\?\|im\\?_start\\?\|\\?>(\w+)\n?", re.IGNORECASE)
 CHATML_END_RE = re.compile(r"\\?<\\?\|im\\?_end\\?\|\\?>", re.IGNORECASE)
 COMMONMARK_UNESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
-PARAM_FENCE_RE = re.compile(r"^(?P<fence>`{3,})")
+PARAM_FENCE_RE = re.compile(r"^(?P<fence>`{3,})(?P<tag>[A-Za-z0-9_+-]*)[ \t]*(?:\r?\n)?")
 MIME_SUBTYPE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 TOOL_HINT_STRIPPED = TOOL_WRAP_HINT.strip()
 SYSTEM_HINTS = (TOOL_WRAP_HINT, STRUCTURED_JSON_WRAP_HINT)
@@ -300,21 +300,25 @@ def strip_markdown_fence(s: str) -> str:
 
     The fence length is detected from the opening fence so tool parameters and
     structured JSON can safely contain shorter backtick sequences inside.
+    Any optional language tag on the opening fence is stripped cleanly.
     """
     s = s.strip()
     if not s:
         return ""
 
     match = PARAM_FENCE_RE.match(s)
-    if not match or not s.endswith(match.group("fence")):
+    if not match:
         return s
 
     fence = match.group("fence")
+    if len(s) < len(fence) * 2 or not s.endswith(fence):
+        return s
+
     lines = s.splitlines()
     if len(lines) >= 3 and lines[-1].strip() == fence:
         return "\n".join(lines[1:-1])
 
-    return s[len(fence) : -len(fence)].strip()
+    return s[len(match.group(0)) : -len(fence)].strip()
 
 
 def _parse_tool_argument_value(raw_value: str) -> JsonValue:
