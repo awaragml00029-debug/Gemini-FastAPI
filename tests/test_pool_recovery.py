@@ -8,6 +8,8 @@ one pointless auth round-trip to Google per 67 seconds, indefinitely.
 
 import asyncio
 from collections import deque
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -53,9 +55,25 @@ def clock(monkeypatch):
     return fake
 
 
+class RecordingPool(GeminiClientPool):
+    """A pool whose restart counts itself and does whatever the test says.
+
+    Subclassing rather than replacing the bound method on the instance: an instance
+    attribute would be called unbound, so its signature could never match the method
+    it stands in for, and every type checker is right to say so.
+    """
+
+    restart_effect: Callable[[Any], None]
+
+    async def _restart_client(self, client: Any) -> None:
+        client.restarts += 1
+        self.restart_effect(client)
+
+
 def build_pool(clients, restart_effect):
     """A pool wired to `clients`, whose restarts do whatever `restart_effect` says."""
-    pool = object.__new__(GeminiClientPool)
+    pool = object.__new__(RecordingPool)
+    pool.restart_effect = restart_effect
     pool._clients = list(clients)
     pool._id_map = {c.id: c for c in clients}
     pool._round_robin = deque(clients)
@@ -65,12 +83,6 @@ def build_pool(clients, restart_effect):
     pool._futile_restarts = {}
     pool._restart_not_before = {}
     pool._recovery_wanted = asyncio.Event()
-
-    async def _restart(client):
-        client.restarts += 1
-        restart_effect(client)
-
-    pool._restart_client = _restart
     return pool
 
 

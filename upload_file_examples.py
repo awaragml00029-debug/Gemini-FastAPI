@@ -9,7 +9,9 @@ import base64
 import os
 from pathlib import Path
 
-import requests
+# curl_cffi ships a requests-compatible API and is already a runtime dependency, so the
+# example resolves without asking the reader to install anything this project does not use.
+from curl_cffi import requests
 
 BASE_URL = os.getenv("GEMINI_FASTAPI_BASE_URL", "http://localhost:8000")
 API_KEY = os.getenv("GEMINI_FASTAPI_API_KEY", "")
@@ -42,9 +44,7 @@ def chat_with_image_url() -> dict:
                         {"type": "text", "text": "Describe this image."},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": "https://example.com/image.png"
-                            },
+                            "image_url": {"url": "https://example.com/image.png"},
                         },
                     ],
                 }

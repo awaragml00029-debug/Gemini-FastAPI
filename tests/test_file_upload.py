@@ -7,6 +7,7 @@ tests rather than relying on an end-to-end check noticing.
 
 import asyncio
 import base64
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -152,6 +153,7 @@ def test_input_audio_honours_the_declared_container(declared_format, expected, t
         raw_data={"format": declared_format} if declared_format is not None else {},
     )
     _text, path = asyncio.run(GeminiClientWrapper._process_content_item(item, "user", tmp_path))
+    assert isinstance(path, Path)
     assert path.suffix == expected
 
 
@@ -192,7 +194,9 @@ def test_a_good_attachment_still_goes_through(tmp_path):
         )
     )
     assert len(files) == 1
-    assert files[0].read_bytes() == PDF
+    attachment = files[0]
+    assert isinstance(attachment, Path)
+    assert attachment.read_bytes() == PDF
     assert "hi" in model_input
 
 
