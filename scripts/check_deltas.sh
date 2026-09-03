@@ -167,6 +167,10 @@ require_symbol 'was_running' app/services/client.py \
     "close() overrides the library's, so a failed init writes uninitialized cookies over a valid cache entry"
 require_symbol 'AccountStatus.UNAUTHENTICATED' app/services/client.py \
     "an unauthenticated session gets cached and shadows the real credentials on the next run"
+require_symbol '_pin_options' app/utils/helper.py \
+    "the SSRF check resolves a name that curl then resolves again, so it guards an address the fetch need never use"
+require_symbol 'client=live_session' app/server/chat.py \
+    "video and music downloads open a second connection to Google instead of reusing the account's session"
 
 echo
 

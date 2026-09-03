@@ -160,9 +160,21 @@ async def _image_to_base64(
 async def _media_to_local_file(
     media: GeneratedVideo | GeneratedMedia, temp_dir: Path
 ) -> dict[str, tuple[str, str]]:
-    """Persist media and return dict mapping type to (filename, hash)"""
+    """Persist media and return dict mapping type to (filename, hash).
+
+    The account's live session is handed to `save()` explicitly. WebImage and
+    GeneratedImage are built with `client=self.client`, but GeneratedVideo and
+    GeneratedMedia are not, so without this they fall through to `save()`'s fallback
+    branch and open a second TLS connection to Google's CDN for every download. The
+    fallback does inherit the account's proxy and fingerprint, so this is not a wrong
+    address -- it is a needless extra connection that the image path does not make.
+
+    `save()` closes only a client it built itself, so passing ours is safe, and a
+    missing session simply restores the previous behaviour.
+    """
+    live_session = getattr(getattr(media, "client_ref", None), "client", None)
     try:
-        saved_paths = await media.save(path=str(temp_dir))
+        saved_paths = await media.save(path=str(temp_dir), client=live_session)
         if not saved_paths:
             logger.warning("No files saved from media object.")
             return {}
@@ -1101,7 +1113,7 @@ async def _process_conversation_with_timeout(
 
 
 async def _process_conversation_for_client(
-    client: GeminiClientWrapper | None,
+    client: GeminiClientWrapper,
     messages: list[AppMessage],
     tmp_dir: Path,
 ) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
@@ -1110,8 +1122,13 @@ async def _process_conversation_for_client(
     Chat traffic for an account goes through its configured SOCKS proxy, so the
     media fetch has to as well -- otherwise one conversation reaches Google from
     two different addresses with two different TLS fingerprints.
+
+    The client is required rather than optional on purpose. The previous signature
+    accepted None and quietly fell back to no proxy and a generic fingerprint, which
+    is the one outcome this function exists to prevent, and it said nothing in the
+    log while doing it. Requiring the client makes that a type error instead.
     """
-    options = client.curl_cffi_fetch_options if client else {"proxy": None, "impersonate": None}
+    options = client.curl_cffi_fetch_options
     try:
         return await _process_conversation_with_timeout(
             messages,
@@ -2862,7 +2879,7 @@ async def create_chat_completion(
         gem_id=gem_id,
     )
 
-    if session:
+    if session and client:
         if not remain:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No new messages.")
 
@@ -3174,7 +3191,7 @@ async def create_response(
         conversation_key=conversation_key,
         gem_id=gem_id,
     )
-    if session:
+    if session and client:
         msgs = _prepare_messages_for_model(
             remain,
             standard_tools or None,

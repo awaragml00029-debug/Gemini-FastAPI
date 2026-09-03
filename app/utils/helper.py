@@ -21,7 +21,7 @@ import gemini_webapi.client as _gemini_client
 import gemini_webapi.constants as _gemini_constants
 import orjson
 import regex
-from curl_cffi import BrowserTypeLiteral, CurlHttpVersion, requests
+from curl_cffi import BrowserTypeLiteral, CurlHttpVersion, CurlOpt, requests
 from jsonschema import SchemaError, ValidationError, validators
 from jsonschema.validators import validator_for
 from loguru import logger
@@ -667,13 +667,19 @@ def _is_public_ip(host: str) -> bool:
     return ip.is_global
 
 
-def _validate_remote_url(url: str) -> str:
-    """Reject URLs that resolve anywhere other than a public address (SSRF guard)."""
+def _validate_remote_url(url: str) -> tuple[str, str | None]:
+    """Reject URLs that resolve anywhere other than a public address (SSRF guard).
+
+    Returns the URL together with the address it was checked at, or None when no
+    lookup happened -- an IP literal, or private fetches deliberately allowed. The
+    caller pins the connection to that address so curl cannot resolve the name a
+    second time and reach somewhere this function never approved.
+    """
     parsed = urlparse(url)
     if parsed.scheme.lower() not in REMOTE_URL_SCHEMES:
         raise ValueError("Unsupported or unsafe URL")
     if g_config.gemini.allow_private_url_fetch:
-        return url
+        return url, None
     if not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("Unsupported or unsafe URL")
 
@@ -681,8 +687,9 @@ def _validate_remote_url(url: str) -> str:
     if hostname == "localhost" or hostname.endswith(".localhost"):
         raise ValueError("Unsupported or unsafe URL")
 
+    # An address literal needs no lookup, so there is nothing to pin and nothing to leak.
     if _is_public_ip(hostname):
-        return url
+        return url, None
 
     if hostname == parsed.hostname and not re.fullmatch(r"[A-Za-z0-9.-]+", hostname):
         raise ValueError("Unsupported or unsafe URL")
@@ -696,7 +703,31 @@ def _validate_remote_url(url: str) -> str:
     resolved_ips = {str(info[4][0]) for info in addr_infos}
     if not resolved_ips or any(not _is_public_ip(ip) for ip in resolved_ips):
         raise ValueError("Unsupported or unsafe URL")
-    return url
+    return url, sorted(resolved_ips)[0]
+
+
+def _pin_options(url: str, pinned_ip: str | None, proxy: str | None) -> dict[CurlOpt, list[str]]:
+    """Force curl to connect to the address `_validate_remote_url` actually approved.
+
+    Without this the name is resolved twice -- once for the check, once by curl -- and
+    the answer may differ in between, which is the whole of a DNS rebinding attack.
+
+    A proxy defeats it, and does so silently: measured against this deployment's own
+    SOCKS proxy, a request pinned to 127.0.0.1 still returned 200 from the real host,
+    under socks5 and socks5h alike, because curl hands the destination to the proxy
+    rather than dialling it. So the option is omitted rather than set and believed in.
+    A proxied fetch keeps only the pre-flight check, which reads this resolver rather
+    than the proxy's, and is therefore advisory. Saying that out loud is the point:
+    the previous code left the same gap while looking like it had closed it.
+    """
+    if not pinned_ip or proxy:
+        return {}
+
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return {}
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    return {CurlOpt.RESOLVE: [f"{parsed.hostname.rstrip('.').lower()}:{port}:{pinned_ip}"]}
 
 
 def _suffix_from_mime_or_url(mime_type: str | None, url: str | None = None) -> str:
@@ -778,7 +809,7 @@ async def save_url_to_tempfile(
         data, suffix = await _decode_data_url(url)
     else:
         download_started = time.perf_counter()
-        current_url = _validate_remote_url(url)
+        current_url, pinned_ip = _validate_remote_url(url)
         async with requests.AsyncSession(
             impersonate=cast(BrowserTypeLiteral, impersonate or "chrome"),
             proxy=proxy,
@@ -807,6 +838,15 @@ async def save_url_to_tempfile(
             for _ in range(MAX_REMOTE_REDIRECTS + 1):
                 buffer.clear()
                 oversized = False
+                # curl_options is a session attribute rather than a request argument, and
+                # it is read on every request, so each hop is re-pinned here: a redirect
+                # reaches a different host, and carrying the previous hop's entry would
+                # leave the new one unpinned without saying so.
+                pin = _pin_options(current_url, pinned_ip, proxy)
+                # curl_cffi types the mapping as dict[CurlOpt, str], but CURLOPT_RESOLVE is
+                # an slist and only accepts a list: handed a plain string, curl walks it one
+                # character at a time and fails with "Could not parse CURLOPT_RESOLVE entry".
+                client.curl_options = cast(dict[CurlOpt, str], pin)
                 try:
                     resp = await client.get(current_url, content_callback=receive_chunk)
                 except Exception as exc:
@@ -817,7 +857,7 @@ async def save_url_to_tempfile(
                     location = resp.headers.get("location")
                     if not location:
                         raise ValueError("Unsafe redirect")
-                    current_url = _validate_remote_url(urljoin(current_url, location))
+                    current_url, pinned_ip = _validate_remote_url(urljoin(current_url, location))
                     continue
 
                 resp.raise_for_status()
@@ -831,13 +871,15 @@ async def save_url_to_tempfile(
                 content_type = resp.headers.get("content-type")
                 suffix = _suffix_from_mime_or_url(content_type, current_url)
                 logger.info(
-                    "Downloaded upload URL: url={}, status_code={}, content_type={}, bytes={}, proxied={}, impersonate={}, elapsed={:.3f}s",
+                    "Downloaded upload URL: url={}, status_code={}, content_type={}, bytes={}, "
+                    "proxied={}, impersonate={}, address_pinned={}, elapsed={:.3f}s",
                     reprlib.repr(current_url),
                     resp.status_code,
                     content_type,
                     len(data),
                     bool(proxy),
                     impersonate or "chrome",
+                    bool(pin),
                     time.perf_counter() - download_started,
                 )
                 break

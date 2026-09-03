@@ -160,6 +160,20 @@ def test_input_audio_honours_the_declared_container(declared_format, expected, t
 # --- how a bad attachment is reported --------------------------------------------------
 
 
+def _client_that_never_fetches() -> GeminiClientWrapper:
+    """A client for the tests below, which decode data URLs and never reach the network.
+
+    `_process_conversation_for_client` requires a client because the account's proxy and
+    fingerprint have to reach the media fetch. These tests never fetch, so the options go
+    unused -- but passing None to say so is exactly the hole that signature closed.
+    """
+    client = object.__new__(GeminiClientWrapper)
+    client.proxy = None
+    client._cfg_impersonate = None
+    client.impersonate = "chrome"
+    return client
+
+
 @pytest.mark.parametrize(
     "bad_payload",
     ["not!!base64!!", "data:application/pdf,notdeclaredbase64"],
@@ -173,14 +187,16 @@ def test_undecodable_attachment_is_a_400_not_a_503(bad_payload, tmp_path):
         )
     ]
     with pytest.raises(HTTPException) as caught:
-        asyncio.run(_process_conversation_for_client(None, messages, tmp_path))
+        asyncio.run(
+            _process_conversation_for_client(_client_that_never_fetches(), messages, tmp_path)
+        )
     assert caught.value.status_code == 400
 
 
 def test_a_good_attachment_still_goes_through(tmp_path):
     model_input, files = asyncio.run(
         _process_conversation_for_client(
-            None,
+            _client_that_never_fetches(),
             [
                 AppMessage(
                     role="user",

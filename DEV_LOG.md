@@ -1,5 +1,61 @@
 # 开发日志
 
+## 2026-09-03（下午）IP 与 TLS 指纹全面审计，外加三处加固
+
+起因：本人观察到 Google 加强风控，判据是「IP 和指纹决定这个项目能不能用」。
+
+### 审计结论：没有「发往 Google 用错 IP 或错指纹」的 bug
+
+出网点逐个核过，全部带账号自己的 proxy 和 impersonate：
+
+| 路径 | 位置 | 代理 | 指纹 |
+|---|---|---|---|
+| 认证 / 初始化 | `get_access_token.py:279-284` | ✅ | ✅ |
+| 主对话、流式 | `client.py:304` 活 session | ✅ | ✅ |
+| cookie 轮转 | `rotate_1psidts.py:37` 复用活 session | ✅ | ✅ |
+| 图片下载 | `client.py:2123/2149` `client=self.client` | ✅ | ✅ |
+| 视频 / 音乐下载 | `client.py:2172/2203` 少传 `client=` | ✅ | ✅ |
+| 用户给的远程 URL | `helper.py:782` | ✅ | ✅ |
+
+`app/` 里唯一的 HTTP 客户端导入是 `helper.py:24` 的 curl_cffi，没有 httpx / aiohttp / requests / urllib.request。容器里没有 `HTTP_PROXY` 之类会在背后绕过 per-client 代理的环境变量。
+
+### 实测（真发了请求，不是读代码）
+
+- **出口 IP**：3 个账号 3 个独立地址，无共用。client0 直连 `146.19.*.*`；client1、client2 各自一个 `107.172.*.*` 段地址。
+- **指纹**：4 种配置产生 4 种不同 JA3，对照组（不带 impersonate）与三者都不同 —— 证明这个开关不是摆设。
+- **对话 session vs 抓取 session**：按两处代码各自的参数形状分别建 session 实测，**JA4 与 Akamai(H2) 三个账号全部逐字节一致**。
+- **JA3 对 Chrome 配置每次都变**：同一配置连打三次得到 3 种 JA3，Firefox 得到 1 种。这是 Chrome 自 110 起随机化 TLS 扩展顺序的行为，curl-cffi 复现对了；JA3 顺序敏感所以变，JA4 排序后计算所以稳。**一个 JA3 恒定的「Chrome」才可疑。**
+
+两处自我纠正：一是最初拿出口 IP 去比代理的**监听**地址得出「不一致」，那是错的，代理跑在本机公网 IP 上、转发出去才是 107.172；二是 JA3 差异被我一度当成配置问题，实为随机化。
+
+### 加固一：堵死会静默绕过代理的降级分支
+
+`chat.py:_process_conversation_for_client` 的 `client` 参数原为 `GeminiClientWrapper | None`，为空时兜底成 `{"proxy": None, "impersonate": None}` —— 也就是**悄悄直连、退成通用 chrome 指纹，日志一个字不说**。追证：`_find_reusable_session`（`chat.py:1017`）只返回 `(None, None, ...)` 或 `(session, client, ...)`，其余调用点都来自 `pool.acquire()`，所以这条分支当时不可达。但它是个安静的降级，改成非可选参数后由 ty + pyright 在 CI 拦住。两个端点的分支条件同步收窄为 `if session and client:`。
+
+### 加固二：视频 / 音乐下载复用账号的活 session
+
+`client.py` 构造三种媒体对象时参数不一致：`WebImage`（`:2123`）和 `GeneratedImage`（`:2149`）都带 `client=self.client`，`GeneratedVideo`（`:2172`）和 `GeneratedMedia`（`:2203`）没带。于是 `save()` 走 `video.py:84` 的兜底分支新建 session。兜底带了 `client_ref`，所以 proxy、impersonate、cookies 都对，**不是错 IP**，只是白开一条连接。
+
+`chat.py:_media_to_local_file` 现在从 `media.client_ref.client` 取活 session 显式传进去。安全性核过：`save()` 只关它自己新建的 client（`video.py` 的 `close_client` 标志），传进去的不会被误关；取不到就退回原行为。
+
+### 加固三：SSRF 检查钉住它批准的那个地址
+
+原来 `_validate_remote_url` 解析域名、校验是公网、然后**把 URL 原样交给 curl 再解析一遍** —— 两次解析之间答案可以变，这正是 DNS rebinding 的全部内容。
+
+现在校验函数返回 `(url, 通过校验的地址)`，`_pin_options` 把它写成 `CURLOPT_RESOLVE`，curl 只能连这个地址。重定向每一跳重新校验、重新钉（`curl_options` 是 session 级但每次请求重读，见 curl_cffi `session.py:664/1356`）。
+
+**带代理时钉不住，而且是静默失效** —— 实测：对着本部署自己的 SOCKS 代理，把 IP 钉到 `127.0.0.1` 仍然返回 200，`socks5` 和 `socks5h` 一样，因为 curl 把目标交给代理而不是自己拨号。所以代理路径**不设**这个选项，而不是设了假装有用。日志新增 `address_pinned=` 字段，把「这次到底钉住没有」写明。
+
+设计过程中被实测否掉的方案：本想「降级 socks5 + 钉 IP」让代理路径也受控，实测证明 `socks5` 也一样忽略 RESOLVE，方案作废。另：`CurlOpt.RESOLVE` 只接受 list，传字符串会让 curl 逐字符解析并报 `Could not parse CURLOPT_RESOLVE entry 'a'`；库把类型标成 `dict[CurlOpt, str]` 太窄，需显式 cast。
+
+剩余风险，说明白：**挂代理的账号，那个预检查读的是本机 resolver，而实际连接由代理端解析，所以它是建议性的、不是强制的。** 本机代理是 xray（监听 10830/10834，转发到 107.172 段），它有能力连到内网，所以这个检查不能干脆删掉 —— 删了就一点保护都没有。
+
+`tests/test_url_pinning.py` 新增 14 条测试钉住这套行为，其中专门有一条钉「代理时不设 pin」，防止以后有人把它「修」成静默无效。`scripts/check_deltas.sh` 加两条断言。
+
+### 未做
+
+**并发限制（一个账号一次只跑一个请求）本人明确说先不做。** 前置问题已查清并记录在此，供以后动手：`request_scope` 只是计数器不是锁，且盖不住整个请求 —— `pool.acquire()`（`pool.py:106`）到发送之间的文件上传裸奔，`chat.py:1401` 首块拿到后 scope 关闭、到 `_hold_request_scope` 真正开始消费之间还有一段裸奔。不先把 scope 拉成「从 acquire 到响应结束」一整段，加锁会从这两个缝里漏。
+
 ## 2026-09-03 同步上游 7d1744e → 66dc3f7（gemini-webapi 2.1.1）
 
 ### 上游这次改了什么
