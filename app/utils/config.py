@@ -127,6 +127,15 @@ class GeminiConfig(BaseModel):
         default=False,
         description="Enable Gemini extended thinking mode for message generation",
     )
+    log_full_prompt: bool = Field(
+        default=True,
+        description=(
+            "Write the exact text sent to Google into debug_dumps/prompt_*.txt. The request "
+            "side is otherwise invisible -- only a character count reaches the log -- which "
+            "is how leaked filenames and control tokens went unnoticed. Writes full "
+            "conversation content to disk; set false once an investigation is over."
+        ),
+    )
     image_full_size: bool = Field(
         default=False,
         description=(

@@ -19,7 +19,9 @@ from app.utils.helper import (
     add_tag,
     save_file_to_tempfile,
     save_url_to_tempfile,
+    strip_local_media_links,
 )
+from app.utils.raw_capture import dump_prompt
 
 # How a model is addressed: by name, or as one of the models a client discovered. `None` leaves
 # the choice to Google.
@@ -429,6 +431,7 @@ class GeminiClientWrapper(GeminiClient):
             text_fragments.append(tool_section)
 
         model_input = "\n".join(fragment for fragment in text_fragments if fragment is not None)
+        model_input = strip_local_media_links(model_input)
 
         if (model_input or message.role == "tool") and tagged:
             model_input = add_tag(message.role, model_input)
@@ -489,6 +492,9 @@ class GeminiClientWrapper(GeminiClient):
         if not bare_single_turn:
             conversation.append(add_tag("assistant", "", unclose=True))
         model_input = "\n".join(conversation)
+        if g_config.gemini.log_full_prompt:
+            dump_prompt(model_input, len(messages))
+
         logger.info(
             "Processed conversation for Gemini: messages={}, input_chars={}, files={}, elapsed={:.3f}s",
             len(messages),

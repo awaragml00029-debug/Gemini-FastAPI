@@ -31,9 +31,18 @@ from loguru import logger
 # families. The list is deliberately loose: a false positive costs one dump file, a
 # false negative costs the evidence.
 FALLBACK_MARKERS = re.compile(
-    r"语言模型|文本模型|超出了我的设计用途|无法提供这方面的帮助|没办法提供这方面的帮助"
-    r"|I'?m (?:just )?an? (?:large )?(?:language|text) model"
-    r"|encountering an error"
+    # Google keeps inventing phrasings. Every one below was seen live on 2026-09-09, and the
+    # first alternative is deliberately loose -- "文本 AI" slipped past a list that only knew
+    # "语言模型" and "文本模型", so that refusal was never recorded at all. Matching the shape
+    # ("I am a <something> model/AI") costs a few extra dumps and misses nothing.
+    r"我(?:只是|是|就是)?一?个?[^，。！？\n]{0,12}(?:语言模型|文本模型|文本\s*AI|AI\s*模型|大模型)"  # noqa: RUF001
+    r"|身为一个[^，。！？\n]{0,12}(?:模型|AI)"  # noqa: RUF001
+    r"|超出了我的设计用途|无法提供这方面的帮助|没办法提供这方面的帮助|没法帮到你|帮不上忙|没法帮上忙"
+    # "由于程序代码的局限，我没法办到" -- seen 2026-09-09 right after leaked filenames  # noqa: RUF003
+    # made the model doubt its own context. New wordings keep appearing; match intent.
+    r"|由于程序代码的局限|程序代码的局限|我没法办到|没法办到|做不到这一点|无法完成这个请求"
+    r"|I'?m (?:just )?an? (?:large )?(?:language|text) (?:model|AI)"
+    r"|encountering an error|I encountered an error"
     r"|I can'?t help (?:you )?with (?:that|this)",
     re.IGNORECASE,
 )
@@ -45,8 +54,13 @@ FALLBACK_MARKERS = re.compile(
 WIDGET_MARKER = re.compile(r"GenerateWidget")
 
 DUMP_DIR = Path(os.environ.get("GEMINI_DUMP_DIR", "/app/data/debug_dumps"))
-MAX_DUMPS = 30
+MAX_DUMPS = 100
 MAX_DUMP_BYTES = 2 * 1024 * 1024
+
+
+# Warn once per kind rather than on every hit: a full quota is worth knowing about, a
+# message per request is not.
+_quota_warned: set[str] = set()
 
 
 def _enabled() -> bool:
@@ -61,6 +75,13 @@ def _dump(frames: list[Any], marker: str, kind: str = "fallback") -> None:
     try:
         DUMP_DIR.mkdir(parents=True, exist_ok=True)
         if len(list(DUMP_DIR.glob(f"{kind}_*.json"))) >= MAX_DUMPS:
+            if kind not in _quota_warned:
+                _quota_warned.add(kind)
+                logger.warning(
+                    f"{kind} dump quota is full ({MAX_DUMPS} files in {DUMP_DIR}). Captures "
+                    "are being dropped, so an empty capture log no longer means no hits -- "
+                    "archive or delete the directory to resume recording."
+                )
             return
 
         path = DUMP_DIR / f"{kind}_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.json"
@@ -86,6 +107,28 @@ def _dump(frames: list[Any], marker: str, kind: str = "fallback") -> None:
 # Bound before install() swaps the name, so the stock parser stays reachable -- the
 # subclass needs it as a base, and tests need it to prove the subclass is transparent.
 ORIGINAL_PARSER = _gemini_parsing.StreamingFrameParser
+
+
+def dump_prompt(text: str, message_count: int) -> None:
+    """Write the exact bytes handed to Google. Never raises into the request.
+
+    The response side has been capturable since the frame parser was hooked, but the
+    request side was only ever a character count in the log -- which is why both the
+    ChatML framing and the leaked `img_<uuid>` filenames had to be found by reading the
+    model's own exposed reasoning instead of simply looking at what we sent.
+    """
+    try:
+        DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        if len(list(DUMP_DIR.glob("prompt_*.txt"))) >= MAX_DUMPS:
+            if "prompt" not in _quota_warned:
+                _quota_warned.add("prompt")
+                logger.warning(f"prompt dump quota is full ({MAX_DUMPS} files in {DUMP_DIR}).")
+            return
+        path = DUMP_DIR / f"prompt_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.txt"
+        header = f"# messages={message_count} chars={len(text)} at={time.strftime('%H:%M:%S')}\n\n"
+        path.write_text(header + text, encoding="utf-8")
+    except Exception as exc:
+        logger.debug(f"Could not write prompt dump: {exc}")
 
 
 class CapturingFrameParser(ORIGINAL_PARSER):

@@ -47,7 +47,7 @@ def test_fallback_dumps_every_frame_so_far(dump_dir) -> None:
     files = _files(dump_dir)
     assert len(files) == 1
     payload = json.loads(files[0].read_text(encoding="utf-8"))
-    assert payload["marker_hit"] == "语言模型"
+    assert "语言模型" in payload["marker_hit"]
     assert payload["frame_count"] == 3
     assert "drafting a Chinese intro" in json.dumps(payload["frames"], ensure_ascii=False)
 
@@ -61,6 +61,7 @@ def test_only_one_dump_per_request(dump_dir) -> None:
 
 def test_dump_cap_is_honoured(dump_dir, monkeypatch) -> None:
     monkeypatch.setattr(raw_capture, "MAX_DUMPS", 2)
+    monkeypatch.setattr(raw_capture, "_quota_warned", set())
     for _ in range(5):
         CapturingFrameParser()._observe([FALLBACK])
     assert len(_files(dump_dir)) <= 2
@@ -100,3 +101,13 @@ def test_parser_output_is_unchanged() -> None:
     sample = ')]}\'\n\n26\n[["wrb.fr",null,"[1,2]"]]\n'
     assert CapturingFrameParser().feed(sample) == ORIGINAL_PARSER().feed(sample)
     assert issubclass(CapturingFrameParser, ORIGINAL_PARSER)
+
+
+def test_full_quota_warns_once(dump_dir, monkeypatch, caplog) -> None:
+    """A silent cap made an empty capture log look like a clean run."""
+    monkeypatch.setattr(raw_capture, "MAX_DUMPS", 1)
+    monkeypatch.setattr(raw_capture, "_quota_warned", set())
+    for _ in range(4):
+        CapturingFrameParser()._observe([FALLBACK])
+    assert len(_files(dump_dir)) == 1
+    assert raw_capture._quota_warned == {"fallback"}
