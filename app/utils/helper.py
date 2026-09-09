@@ -78,6 +78,45 @@ FOLLOWUP_TAG_RE = re.compile(r"<FollowUp\b[^>]*/>")
 # there is nothing to run. Dropping it silently would leave the reply with an unexplained
 # hole, so it is replaced by a line saying what was there.
 WIDGET_BLOCK_RE = re.compile(r"<GenerateWidget\b.*?</GenerateWidget>", re.DOTALL)
+
+# Generated media is handed to the client as `![title](<our host>/media/img_<uuid>.jpg?token=…)`,
+# and the client sends that line straight back as assistant history on the next turn. Google
+# then sees a filename for a file it cannot fetch. Captured live on 2026-09-09, the model
+# reasons: "I see a filename in the text (img_2923f9…jpg), but no actual image… leaning
+# toward not passing image_references if I can't confirm the image's existence" -- and drops
+# the image work it was asked to do. The URL is meaningless to Google either way, so it is
+# replaced by a marker that says an image was there.
+LOCAL_MEDIA_LINK_RE = re.compile(
+    r"\[!\[[^\]]*\]\([^)\s]*?/media/[^)\s]*?\)\]\([^)\s]*?/media/[^)\s]*?\)"
+)
+LOCAL_MEDIA_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)\s]*?/media/[^)\s]*?\)")
+
+
+# Our own media is titled with its filename (`![img_<uuid>.jpg](…)`), so "keep the title,
+# drop the URL" still handed Google the filename -- observed live in a captured prompt as
+# `[generated image: img_47d46252….jpg]`, right before the model refused. A title that is
+# just a generated name carries nothing and must go with the URL.
+GENERATED_MEDIA_NAME_RE = re.compile(
+    r"^(?:img|vid|aud|media)_[0-9a-f]{8,}(?:\.\w+)?$", re.IGNORECASE
+)
+
+
+def strip_local_media_links(text: str) -> str:
+    """Swap our own media URLs for a plain marker before the text goes back to Google."""
+    if not text or "/media/" not in text:
+        return text
+
+    text = LOCAL_MEDIA_LINK_RE.sub("[generated media]", text)
+
+    def _image(match: re.Match[str]) -> str:
+        title = (match.group(1) or "").strip()
+        if title and title.lower() != "image" and not GENERATED_MEDIA_NAME_RE.match(title):
+            return f"[generated image: {title}]"
+        return "[generated image]"
+
+    return LOCAL_MEDIA_IMAGE_RE.sub(_image, text)
+
+
 WIDGET_PLACEHOLDER = "[交互式组件：需在 Gemini 网页端查看]"  # noqa: RUF001
 
 MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024

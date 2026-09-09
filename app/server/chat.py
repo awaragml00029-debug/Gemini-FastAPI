@@ -2660,7 +2660,11 @@ def _create_responses_real_streaming_response(
                                 size=f"{w}x{h}" if w and h else None,
                             )
 
-                            img_link = f"![{fname}]({base_url}media/{fname}?token={get_media_token(fname)})"
+                            # The alt text is echoed back as assistant history, so it must not
+                            # be the filename: Google then sees a name for a file it cannot fetch.
+                            img_link = (
+                                f"![Image]({base_url}media/{fname}?token={get_media_token(fname)})"
+                            )
                             md_to_add = f"\n\n{img_link}"
 
                             img_index = next_output_index
