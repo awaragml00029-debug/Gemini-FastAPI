@@ -78,6 +78,7 @@ from app.utils.helper import (
     STREAM_TAIL_RE,
     STRICT_SCHEMA_ADHERENCE_PROMPT,
     STRUCTURED_JSON_WRAP_HINT,
+    WIDGET_PLACEHOLDER,
     StructuredOutputValidationError,
     append_tool_hint_to_last_user_message,
     build_image_generation_instruction,
@@ -127,10 +128,14 @@ async def _image_to_base64(
     image: Image, temp_dir: Path
 ) -> tuple[str, int | None, int | None, str, str]:
     """Persist an image provided by gemini_webapi and return base64 plus dimensions, filename, and hash."""
+    started = time.perf_counter()
     if isinstance(image, GeneratedImage):
+        full_size = g_config.gemini.image_full_size
         try:
-            saved_path = await image.save(path=str(temp_dir), full_size=True)
+            saved_path = await image.save(path=str(temp_dir), full_size=full_size)
         except Exception as e:
+            if not full_size:
+                raise
             logger.warning(
                 f"Failed to download full-size GeneratedImage, retrying with default size: {e}"
             )
@@ -140,23 +145,41 @@ async def _image_to_base64(
 
     if not saved_path:
         raise ValueError("Failed to save generated image")
+    downloaded = time.perf_counter()
 
     original_path = Path(saved_path)
-    data = original_path.read_bytes()
-    suffix = original_path.suffix
 
-    if not suffix:
-        detected_ext = detect_image_extension(data)
-        suffix = detected_ext or (".png" if isinstance(image, GeneratedImage) else ".jpg")
+    def _encode() -> tuple[str, int | None, int | None, str, str, str]:
+        """Read, hash and base64 the image off the event loop.
 
-    random_name = f"img_{uuid.uuid4().hex}{suffix}"
-    new_path = temp_dir / random_name
-    original_path.rename(new_path)
+        A few MB of b64encode/sha256 is tens of milliseconds -- small next to the download,
+        but it runs inside the request loop and would stall every other in-flight stream.
+        """
+        data = original_path.read_bytes()
+        suffix = original_path.suffix
+        if not suffix:
+            detected_ext = detect_image_extension(data)
+            suffix = detected_ext or (".png" if isinstance(image, GeneratedImage) else ".jpg")
+        random_name = f"img_{uuid.uuid4().hex}{suffix}"
+        original_path.rename(temp_dir / random_name)
+        w, h = extract_image_dimensions(data)
+        return (
+            base64.b64encode(data).decode("ascii"),
+            w,
+            h,
+            random_name,
+            hashlib.sha256(data).hexdigest(),
+            suffix,
+        )
 
-    width, height = extract_image_dimensions(data)
-    filename = random_name
-    file_hash = hashlib.sha256(data).hexdigest()
-    return base64.b64encode(data).decode("ascii"), width, height, filename, file_hash
+    encoded, width, height, filename, file_hash, _ = await asyncio.to_thread(_encode)
+    logger.debug(
+        "Image ready: download={:.3f}s encode={:.3f}s full_size={}",
+        downloaded - started,
+        time.perf_counter() - downloaded,
+        g_config.gemini.image_full_size,
+    )
+    return encoded, width, height, filename, file_hash
 
 
 async def _media_to_local_file(
@@ -1508,6 +1531,18 @@ def _artifact_holdback_len(text: str) -> int:
     return 0
 
 
+_WIDGET_OPEN = "<GenerateWidget"
+_WIDGET_CLOSE = "</GenerateWidget>"
+
+
+def _partial_suffix_len(text: str, marker: str) -> int:
+    """How many trailing chars of `text` could still be growing into `marker`."""
+    for n in range(min(len(text), len(marker) - 1), 0, -1):
+        if marker.startswith(text[-n:]):
+            return n
+    return 0
+
+
 _FOLLOWUP_PREFIX = "<FollowUp"
 
 
@@ -1540,6 +1575,8 @@ class StreamingOutputFilter:
         self.current_role = ""
         self.artifact_hold = ""
         self.followup_hold = ""
+        self.widget_hold = ""
+        self.in_widget = False
 
     def _filter_artifacts(self, text: str) -> str:
         """Drop complete artifact URLs and withhold anything that might still become one."""
@@ -1561,6 +1598,53 @@ class StreamingOutputFilter:
             return buf[: len(buf) - keep]
         self.artifact_hold = ""
         return buf
+
+    def _filter_widget(self, text: str) -> str:
+        """Swallow `<GenerateWidget>…</GenerateWidget>` blocks, leaving one placeholder line.
+
+        The block spans many chunks, so the open and close markers arrive split. Anything
+        that could still be growing into either marker is withheld rather than emitted.
+        """
+        buf = self.widget_hold + text
+        out: list[str] = []
+        while buf:
+            if self.in_widget:
+                idx = buf.find(_WIDGET_CLOSE)
+                if idx == -1:
+                    keep = _partial_suffix_len(buf, _WIDGET_CLOSE)
+                    self.widget_hold = buf[len(buf) - keep :] if keep else ""
+                    return "".join(out)
+                buf = buf[idx + len(_WIDGET_CLOSE) :]
+                self.in_widget = False
+                out.append(WIDGET_PLACEHOLDER)
+                continue
+
+            idx = buf.find(_WIDGET_OPEN)
+            if idx == -1:
+                keep = _partial_suffix_len(buf, _WIDGET_OPEN)
+                out.append(buf[: len(buf) - keep] if keep else buf)
+                self.widget_hold = buf[len(buf) - keep :] if keep else ""
+                return "".join(out)
+
+            after = idx + len(_WIDGET_OPEN)
+            if after >= len(buf):
+                # The delimiter has not arrived yet: `<GenerateWidget` could still turn out
+                # to be `<GenerateWidgetFoo`. Hold rather than commit to swallowing.
+                out.append(buf[:idx])
+                self.widget_hold = buf[idx:]
+                return "".join(out)
+            if buf[after] not in " \t\n>":
+                # A longer name that merely starts the same way -- not our block.
+                out.append(buf[:after])
+                buf = buf[after:]
+                continue
+
+            out.append(buf[:idx])
+            buf = buf[after:]
+            self.in_widget = True
+
+        self.widget_hold = ""
+        return "".join(out)
 
     def _filter_followup(self, text: str) -> str:
         """Drop complete FollowUp tags and withhold anything that might still become one."""
@@ -1648,7 +1732,7 @@ class StreamingOutputFilter:
 
             self.buffer = self.buffer[end:]
 
-        return self._filter_followup(self._filter_artifacts("".join(output)))
+        return self._filter_followup(self._filter_artifacts(self._filter_widget("".join(output))))
 
     def flush(self) -> str:
         """Release remaining buffer content and perform final cleanup at stream end."""
@@ -1661,6 +1745,14 @@ class StreamingOutputFilter:
         self.buffer = ""
         self.stack = ["NORMAL"]
         self.current_role = ""
+        # A block still open at end of stream had its content swallowed already, so the
+        # placeholder is what stands in for it; otherwise release whatever was withheld.
+        if self.in_widget:
+            res = WIDGET_PLACEHOLDER
+            self.in_widget = False
+        else:
+            res = self.widget_hold + res
+        self.widget_hold = ""
         res = ARTIFACT_URL_RE.sub("", self.artifact_hold + res)
         self.artifact_hold = ""
         res = FOLLOWUP_TAG_RE.sub("", self.followup_hold + res)

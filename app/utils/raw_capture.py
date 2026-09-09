@@ -38,6 +38,12 @@ FALLBACK_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
+# `<GenerateWidget …>` carries a *prompt for a renderer*, not the rendered component, and
+# the render happens in Google's frontend. Its `component_placeholder_id` hints there may be
+# a matching content block elsewhere in the response -- unverified, which is why the frames
+# are captured: they settle whether anything is recoverable over the reverse API.
+WIDGET_MARKER = re.compile(r"GenerateWidget")
+
 DUMP_DIR = Path(os.environ.get("GEMINI_DUMP_DIR", "/app/data/debug_dumps"))
 MAX_DUMPS = 30
 MAX_DUMP_BYTES = 2 * 1024 * 1024
@@ -47,14 +53,17 @@ def _enabled() -> bool:
     return os.environ.get("GEMINI_DUMP_FALLBACK", "1") not in ("0", "false", "no")
 
 
-def _dump(frames: list[Any], marker: str) -> None:
-    """Write the frames collected so far. Never raises into the stream."""
+def _dump(frames: list[Any], marker: str, kind: str = "fallback") -> None:
+    """Write the frames collected so far. Never raises into the stream.
+
+    Each `kind` gets its own quota so one class of capture cannot starve the other.
+    """
     try:
         DUMP_DIR.mkdir(parents=True, exist_ok=True)
-        if len(list(DUMP_DIR.glob("fallback_*.json"))) >= MAX_DUMPS:
+        if len(list(DUMP_DIR.glob(f"{kind}_*.json"))) >= MAX_DUMPS:
             return
 
-        path = DUMP_DIR / f"fallback_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.json"
+        path = DUMP_DIR / f"{kind}_{time.strftime('%Y%m%d-%H%M%S')}_{os.getpid()}.json"
         payload = json.dumps(
             {
                 "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -69,7 +78,7 @@ def _dump(frames: list[Any], marker: str) -> None:
         if len(payload.encode("utf-8")) > MAX_DUMP_BYTES:
             payload = payload[: MAX_DUMP_BYTES // 2] + '\n… truncated …\n"}'
         path.write_text(payload, encoding="utf-8")
-        logger.warning(f"Fallback reply detected ({marker!r}); raw frames written to {path}")
+        logger.warning(f"{kind} capture ({marker!r}); raw frames written to {path}")
     except Exception as exc:  # diagnosis must never break a reply
         logger.debug(f"Could not write fallback dump: {exc}")
 
@@ -86,19 +95,21 @@ class CapturingFrameParser(ORIGINAL_PARSER):
         super().__init__()
         self._captured: list[Any] = []
         self._dumped = False
+        self._widget_dumped = False
 
     def _observe(self, frames: list[Any]) -> None:
         if not frames:
             return
         try:
             self._captured.extend(frames)
-            if self._dumped:
-                return
             # Only the frames from this call are scanned, so the cost stays linear.
-            match = FALLBACK_MARKERS.search(str(frames))
-            if match:
+            blob = str(frames)
+            if not self._dumped and (match := FALLBACK_MARKERS.search(blob)):
                 self._dumped = True
-                _dump(self._captured, match.group(0))
+                _dump(self._captured, match.group(0), "fallback")
+            if not self._widget_dumped and WIDGET_MARKER.search(blob):
+                self._widget_dumped = True
+                _dump(self._captured, "GenerateWidget", "widget")
         except Exception as exc:
             logger.debug(f"Frame capture skipped: {exc}")
 

@@ -72,6 +72,14 @@ _install_frame_capture()
 # it has to be dropped here, on every path that produces visible text.
 FOLLOWUP_TAG_RE = re.compile(r"<FollowUp\b[^>]*/>")
 
+# `<GenerateWidget …>{spec}</GenerateWidget>` is the web UI's interactive-component block.
+# The spec inside is a *prompt for a renderer* ("Create an interactive tactical map…"), not
+# the rendered thing, and the render happens in Google's frontend -- so over the reverse API
+# there is nothing to run. Dropping it silently would leave the reply with an unexplained
+# hole, so it is replaced by a line saying what was there.
+WIDGET_BLOCK_RE = re.compile(r"<GenerateWidget\b.*?</GenerateWidget>", re.DOTALL)
+WIDGET_PLACEHOLDER = "[交互式组件：需在 Gemini 网页端查看]"  # noqa: RUF001
+
 MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_REDIRECTS = 5
 REMOTE_URL_SCHEMES = {"http", "https"}
@@ -1327,6 +1335,7 @@ def process_llm_output(
 
     raw_text = ARTIFACT_URL_RE.sub("", raw_text)
     raw_text = FOLLOWUP_TAG_RE.sub("", raw_text)
+    raw_text = WIDGET_BLOCK_RE.sub(WIDGET_PLACEHOLDER, raw_text)
     visible_output, tool_calls = extract_tool_calls(raw_text)
     if tool_calls:
         logger.debug(f"Detected {len(tool_calls)} tool call(s) in model output.")
