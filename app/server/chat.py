@@ -94,7 +94,7 @@ from app.utils.helper import (
     process_llm_output,
     serialize_tool_choice_for_response,
     serialize_tools_for_response,
-    strip_local_media_links,
+    strip_media_markup,
     strip_system_hints,
     validate_json_schema,
 )
@@ -1435,15 +1435,29 @@ _API_ERROR_CODE_RE = re.compile(r"Unknown API error code: (\d+)")
 # chars; the false positives collected (a self-introduction, a follow-ups JSON) were 88-293
 # chars and carried real content after the phrase.
 _REFUSAL_TEXT_RE = re.compile(
-    r"^(?:我(?:只是|是|就是)?一?个?[^，。！？\n]{0,12}(?:语言模型|文本模型|文本\s*AI|AI\s*模型)"  # noqa: RUF001
-    r"|身为一个[^，。！？\n]{0,12}(?:模型|AI)"  # noqa: RUF001
+    # 无法提供…，因为我只是一个语言模型 -- the noun sits after a comma, so the class cannot  # noqa: RUF003
+    # exclude punctuation or it never reaches it.
+    r"^(?:我(?:只是|是|就是)?一?个?[^\n]{0,30}?(?:语言模型|文本模型|文本\s*AI|AI\s*模型)"
+    r"|身为一个[^\n]{0,20}?(?:模型|AI)"
     r"|由于程序代码的局限"
     r"|I'?m (?:just )?an? (?:large )?(?:language|text) (?:model|AI)"
-    r"|I seem to be encountering an error"
-    r"|I encountered an error)",
+    r"|I(?:'m| am)?\s*(?:seem to be\s+)?(?:having a hard time|encountering an error"
+    r"|encountered an error)"
+    r"|Sorry, something went wrong)",
     re.IGNORECASE,
 )
-_REFUSAL_MAX_CHARS = 80
+# "I'm having a hard time fulfilling your request. Can I help you with something else?"
+# is 82 characters on its own, so 80 cut off a real refusal.
+_REFUSAL_MAX_CHARS = 120
+
+# Matching the sentence shape alone is not enough once the pattern is allowed to span a
+# comma: "我是 Gemini，由 Google 训练的大型语言模型。关于…我都可以帮你。" fits it and is the  # noqa: RUF003
+# opposite of a refusal. A refusal always also says it cannot do the thing.
+_REFUSAL_INABILITY_RE = re.compile(
+    r"无法|不能|没法|没办法|超出|帮不上|帮不了|局限|理解不了"
+    r"|can'?t|cannot|unable|not able|hard time|went wrong|error",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_refusal(output: ModelOutput) -> bool:
@@ -1451,14 +1465,14 @@ def _looks_like_refusal(output: ModelOutput) -> bool:
     # An attached image turns a 20-character refusal into a 333-character string; measure the
     # prose, not the markup. Observed live: "身为一个语言模型，我没办法提供这方面的帮助。"  # noqa: RUF003
     # followed by an image link sailed past the length check and was never resent.
-    text = strip_local_media_links((output.text or "").strip()).strip()
+    text = strip_media_markup((output.text or "").strip()).strip()
     if not text or len(text) > _REFUSAL_MAX_CHARS:
         return False
     # thoughts == 0 is the other failure mode: refused before generating anything. Those
     # come back refused again, so resending only burns quota.
     if not (output.thoughts or "").strip():
         return False
-    return bool(_REFUSAL_TEXT_RE.match(text))
+    return bool(_REFUSAL_TEXT_RE.match(text)) and bool(_REFUSAL_INABILITY_RE.search(text))
 
 
 def _transient_api_error_code(exc: APIError) -> int | None:

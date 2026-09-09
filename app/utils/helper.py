@@ -125,6 +125,18 @@ def strip_reasoning_blocks(text: str) -> str:
     return REASONING_BLOCK_RE.sub("", text).strip()
 
 
+def strip_media_markup(text: str) -> str:
+    """Remove media markup outright, for measuring prose length rather than for display.
+
+    `strip_local_media_links` leaves a "[generated image]" marker so the reader knows an
+    image was there. Two of those add 34 characters, which was enough to push a 58-character
+    refusal past the length cap that decides whether to resend.
+    """
+    if not text or "/media/" not in text:
+        return text
+    return LOCAL_MEDIA_IMAGE_RE.sub("", LOCAL_MEDIA_LINK_RE.sub("", text)).strip()
+
+
 def strip_local_media_links(text: str) -> str:
     """Swap our own media URLs for a plain marker before the text goes back to Google."""
     if not text or "/media/" not in text:
