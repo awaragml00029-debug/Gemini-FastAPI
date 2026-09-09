@@ -41,6 +41,7 @@ from app.models import (
     ToolChoiceTypes,
 )
 from app.utils import g_config
+from app.utils.raw_capture import install as _install_frame_capture
 
 MAX_REMOTE_FETCH_BYTES = 20 * 1024 * 1024
 
@@ -59,6 +60,17 @@ ARTIFACT_URL_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+[\w-]+\n
 # replaced at the source. client.py binds the name at import time, hence both targets.
 _gemini_client.ARTIFACTS_RE = ARTIFACT_URL_RE
 _gemini_constants.ARTIFACTS_RE = ARTIFACT_URL_RE
+
+# Diagnosis for the ~12-16% of replies that come back as a canned refusal or error while
+# the reasoning shows a completed answer. Swaps in a frame parser that keeps Google's raw
+# frames and writes them out on a hit. Behaviour is unchanged; GEMINI_DUMP_FALLBACK=0 opts out.
+_install_frame_capture()
+
+# Gemini's web UI renders `<FollowUp label="..." query="..."/>` as a suggested-question
+# button. The reverse API hands us the raw tag instead, so it lands verbatim at the end of
+# the reply. `FollowUp` appears nowhere in gemini_webapi, so nothing upstream strips it --
+# it has to be dropped here, on every path that produces visible text.
+FOLLOWUP_TAG_RE = re.compile(r"<FollowUp\b[^>]*/>")
 
 MAX_REMOTE_MEDIA_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_REDIRECTS = 5
@@ -267,11 +279,21 @@ STREAM_FLUSH_TAIL_RE = re.compile(
 )
 
 
+# Plain labels carry the same role information without imitating a control format. Captured
+# live on 2026-09-09: with ChatML tags the model reasons about an "injected system prompt"
+# wrapped in "fake tokens" that "simulate a system message", then refuses.
+PLAIN_ROLE_LABELS = {"user": "User", "assistant": "Assistant", "system": "System", "tool": "Tool"}
+
+
 def add_tag(role: str, content: str, unclose: bool = False) -> str:
-    """Surround content with ChatML role tags."""
+    """Surround content with role markers -- ChatML or plain labels, per config."""
     if role not in VALID_TAG_ROLES:
         logger.warning(f"Unknown role: {role}, returning content without tags")
         return content
+
+    if not g_config.gemini.chatml_tags:
+        label = PLAIN_ROLE_LABELS[role]
+        return f"{label}:" if unclose else f"{label}: {content}"
 
     return f"<|im_start|>{role}\n{content}" + ("" if unclose else "\n<|im_end|>")
 
@@ -1304,6 +1326,7 @@ def process_llm_output(
         thoughts = thoughts.strip()
 
     raw_text = ARTIFACT_URL_RE.sub("", raw_text)
+    raw_text = FOLLOWUP_TAG_RE.sub("", raw_text)
     visible_output, tool_calls = extract_tool_calls(raw_text)
     if tool_calls:
         logger.debug(f"Detected {len(tool_calls)} tool call(s) in model output.")

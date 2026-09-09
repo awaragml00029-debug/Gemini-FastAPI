@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import re
 import reprlib
 import time
 import uuid
@@ -16,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from gemini_webapi import ModelOutput
 from gemini_webapi.client import ChatSession
-from gemini_webapi.exceptions import ModelInvalidError
+from gemini_webapi.exceptions import APIError, ModelInvalidError
 from gemini_webapi.types.image import GeneratedImage, Image
 from gemini_webapi.types.video import GeneratedMedia, GeneratedVideo
 from loguru import logger
@@ -70,6 +71,7 @@ from app.utils import g_config
 from app.utils.config import ChatMode
 from app.utils.helper import (
     ARTIFACT_URL_RE,
+    FOLLOWUP_TAG_RE,
     SCHEMA_ADHERENCE_PROMPT,
     STREAM_FLUSH_TAIL_RE,
     STREAM_MASTER_RE,
@@ -1391,6 +1393,23 @@ async def _send_and_await_first_chunk(
     return _restream(first, generator)
 
 
+# Google's own web UI surfaces 1097 and 1155 as transient "Something went wrong" failures,
+# but gemini_webapi only enumerates 1013/1037/1050/1052/1060 in its `ErrorCode`, so these two
+# fall through its catch-all and are raised with no retry at all. Resending usually works.
+_TRANSIENT_API_ERROR_CODES = frozenset({1097, 1155})
+_TRANSIENT_RETRY_ATTEMPTS = 2
+_API_ERROR_CODE_RE = re.compile(r"Unknown API error code: (\d+)")
+
+
+def _transient_api_error_code(exc: APIError) -> int | None:
+    """The Google-side error code carried by an APIError, when it is one worth resending."""
+    match = _API_ERROR_CODE_RE.search(str(exc))
+    if not match:
+        return None
+    code = int(match.group(1))
+    return code if code in _TRANSIENT_API_ERROR_CODES else None
+
+
 async def _send_with_internal_fallback(
     *,
     pool: GeminiClientPool,
@@ -1412,48 +1431,62 @@ async def _send_with_internal_fallback(
     where Google reports a rejected chat, so the retry happens before any response is committed
     to the client. The cost is that response headers wait for Google's first chunk.
     """
-    try:
-        async with client.request_scope():
-            output = await _send_and_await_first_chunk(
-                session, current_input, files=files, stream=stream, temporary=temporary
-            )
-        return output, session, client
-    except ModelInvalidError:
-        if stored_conversation is None:
-            raise
-
-        # Drop the dead metadata so the next request does not rediscover and re-fail on it.
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            if db.evict(stored_conversation):
-                logger.info("Evicted stale conversation metadata after Google rejected it.")
-        except Exception as evict_exc:
-            logger.warning(f"Failed to evict stale conversation metadata: {evict_exc}")
-
-        logger.warning(
-            "Metadata-backed chat reuse failed; retrying with internal history replay in a fresh chat."
-        )
-        fallback_input, fallback_files = await _process_conversation_for_client(
-            client, full_prepared_messages, tmp_dir
-        )
-        # Built before acquiring, so a replay that needs an upload is not handed to a guest.
-        fallback_client = await pool.acquire(
-            require_account=bool(fallback_files)
-            or len(fallback_input) > _effective_max_chars_per_request(temporary)
-        )
-        fallback_session = fallback_client.start_chat(
-            model=fallback_client.usable_model(resolved_model)
-        )
-        # Keep the caller's streaming mode: the endpoints reject a ModelOutput when the client
-        # asked for a stream, so downgrading here would turn a recovery into a 502.
-        async with fallback_client.request_scope():
-            output = await _send_and_await_first_chunk(
-                fallback_session,
-                fallback_input,
-                files=list(fallback_files),
-                stream=stream,
-                temporary=temporary,
+            async with client.request_scope():
+                output = await _send_and_await_first_chunk(
+                    session, current_input, files=files, stream=stream, temporary=temporary
+                )
+            return output, session, client
+        except APIError as exc:
+            code = _transient_api_error_code(exc)
+            if code is None or attempt >= _TRANSIENT_RETRY_ATTEMPTS:
+                raise
+            # Safe to resend: the first chunk is pulled inside, so nothing has been committed to
+            # the client yet, and the library rolls the chat metadata back when a turn produced
+            # no text. Same session on purpose -- the chat is fine, Google's backend blipped.
+            logger.warning(
+                f"Google returned transient error {code}; resending "
+                f"(attempt {attempt + 1}/{_TRANSIENT_RETRY_ATTEMPTS})."
             )
-        return output, fallback_session, fallback_client
+        except ModelInvalidError:
+            if stored_conversation is None:
+                raise
+
+            # Drop the dead metadata so the next request does not rediscover and re-fail on it.
+            try:
+                if db.evict(stored_conversation):
+                    logger.info("Evicted stale conversation metadata after Google rejected it.")
+            except Exception as evict_exc:
+                logger.warning(f"Failed to evict stale conversation metadata: {evict_exc}")
+
+            logger.warning(
+                "Metadata-backed chat reuse failed; retrying with internal history replay in a fresh chat."
+            )
+            fallback_input, fallback_files = await _process_conversation_for_client(
+                client, full_prepared_messages, tmp_dir
+            )
+            # Built before acquiring, so a replay that needs an upload is not handed to a guest.
+            fallback_client = await pool.acquire(
+                require_account=bool(fallback_files)
+                or len(fallback_input) > _effective_max_chars_per_request(temporary)
+            )
+            fallback_session = fallback_client.start_chat(
+                model=fallback_client.usable_model(resolved_model)
+            )
+            # Keep the caller's streaming mode: the endpoints reject a ModelOutput when the client
+            # asked for a stream, so downgrading here would turn a recovery into a 502.
+            async with fallback_client.request_scope():
+                output = await _send_and_await_first_chunk(
+                    fallback_session,
+                    fallback_input,
+                    files=list(fallback_files),
+                    stream=stream,
+                    temporary=temporary,
+                )
+            return output, fallback_session, fallback_client
 
 
 _ARTIFACT_HOSTS = ("http://googleusercontent.com/", "https://googleusercontent.com/")
@@ -1475,6 +1508,26 @@ def _artifact_holdback_len(text: str) -> int:
     return 0
 
 
+_FOLLOWUP_PREFIX = "<FollowUp"
+
+
+def _followup_holdback_len(text: str) -> int:
+    """Length of the trailing run that could still become a `<FollowUp .../>` tag.
+
+    The tag arrives split across chunks, so a bare `<Follo` at the buffer edge is not yet
+    strippable and would escape character by character. Withhold anything from a possible
+    tag start onwards until it either closes (and is dropped) or the stream ends.
+    """
+    idx = text.rfind("<")
+    if idx == -1:
+        return 0
+    tail = text[idx:]
+    # A closed tag was already removed by the sub, so a surviving `<FollowUp` is still open.
+    if tail.startswith(_FOLLOWUP_PREFIX) or _FOLLOWUP_PREFIX.startswith(tail):
+        return len(text) - idx
+    return 0
+
+
 class StreamingOutputFilter:
     """
     Filter to suppress technical protocol markers, tool calls, and system hints from the stream.
@@ -1486,6 +1539,7 @@ class StreamingOutputFilter:
         self.stack = ["NORMAL"]
         self.current_role = ""
         self.artifact_hold = ""
+        self.followup_hold = ""
 
     def _filter_artifacts(self, text: str) -> str:
         """Drop complete artifact URLs and withhold anything that might still become one."""
@@ -1506,6 +1560,17 @@ class StreamingOutputFilter:
             self.artifact_hold = buf[len(buf) - keep :]
             return buf[: len(buf) - keep]
         self.artifact_hold = ""
+        return buf
+
+    def _filter_followup(self, text: str) -> str:
+        """Drop complete FollowUp tags and withhold anything that might still become one."""
+        buf = self.followup_hold + text
+        buf = FOLLOWUP_TAG_RE.sub("", buf)
+        keep = _followup_holdback_len(buf)
+        if keep:
+            self.followup_hold = buf[len(buf) - keep :]
+            return buf[: len(buf) - keep]
+        self.followup_hold = ""
         return buf
 
     @property
@@ -1583,7 +1648,7 @@ class StreamingOutputFilter:
 
             self.buffer = self.buffer[end:]
 
-        return self._filter_artifacts("".join(output))
+        return self._filter_followup(self._filter_artifacts("".join(output)))
 
     def flush(self) -> str:
         """Release remaining buffer content and perform final cleanup at stream end."""
@@ -1598,6 +1663,8 @@ class StreamingOutputFilter:
         self.current_role = ""
         res = ARTIFACT_URL_RE.sub("", self.artifact_hold + res)
         self.artifact_hold = ""
+        res = FOLLOWUP_TAG_RE.sub("", self.followup_hold + res)
+        self.followup_hold = ""
         return strip_system_hints(res)
 
 
