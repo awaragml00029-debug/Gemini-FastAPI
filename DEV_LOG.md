@@ -1,5 +1,54 @@
 # 开发日志
 
+## 2026-09-09（三）图片慢的真因、widget 块、以及「不做拒答重试」的决定
+
+### 图片慢：4 次串行代理往返，不是我们的处理慢
+
+实测两次带图请求（日志时间线，非推断）：
+
+| Google 生成 | 媒体处理 | 媒体占比 |
+|---|---|---|
+| 19.6s | **30.8s** | 61% |
+| 19.5s | **19.8s** | 50% |
+
+媒体处理比生成还慢。根因在 `gemini_webapi/types/image.py`，`full_size=True` 的路径：
+
+```python
+original_url = await self.client_ref._get_full_size_image(...)   # ① 请求
+response = await req_client.get(f"{original_url}=d-I?alr=yes")   # ② 请求
+response = await req_client.get(response.text)                   # ③ 请求
+# 然后 ④ 才下载图片本体
+```
+
+**4 次串行网络往返，每次都走账号的 SOCKS 代理**，前三次纯粹在解析真实 URL。`full_size=False` 直接给 URL 加 `=s1024-rj`，**1 次请求**搞定。而我们此前把 `full_size=True` 写死在 `chat.py`。
+
+改为配置项 `image_full_size`，**默认 false**（`CONFIG_GEMINI__IMAGE_FULL_SIZE=true` 换回原图画质）。同时 `read_bytes`/`base64`/`sha256` 移进 `asyncio.to_thread` —— 几 MB 只有几十毫秒，不是本次主因，但它跑在请求循环里会拖住其他在途流。
+
+新增分段日志 `Image ready: download=Xs encode=Ys full_size=B`，下次不必再靠读代码推断。
+
+### `<GenerateWidget>` 块：能剥不能救
+
+`<GenerateWidget …>{spec}</GenerateWidget>` 里装的是**给渲染器的提示词**（"Create an interactive tactical map…"），渲染发生在 Google 前端 —— 逆向 API 拿到的是图纸不是房子，**运行不了**。`GenerateWidget` 在我们代码和 gemini_webapi 里都零命中，和 FollowUp 一样是原样漏出来的。
+
+改为折叠成一行占位说明（直接删会让回复出现无法解释的缺口）。流式实现比 FollowUp 难：块有几 KB、跨很多 chunk，开闭标记都会被切断。
+
+**一个被测试抓住的 bug**：起初用 `buf.find("<GenerateWidget")` 判定块起始，于是 `<GenerateWidgetX>` 也命中，然后一路吞到流末尾。已加分隔符校验（后面必须是空白或 `>`），并在 `test_widget_block.py` 里留了回归用例。非流式正则因为有 `\b` 边界，本来就没这个问题。
+
+`component_placeholder_id` 暗示响应里**可能**有对应内容块（未证实）。为验证，帧捕获新增 widget 类型，与 fallback 各自 30 个配额，互不挤占。
+
+### 决定：不做拒答自动重试
+
+日志证实**重试有效**（同样内容，被拒后几秒重发就能过）—— 说明 Google 是每次请求独立做随机安全评分，不是内容拉黑：
+
+```
+03:34:09 兜底 → 03:34:10 重试 → 03:34:30 又兜底 → 03:34:34 重试 → 03:35:04 起连续成功
+03:35:55 兜底 → 03:36:35 重试 → 03:37:05 成功
+```
+
+判据也有 25 个 dump 撑着（整句匹配 + `len(text)<80` + `thoughts>0`，能挡掉全部已知误报）。
+
+**但用户决定不做。** 记录在此，免得以后有人看到 12~16% 的拒答率又把这事重开一遍：技术上可行、判据齐备、代价约 5% 额度，是**产品决定不做**，不是做不了。
+
 ## 2026-09-09（续）兜底回复定性：与请求内容无关，提示词假设被实验证伪
 
 ### 被证伪的假设：注入的工具提示词触发了风控

@@ -127,6 +127,15 @@ class GeminiConfig(BaseModel):
         default=False,
         description="Enable Gemini extended thinking mode for message generation",
     )
+    image_full_size: bool = Field(
+        default=False,
+        description=(
+            "Download generated images at original resolution. The library resolves the "
+            "full-size URL through three chained requests before the download itself, and "
+            "every one of them goes through the account's SOCKS proxy -- measured at 20-31s "
+            "of media processing per reply. False takes the single-request 1024px path."
+        ),
+    )
     chatml_tags: bool = Field(
         default=False,
         description=(
