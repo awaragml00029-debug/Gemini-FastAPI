@@ -89,7 +89,13 @@ WIDGET_BLOCK_RE = re.compile(r"<GenerateWidget\b.*?</GenerateWidget>", re.DOTALL
 LOCAL_MEDIA_LINK_RE = re.compile(
     r"\[!\[[^\]]*\]\([^)\s]*?/media/[^)\s]*?\)\]\([^)\s]*?/media/[^)\s]*?\)"
 )
-LOCAL_MEDIA_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)\s]*?/media/[^)\s]*?\)")
+# The library titles images "[Image 1]" (client.py: title=f"[Image {idx+1}]"), so the alt
+# text carries its own brackets and `[^\]]*` stopped at the inner one -- the whole link then
+# survived, which is how a 20-character refusal reached 333 characters and slipped past the
+# length check that decides whether to resend.
+LOCAL_MEDIA_IMAGE_RE = re.compile(r"!\[([^\n]*?)\]\([^)\s]*?/media/[^)\s]*?\)")
+# "Image", "[Image 1]", "image 2" -- an index, not a description worth keeping.
+INDEXED_IMAGE_TITLE_RE = re.compile(r"^\[?\s*image\s*\d*\s*\]?$", re.IGNORECASE)
 
 
 # Our own media is titled with its filename (`![img_<uuid>.jpg](…)`), so "keep the title,
@@ -128,7 +134,11 @@ def strip_local_media_links(text: str) -> str:
 
     def _image(match: re.Match[str]) -> str:
         title = (match.group(1) or "").strip()
-        if title and title.lower() != "image" and not GENERATED_MEDIA_NAME_RE.match(title):
+        if (
+            title
+            and not INDEXED_IMAGE_TITLE_RE.match(title)
+            and not GENERATED_MEDIA_NAME_RE.match(title)
+        ):
             return f"[generated image: {title}]"
         return "[generated image]"
 

@@ -127,6 +127,17 @@ class GeminiConfig(BaseModel):
         default=False,
         description="Enable Gemini extended thinking mode for message generation",
     )
+    refusal_retry_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description=(
+            "How many times to send a request whose reply came back as a stock refusal. "
+            "Google swaps the finished answer at the output layer, so drawing again usually "
+            "wins; 1 disables the retry, which is what an A/B measurement of the raw refusal "
+            "rate needs."
+        ),
+    )
     log_full_prompt: bool = Field(
         default=True,
         description=(

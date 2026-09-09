@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import random
 import re
 import reprlib
 import time
@@ -93,6 +94,7 @@ from app.utils.helper import (
     process_llm_output,
     serialize_tool_choice_for_response,
     serialize_tools_for_response,
+    strip_local_media_links,
     strip_system_hints,
     validate_json_schema,
 )
@@ -1424,6 +1426,41 @@ _TRANSIENT_RETRY_ATTEMPTS = 2
 _API_ERROR_CODE_RE = re.compile(r"Unknown API error code: (\d+)")
 
 
+# Google replaces a finished answer with a stock refusal at the output layer. Captured
+# live: a request about Austin MN came back with 1MB of real data -- 27 maps_local calls,
+# "Hormel" 296 times, "SPAM" 145 -- and a final text of "我只是一个文本 AI". The model had
+# the answer; only the rendered text was swapped. Resending draws again and usually wins.
+#
+# Anchored, not substring: the whole reply must *be* the refusal. Real refusals ran 20-31
+# chars; the false positives collected (a self-introduction, a follow-ups JSON) were 88-293
+# chars and carried real content after the phrase.
+_REFUSAL_TEXT_RE = re.compile(
+    r"^(?:我(?:只是|是|就是)?一?个?[^，。！？\n]{0,12}(?:语言模型|文本模型|文本\s*AI|AI\s*模型)"  # noqa: RUF001
+    r"|身为一个[^，。！？\n]{0,12}(?:模型|AI)"  # noqa: RUF001
+    r"|由于程序代码的局限"
+    r"|I'?m (?:just )?an? (?:large )?(?:language|text) (?:model|AI)"
+    r"|I seem to be encountering an error"
+    r"|I encountered an error)",
+    re.IGNORECASE,
+)
+_REFUSAL_MAX_CHARS = 80
+
+
+def _looks_like_refusal(output: ModelOutput) -> bool:
+    """Whether a finished reply is a stock refusal standing in for a real answer."""
+    # An attached image turns a 20-character refusal into a 333-character string; measure the
+    # prose, not the markup. Observed live: "身为一个语言模型，我没办法提供这方面的帮助。"  # noqa: RUF003
+    # followed by an image link sailed past the length check and was never resent.
+    text = strip_local_media_links((output.text or "").strip()).strip()
+    if not text or len(text) > _REFUSAL_MAX_CHARS:
+        return False
+    # thoughts == 0 is the other failure mode: refused before generating anything. Those
+    # come back refused again, so resending only burns quota.
+    if not (output.thoughts or "").strip():
+        return False
+    return bool(_REFUSAL_TEXT_RE.match(text))
+
+
 def _transient_api_error_code(exc: APIError) -> int | None:
     """The Google-side error code carried by an APIError, when it is one worth resending."""
     match = _API_ERROR_CODE_RE.search(str(exc))
@@ -1462,6 +1499,23 @@ async def _send_with_internal_fallback(
                 output = await _send_and_await_first_chunk(
                     session, current_input, files=files, stream=stream, temporary=temporary
                 )
+            if (
+                not stream
+                and attempt < g_config.gemini.refusal_retry_attempts
+                and isinstance(output, ModelOutput)
+                and _looks_like_refusal(output)
+            ):
+                # Streaming cannot use this: the text only arrives in the final frames, by
+                # which point it has already been pushed to the client.
+                delay = random.uniform(1.0, 2.0)
+                logger.warning(
+                    f"Reply came back as a stock refusal ({(output.text or '')[:24]!r}); "
+                    f"resending in {delay:.1f}s "
+                    f"(attempt {attempt + 1}/{g_config.gemini.refusal_retry_attempts})."
+                )
+                await asyncio.sleep(delay)
+                continue
+
             return output, session, client
         except APIError as exc:
             code = _transient_api_error_code(exc)
@@ -1470,10 +1524,14 @@ async def _send_with_internal_fallback(
             # Safe to resend: the first chunk is pulled inside, so nothing has been committed to
             # the client yet, and the library rolls the chat metadata back when a turn produced
             # no text. Same session on purpose -- the chat is fine, Google's backend blipped.
+            # Backoff with jitter: resending 0s after Google just failed is the one shape
+            # worth avoiding if the failure was rate-related.
+            delay = random.uniform(1.0, 2.0)
             logger.warning(
-                f"Google returned transient error {code}; resending "
+                f"Google returned transient error {code}; resending in {delay:.1f}s "
                 f"(attempt {attempt + 1}/{_TRANSIENT_RETRY_ATTEMPTS})."
             )
+            await asyncio.sleep(delay)
         except ModelInvalidError:
             if stored_conversation is None:
                 raise

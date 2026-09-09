@@ -56,6 +56,7 @@ WIDGET_MARKER = re.compile(r"GenerateWidget")
 DUMP_DIR = Path(os.environ.get("GEMINI_DUMP_DIR", "/app/data/debug_dumps"))
 MAX_DUMPS = 100
 MAX_DUMP_BYTES = 2 * 1024 * 1024
+_TRUNCATED_FRAME_CHARS = 4000
 
 
 # Warn once per kind rather than on every hit: a full quota is worth knowing about, a
@@ -97,7 +98,26 @@ def _dump(frames: list[Any], marker: str, kind: str = "fallback") -> None:
             default=str,
         )
         if len(payload.encode("utf-8")) > MAX_DUMP_BYTES:
-            payload = payload[: MAX_DUMP_BYTES // 2] + '\n… truncated …\n"}'
+            # Cutting a JSON document in half leaves something no parser will read: a 1MB
+            # maps_local capture had to be analysed with regexes because of exactly that.
+            # Keep a bounded head and tail as plain strings so the file always parses.
+            def _preview(items: list[Any]) -> list[str]:
+                return [str(item)[:_TRUNCATED_FRAME_CHARS] for item in items]
+
+            payload = json.dumps(
+                {
+                    "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "marker_hit": marker,
+                    "frame_count": len(frames),
+                    "truncated": True,
+                    "note": f"payload exceeded {MAX_DUMP_BYTES} bytes; frames abridged",
+                    "frames_head": _preview(frames[:3]),
+                    "frames_tail": _preview(frames[-3:]),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
         path.write_text(payload, encoding="utf-8")
         logger.warning(f"{kind} capture ({marker!r}); raw frames written to {path}")
     except Exception as exc:  # diagnosis must never break a reply
