@@ -20,6 +20,7 @@ from app.utils.helper import (
     save_file_to_tempfile,
     save_url_to_tempfile,
     strip_local_media_links,
+    strip_reasoning_blocks,
 )
 from app.utils.raw_capture import dump_prompt
 
@@ -431,7 +432,7 @@ class GeminiClientWrapper(GeminiClient):
             text_fragments.append(tool_section)
 
         model_input = "\n".join(fragment for fragment in text_fragments if fragment is not None)
-        model_input = strip_local_media_links(model_input)
+        model_input = strip_reasoning_blocks(strip_local_media_links(model_input))
 
         if (model_input or message.role == "tool") and tagged:
             model_input = add_tag(message.role, model_input)

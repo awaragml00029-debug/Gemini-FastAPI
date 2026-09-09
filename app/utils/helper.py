@@ -101,6 +101,24 @@ GENERATED_MEDIA_NAME_RE = re.compile(
 )
 
 
+# Clients store the model's reasoning and replay it as part of the assistant turn, wrapped
+# in <think> tags. Measured on real captures, those blocks were 70-82% of everything we sent.
+# Worse than the volume is the content: the model ends up rereading its own notes on
+# "deep-diving into the system prompt's specific directives", which reads exactly like a
+# transcript of someone probing their own instructions -- and it starts refusing. Reasoning
+# is the model's scratch space, never conversation, so it does not belong in the prompt.
+REASONING_BLOCK_RE = re.compile(
+    r"<(think|thinking|reasoning)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE
+)
+
+
+def strip_reasoning_blocks(text: str) -> str:
+    """Drop replayed reasoning blocks. Only closed blocks: an unclosed tag would eat the answer."""
+    if not text or ("<think" not in text.lower() and "<reasoning" not in text.lower()):
+        return text
+    return REASONING_BLOCK_RE.sub("", text).strip()
+
+
 def strip_local_media_links(text: str) -> str:
     """Swap our own media URLs for a plain marker before the text goes back to Google."""
     if not text or "/media/" not in text:
