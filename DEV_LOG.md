@@ -1,5 +1,180 @@
 # 开发日志
 
+## 2026-09-09（续）兜底回复定性：与请求内容无关，提示词假设被实验证伪
+
+### 被证伪的假设：注入的工具提示词触发了风控
+
+用户提出「自带的提示词风格触发风控」，理由是发 `hello world` 都不回答。这个假设**看起来很有说服力**：`build_tool_prompt` 注入的 `SYSTEM INTERFACE: ...`、`REQUIRED SYNTAX, reproduce literally`、`Emit the block and nothing else. No preamble or commentary.` 加上 `[ToolCalls]` 私有标记，形态上确实很像提示词注入攻击，而 `TOOL_WRAP_HINT`（358 字符）还会被 `append_tool_hint_to_last_user_message` **追加进用户消息本身**。
+
+我一度据此写了一整套推理。**A/B 实测把它推翻了**：
+
+| 组 | 场景 | 结果 |
+|---|---|---|
+| A | `hello world`，**无** tools（不触发任何注入） | 8 次里 1 次兜底 |
+| B | `hello world`，**带** tools（注入 533 字符） | 8 次里 1 次兜底 |
+
+**两组完全一样。** 注入不是变量。
+
+### ⚠️ 上面这个「证伪」是错的 —— A/B 实验设计有缺陷（当日晚些时候推翻）
+
+用户贴回一次真实对话：模型的**思考过程被暴露出来**，原文写着：
+
+> "dissecting the **injected system prompt**, observing how the user framed their instructions within **fake tokens**. The markup is intended to **simulate a system message**"
+
+然后回复：「请恕我爱莫能助，我只是一个语言模型，不能理解或回复你的这个问题。」
+
+**模型把我们的 ChatML 包装当成了伪造的系统消息，判定为提示词注入，然后拒答。** 包装出处 `helper.py:288`：
+
+```python
+return f"<|im_start|>{role}\n{content}" + ("" if unclose else "\n<|im_end|>")
+```
+
+这也解释了裸 `hello world`（11 字符）为什么日志里是 `input_chars=62`。
+
+**我那个 A/B 实验为什么没测出来**：`<|im_start|>` 包装是**无条件**加的，A 组和 B 组**都带**。我只变了「工具提示词」这一个变量，真正的嫌疑犯在两组里都在场，所以两组表现一致 —— 我却据此宣布「注入不是变量」。**对照组根本没设对。**
+
+**证据等级**：这是用户的**一次实测观察**（模型思考意外暴露），不是我跑的对照实验。方向性很强，但「ChatML 包装是根因」尚未被对照实验证实。
+
+**要验证它，正确的对照组是**：一组带 `<|im_start|>` 包装、一组完全裸发（单条 user 消息不加任何标记），各跑 30+ 轮比失败率。本轮未做。
+
+### 立住的结论：失败率与请求内容无关
+
+三轮独立实验：
+
+| 实验 | 场景 | 失败率 |
+|---|---|---|
+| 19 次 | 中文长回答，无 tools | 3/19 ≈ 16% |
+| A 组 8 次 | `hello world`，无 tools | 1/8 = 12.5% |
+| B 组 8 次 | `hello world`，带 tools | 1/8 = 12.5% |
+
+连 `hello world` 这种无害到极点、零注入的请求都稳定翻车。**提示词、工具定义、请求长度、语言全都不是变量**，剩下的解释只有 Google 侧对这批账号或这条通道存在固有失败率。
+
+### 一个之前混淆了的区分
+
+我一直把这事当「安全拒答」，但这轮抓到的是：
+
+```
+I seem to be encountering an error. Can I try something else for you?
+```
+
+这**不是拒绝，是报错**。跟之前那批「我只是一个语言模型」（能力边界拒绝）语义不同。**很可能是两种不同的失败被当成一件事在分析**，之前的 16% 里混了多少哪一种，现在说不清。
+
+### 另一条要修正的旧结论（存疑，未验证）
+
+旧记录写「tool calling: auto 约五成、required 0/10，锅在模型不在代码」。但 `required` 会额外注入 `You MUST call at least one tool this turn`。若强制指令确实更易触发拦截，那 0/10 可能是**每次都被兜底替换**，而不是模型不听话 —— 两者在「没返回 tool call」这个表象上无法区分。**本轮 A/B 只测了 auto 场景，没测 required，所以这条仍是猜测**，标注在此待验。
+
+### 部署后的客观数据（纠正一个错觉）
+
+用户反馈「修过的版本成功率提升了不少」。查日志：
+
+```
+resending 次数 : 0
+成功完成       : 12
+失败           : 0
+```
+
+**1097/1155 的重试一次都没触发过**，所以提升不可能来自它。FollowUp 剥离只影响文本整洁度、不影响成功率。**没有客观证据支持这次修复提升了成功率**，样本也太小，不认这个功劳。
+
+### 加固完整性核查：没丢，但清掉一颗上游残留的地雷
+
+用户担心「gemini-webapi 更新了，是不是我们的加固漏了什么」。三条独立证据说明**没丢**：
+
+1. **`scripts/check_deltas.sh` 39 项断言全绿** —— 这脚本就是为防上游同步冲掉加固而存在的，`All fork custom deltas intact`
+2. **孤儿函数扫描**：235 个函数定义里只有 1 个真孤儿，其余 7 个是 pydantic `@field_validator` / `@model_validator` 的框架回调假阳性
+3. **init 超时加固实测在位**：`init() → _init_with_retries → _restart_client → asyncio.wait_for(client.init(), timeout=...)`
+
+那 1 个真孤儿是上游残留：
+
+```python
+async def _init_one(self, client) -> bool:      # 零调用者
+    return await self._init_attempt(client)
+
+async def _init_attempt(self, client) -> bool:  # 零调用者（除上面那个）
+    await client.init()                          # 裸调用，没有 wait_for
+```
+
+正是 09-03 记录里写的「上游的 `_init_attempt` 三样都没有」那个版本。**当时没有危害（没人调用），但是陷阱**：谁顺手用 `_init_one` 就绕过超时，直接踩回「死账号重启卡在请求路径」那个延迟根因。已删除，删前核过全项目零引用、守卫零断言、实际路径不经过。
+
+**方法论留档**：孤儿函数扫描（定义了但全项目零调用）能查出「上游同步把调用点改回去了」这一种丢失形态，但查不出「函数还在、内部代码段被覆盖」那种 —— 后者靠 `check_deltas.sh` 的断言。两者互补，都要跑。
+
+### 本轮新增：原始帧捕获（诊断，非修复）
+
+问题的根本障碍是**看不到 Google 实际返回了什么** —— 库只把最终文本交出来，中间 17~21 个 part 全丢。`app/utils/raw_capture.py` 用与 `ARTIFACTS_RE` 相同的猴子补丁手法换掉 `StreamingFrameParser`，累积当前请求的帧，命中兜底文案时把**命中前的全部帧**落盘到 `/app/data/debug_dumps/`。
+
+- 每个请求一个 parser 实例（`client.py:1552`），天然隔离，不需要 contextvar
+- 三处 patch：`client` / `utils` / `utils.parsing` —— client.py:72 在 import 时绑定了名字
+- 单请求只 dump 一次；文件数上限 30；单文件 2MB 上限
+- 全程 try/except，dump 失败只丢证据不影响回复（有测试锁定）
+- `GEMINI_DUMP_FALLBACK=0` 关闭，`GEMINI_DUMP_DIR` 改路径
+
+**这只是诊断，不改任何行为。** 拿到 dump 后要看的是：兜底文案是单帧整体替换、是第二个 candidate、还是覆盖了已有的部分文本 —— 这决定了能不能在我们这层救回来。
+
+## 2026-09-09 「跑几次就出错，特别是文字」实测定性：三个现象，两个是我们的
+
+起因：用户报「程序跑几次就有错误，特别是文字」，补充说「最常见的是回复被换成一句拒答，也有回答或思考一半直接报错的」。
+
+### 实测（真发了请求，不是读代码）
+
+直连容器 8092 发 **19 次真实对话**（11 次非流式 + 8 次流式，同一个提示词，gemini-flash，轮询 3 个账号）：
+
+| 现象 | 频次 | 定性 |
+|---|---|---|
+| 最终回复被替换成拒答文案 | 3 / 19（≈16%） | **Google 侧**，不是我们的 bug |
+| `Unknown API error code: 1097` / `1155` | 历史日志 25 次 | 库不认这两个码，直接抛、不重试 |
+| `<FollowUp .../>` 标签漏进正文 | 流式 8 次里 1 次 | **我们没剥**，全链路无人处理 |
+
+FollowUp 的出现率只能给流式的 1/8：非流式统计脚本当时只打印了 content 前 120 字，标签在末尾可能被截掉没统计到，**实际可能更高**。
+
+### 现象一：拒答替换 —— 查清了，是 Google，本轮按用户决定不动
+
+三次措辞各不相同：「我是一个语言模型，这超出了我的设计用途」/「我无法提供这方面的帮助，因为我只是一个语言模型」/「身为一个语言模型，我没办法提供这方面的帮助」。
+
+四条证据排除了「我们挑错 part / 丢了正文」：
+
+1. 三句文案在 `app/` 和容器内 `gemini_webapi` 里全都搜不到 —— 只能是服务端返回的
+2. 流式下拒答**只有 1 个 content chunk**，正常回答是 2–3 个 —— 不存在正文被我们吃掉
+3. 有一次 `reasoning_content` 长 2190 字符，模型**已经把中文答案写完了**（"擅长破解复杂密码与分子模拟等前沿难题"），最终 content 才被换成拒答 —— 替换发生在输出层
+4. 联网查证：Gemini 网页端已知行为，安全分类器后置拦截，普通网页用户同样会遇到「回答先出来几秒然后消失」
+
+我们这边**没有**「识别拒答→换账号重试」的逻辑，撞上就原样返给客户端。用户本轮明确要求不做：会多烧账号额度，且「什么算拒答」的匹配规则容易误伤模型正常自述身份的场景。
+
+### 现象二（已修）：1097 / 1155 归入可重试
+
+库的 `ErrorCode`（`constants.py:343`）只收录 1013/1037/1050/1052/1060，1097 和 1155 落到 `client.py:1608` 的 `case _` 直接 `raise`，**一次都不重试**。而 Google 自己的网页端把这两个码显示为临时性的 "Something went wrong"。
+
+`gemini-webapi` 是 PyPI 外部依赖（`pyproject.toml`，`>=2.1.1,<3`），改 site-packages 会被重建镜像冲掉，所以重试做在**我们这一层**：`chat.py:_send_with_internal_fallback` 外面套重试循环，`_transient_api_error_code()` 从异常文本里取码。
+
+在这一层重试是安全的，前提是既有的 `_send_and_await_first_chunk`：它**先拉第一个 chunk**，所以失败时响应还没提交给客户端。用同一个 session 重发（不换账号）—— chat 本身没坏，且库在 `has_generated_text` 为假时会自己回滚 chat metadata。
+
+### 现象三（已修）：`<FollowUp .../>` 标签剥离
+
+网页 UI 把 `<FollowUp label="..." query="..."/>` 渲染成追问按钮，逆向 API 拿到的是原始标签，直接透传进正文。`FollowUp` 这个词在我们代码、`gemini_webapi` 库、容器内全都搜不到 —— **全链路无人处理**。
+
+复用既有的 artifact 剥离管道，三个挂载点（覆盖 chat.py 4 处 + gemini.py 2 处全部输出路径）：
+
+- `helper.py:process_llm_output` —— 非流式
+- `StreamingOutputFilter._filter_followup` —— 流式，带跨 chunk holdback（标签会被切在两个 chunk 之间）
+- `StreamingOutputFilter.flush` —— 收尾释放
+
+### 本轮没覆盖的（重要）
+
+**流中途报错修不到。** 1097/1155 实际出现在两个位置，日志区分得很清楚：
+
+- `_send_with_split:1288` → `create_chat_completion:2944`：首 chunk 之前 —— **本次修复覆盖**
+- `generate_stream:1749` "Error during streaming"：首 chunk 之后，SSE 推到一半断 —— **覆盖不到**
+
+用户抱怨的「回答一半报错」是后者。在那个位置重试要重构 `_restream` 的结构，且 thoughts 已经推给客户端、重试会重复输出，代价和风险都高，本轮没做。
+
+出错现场的两次采样都是长输入：`text_chars=89494 / elapsed=101.641s`、`text_chars=24613 / elapsed=16.435s`。**样本只有 2 个，不足以断言「只在长输入时发生」** —— 留给下次。
+
+另：1013 已被库自己收录且文案不同（`temporary error (1013)`），不走我们这条正则，本轮按用户「只修 1097/1155」未纳入。
+
+### 验证
+
+`ruff check` / `ruff format` / `pyright`（须带 `--pythonpath .venv/bin/python`，否则它退到系统 py<3.12 报一堆假错）/ `ty` 全清。新增 `tests/test_followup_filter.py`（24 项）、`tests/test_transient_retry.py`（11 项），既有 313 项全过。
+
+测试里锁了一条**既有**行为：`flush()` 会丢掉结尾孤立的 `<`，因为 `STREAM_FLUSH_TAIL_RE`（`helper.py:264`）把它当 `<|im_start|>` 残片。与 FollowUp 无关，验证过未改动的正则本身就这样。
+
 ## 2026-09-03（下午）IP 与 TLS 指纹全面审计，外加三处加固
 
 起因：本人观察到 Google 加强风控，判据是「IP 和指纹决定这个项目能不能用」。
