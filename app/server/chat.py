@@ -1860,6 +1860,33 @@ async def _process_media_item(
 # --- Response Builders & Streaming ---
 
 
+def _delta_continues(chunk_text: str | None, sent: str) -> bool:
+    """Whether a streamed delta continues what we already sent, or the reply was swapped.
+
+    gemini_webapi computes a delta with SequenceMatcher whenever the new text is not an
+    extension of the old (`get_delta_by_fp_len`), which is right for the mid-string edits it
+    was written for and wrong for a whole-text replacement: the matcher finds some incidental
+    overlap and returns the tail after it. Observed live -- a half-written answer followed by
+    "wrong. Please try your request again.", the tail of Google's "Sorry, something went
+    wrong…" spliced onto the client's sentence.
+
+    The signal is the shared prefix, not the length: the flicker the library compensates for
+    only rewrites the tail, while a replacement differs from the first character. Length would
+    not separate them -- "Sorry, something went wrong. Please try your request again." is
+    longer than the half-written Chinese sentence it replaced.
+    """
+    if not chunk_text or not sent:
+        return True
+    if chunk_text.startswith(sent):
+        return True
+    shared = 0
+    for a, b in zip(chunk_text, sent, strict=False):
+        if a != b:
+            break
+        shared += 1
+    return shared >= len(sent) * 0.8
+
+
 def _sse_error(
     message: str, error_type: str, param: str | None = None, code: str | None = None
 ) -> str:
@@ -1957,13 +1984,19 @@ def _create_real_streaming_response(
                         )
 
                     if text_delta := chunk.text_delta:
-                        full_text += text_delta
-                        if not structured_requirement and (
-                            visible_delta := suppressor.process(text_delta)
-                        ):
-                            yield make_chunk(
-                                {"delta": {"content": visible_delta}, "finish_reason": None}
+                        if not _delta_continues(chunk.text, full_text):
+                            logger.warning(
+                                "Google replaced the reply mid-stream; dropping a spliced "
+                                f"delta ({text_delta[:40]!r})."
                             )
+                        else:
+                            full_text += text_delta
+                            if not structured_requirement and (
+                                visible_delta := suppressor.process(text_delta)
+                            ):
+                                yield make_chunk(
+                                    {"delta": {"content": visible_delta}, "finish_reason": None}
+                                )
 
                     for img in chunk.images or []:
                         if img.url and img.url not in seen_image_urls:
@@ -2339,7 +2372,13 @@ def _create_responses_real_streaming_response(
                             },
                         )
 
-                    if chunk.text_delta:
+                    spliced_delta = not _delta_continues(chunk.text, full_text)
+                    if spliced_delta and chunk.text_delta:
+                        logger.warning(
+                            "Google replaced the reply mid-stream; dropping a spliced delta "
+                            f"({chunk.text_delta[:40]!r})."
+                        )
+                    if chunk.text_delta and not spliced_delta:
                         full_text += chunk.text_delta
                         if thought_open:
                             yield make_event(
@@ -2419,7 +2458,9 @@ def _create_responses_real_streaming_response(
                                 )
                                 message_open = True
 
-                            if visible := suppressor.process(chunk.text_delta):
+                            if not spliced_delta and (
+                                visible := suppressor.process(chunk.text_delta)
+                            ):
                                 yield make_event(
                                     "response.output_text.delta",
                                     {
