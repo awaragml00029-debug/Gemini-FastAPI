@@ -127,6 +127,15 @@ class GeminiConfig(BaseModel):
         default=False,
         description="Enable Gemini extended thinking mode for message generation",
     )
+    chatml_tags: bool = Field(
+        default=False,
+        description=(
+            "Wrap each turn in ChatML control tokens (<|im_start|>/<|im_end|>). Gemini knows "
+            "those tokens from its own training data and reads them as a forged system "
+            "message, answering with a canned refusal, so this is off by default. Set true to "
+            "restore the previous framing."
+        ),
+    )
     max_chars_per_request: int = Field(
         default=1_000_000,
         ge=1,

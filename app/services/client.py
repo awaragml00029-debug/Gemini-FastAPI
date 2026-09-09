@@ -444,6 +444,12 @@ class GeminiClientWrapper(GeminiClient):
         fetch_impersonate: str | None = None,
     ) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
         started = time.perf_counter()
+        # A single user turn needs no role framing at all. Sending the text as-is is what a
+        # browser session looks like, and it removes the last thing that could read as forged
+        # conversation markup.
+        bare_single_turn = (
+            not g_config.gemini.chatml_tags and len(messages) == 1 and messages[0].role == "user"
+        )
         conversation: list[str] = []
         files: list[str | Path | bytes | io.BytesIO] = []
 
@@ -472,7 +478,7 @@ class GeminiClientWrapper(GeminiClient):
                 input_part, files_part = await GeminiClientWrapper.process_message(
                     msg,
                     tempdir,
-                    tagged=True,
+                    tagged=not bare_single_turn,
                     fetch_proxy=fetch_proxy,
                     fetch_impersonate=fetch_impersonate,
                 )
@@ -480,7 +486,8 @@ class GeminiClientWrapper(GeminiClient):
                 files.extend(files_part)
                 i += 1
 
-        conversation.append(add_tag("assistant", "", unclose=True))
+        if not bare_single_turn:
+            conversation.append(add_tag("assistant", "", unclose=True))
         model_input = "\n".join(conversation)
         logger.info(
             "Processed conversation for Gemini: messages={}, input_chars={}, files={}, elapsed={:.3f}s",
