@@ -1,5 +1,83 @@
 # 开发日志
 
+## 2026-10-26 同步上游 66dc3f7 → 86e192a（Python 3.14、gemini-webapi 42f89a7、auto_delete）
+
+分支 `migrate/upstream-20261025`，在 `main`（`583948e`）之上 4 个提交。**未推送、未合 main、未上线。**
+
+### 上游改了什么（13 个提交，真正动代码的 3 个）
+
+| 提交 | 内容 |
+|---|---|
+| `2e719d6`（10-01） | gemini-webapi 从 PyPI 2.1.1 改成 git 源 `luuquangvu/Gemini-API@42f89a7`；builder 镜像装 `git`；`chat.py` 删掉 instruction 的 `type != "message"` 过滤 |
+| `1070d08`（10-14） | Python 3.13 → **3.14**；ruff 开 `D`（google docstring）并去掉 `E501` 的 ignore；全仓补 docstring、长行换行；依赖整体升级（fastapi 0.143.3、uvicorn 0.54.0、lmdb 3.0.0…） |
+| `dc0f1af`（10-17） | 新 `chat_mode: auto_delete`：会话过期后**同时删 Google 账号里的会话和本地 LMDB**。默认仍是 `normal`，不改配置不生效 |
+| 其余 10 个 | dependabot 升 action 版本、merge 提交 |
+
+**库 `42f89a7` 的来历已核实**：= v2.1.1 + 1 个提交（网络瞬断重试 + cookie 缓存按 base PSID 固定，防 PSID 轮换后缓存分叉）。该提交已作为 PR #361 合入官方 `HanaokaYuzu/Gemini-API` master（10-08），但**还没有 PyPI 发布、也没有 tag**。
+
+### 合并：12 处冲突，全部保留加固
+
+`main.py` 3、`chat.py` 4、`client.py` 2、`helper.py` 2、`config.yaml` 1，外加 `track.yml`（我们删、上游改 → 保持删除）。原则：**冲突处一律保留我们的加固，只吸收上游的措辞/换行**。
+
+- `chat.py`：保留瞬断/拒答重发循环、回退路径里的 `_process_conversation_for_client` 与 `request_scope`、`![Image]` 替代文本（防 Google 看到它取不到的文件名）
+- `helper.py`：保留软化版工具提示词（`11dcba0`），上游只是换行
+- `config.yaml`：保留 `url_fetch_timeout: 30` 和重启参数，加入上游 auto_delete 说明
+- `main.py`：保留我们的后台 init / 恢复任务的关停顺序，再加上游的 `cleanup_task.cancel()` —— 放在 `pool.close()` **之前**，因为 auto_delete 会从清理任务里调 pool
+
+### 两处「自动合并干净、运行时才炸」的坑（已修 + 测试 + 守卫）
+
+1. **`close()` 覆写 × 新库 `save_cookies` 签名**。新库把签名改成 `save_cookies(cookies, base_psid=None, verbose=False)`，我们的覆写还是按位置传 `self.verbose`。`verbose` 默认 `true` → `base_psid=True` → 缓存路径哈希里 `True.strip()` 抛 `AttributeError`。而新库的 `@running` 重试**每次重试都会调 `close()`**，正好落到这里。已改为关键字传参并固定到 `_base_psid`，同时补上新库 `close()` 的「无 PSID 不写缓存」守卫。
+   证据：签名由 `inspect.signature` 在装好的新库上实测确认；崩溃路径是读代码推出来的。
+2. **`pool.delete_chat()` 调了不存在的方法**。上游代码调 `self._ensure_client_ready()`，我们重写过的 pool 没有这个方法 → `AttributeError` 被 `except Exception` 吞掉 → 每次远程删除都「失败」。改法遵守我们的加固：**不在这里重启 client**（重启只由恢复任务做），client 不可用或已退役就记一次失败、下轮再试（最多 5 次）；删除放进 `request_scope()`，后台重启和 auto-close 不会中途掐断。
+
+新增 `tests/test_cookie_cache_pinning.py`、`tests/test_remote_chat_deletion.py`；逐条把修复撤掉验证过这些测试确实会红。`check_deltas.sh` 加 2 条断言（拿纯上游代码跑，两条都 FAIL）。
+
+### 加固完善：响应格式 JSON Schema 的远程 `$ref` SSRF
+
+全量测试卡死，faulthandler 栈：`canonicalize_structured_output` → jsonschema `_warn_for_remote_retrieve` → `urlopen` → `socket.create_connection`。
+
+`_bounded_validator_for()` 构造校验器时没给 registry，jsonschema 就退回到已废弃的默认行为：**远程 `$ref` 用裸 `urlopen` 去抓，没有超时、没有地址校验**。`response_format` 是 API 调用方给的，所以 `{"$ref": "http://169.254.169.254/latest/meta-data"}` 会让服务器去请求云元数据地址（盲 SSRF），对方不应答就把请求永久挂住。上游自己的测试用的正是这个 schema，只在 connect 很快失败的机器上才能通过。这段代码是 `1115894` 随 08 月迁移进来的，**main 上一直存在**。
+
+修法：传一个空的 `referencing.Registry()`。它从不自动抓取（python-jsonschema #1065），本地 `$ref`（`$defs`、draft-04 `definitions`、指回自身 `$id`）照常解析，远程的立刻报错，落进已有的「不校验、不判失败」分支。实测（jsonschema 4.26.0 / referencing 0.37.0）：`urlopen` 调用 0 次、耗时 0.0s；去掉 `registry=` 新测试即变红。守卫 +1 条。
+
+### main 上已有、这次顺带查清的问题
+
+1. **两个断连测试必挂**（`test_stream_disconnect_cancels_pending_media_tasks` 及 Responses 版）。四组对照（各 3 次）：我们的 main 在 py3.13+库 2.1.1、py3.14+库 2.1.1 都挂，纯上游通过 → 与合并、Python 版本、库版本都无关。`git bisect` 定位到 `583948e`（09-09「拼接回复」修复）。原因是**测试夹具不真实**：后续 chunk 的 `.text` 只有 `"more"`，而真实库的 `.text` 总是累计全文，`_delta_continues` 正确地把它们当「回复被替换」全部丢弃（6 秒 51 条警告），测试就永远等不到第三帧。**加固本身是对的、不动**；夹具改成累计文本后 10/10 通过。
+2. **main 的 CI 自 09-09 起一直红**：`ruff format --check` 会格式化 `DEV_LOG.md` 里的 Python 代码块，三处手工对齐的注释不合格。
+3. **`Sync Upstream` 自 10-01 后连续失败 24 次**，所以这次更新没有自动 PR。原因：有冲突时工作流把上游原样推成分支，而上游提交改了 `.github/workflows/ci.yaml`，GitHub 不允许 `GITHUB_TOKEN` 推送工作流文件（需要带 `workflow` 权限的 PAT）。**这是仓库凭据问题，本次未处理，待本人决定。**
+
+### lint 收尾
+
+上游新开的 docstring 规则在我们 fork 独有代码上报 115 处：插入 101 条一行 docstring（只增不删），10 处长行换行（逐文件比对字符串常量多重集，前后完全一致），`DEV_LOG.md` 代码块只改空白。另修 `test_refusal_retry.py` 的 8 个类型错误（main 上就有）。
+
+### 验证
+
+| 项 | 结果 | 证据等级 |
+|---|---|---|
+| pytest | **466 passed**，无任何 deselect，约 8s | 实测 |
+| CI 七步（守卫 / uv sync / ruff check / ruff format / ty / pyright / pytest），干净 worktree 复跑 | 全部 PASS | 实测 |
+| 守卫 `check_deltas.sh` | **42/42** | 实测 |
+| 新库 `save_cookies` 签名 | `(cookies, base_psid=None, verbose=False)` | 实测 |
+| 与真实 Google 的交互（新库重试、auto_delete 远程删除） | **未验证** | 需上线后看日志 |
+
+### 镜像
+
+`ghcr.io/awaragml00029-debug/clean:20261026-001902`（`--no-cache --pull`，只打时间戳标签、不打 `latest` —— 本机有 watchtower）
+image id `sha256:d1b0c2845e4a3413fbc8600dbf771f10c00d07bce0820ed55df56535569cfc72`，213MB，label `revision=e4185c5`。**仅本地构建，未推 ghcr。**
+
+镜像内核对：Python 3.14.9、gemini-webapi 0.0.post268（= 42f89a7）、fastapi 0.143.3、uvicorn 0.54.0；三处修复（`base_psid=`、`delete_chat` 不重启、schema `registry=`）都在。
+冒烟（`--network none`、无挂载、跑完即删）：清理任务 → 恢复任务 → ready → Uvicorn 监听，`/health` 与 `/v1/health` 均有响应（无网无 cookie，503「No usable Gemini client」符合预期），日志无 Traceback/ERROR。
+
+回滚锚点：`clean:20260909-142425`（本机仍在）。
+
+### 下一步（需要本人决定）
+
+- 推送分支 / 合入 main / 推 ghcr / 上线 —— 均未做
+- `Sync Upstream` 的 PAT 问题
+- 要不要开 `auto_delete`（默认关）
+
+---
+
 ## 2026-09-09（四）拒答其实有两类 —— 上下文污染那类是我们自己造的
 
 ### 最重要的修正：把两类拒答混成了一件事
