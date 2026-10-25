@@ -19,6 +19,7 @@ from app.services.client import GeminiClientWrapper
 
 @pytest.fixture
 def saved(monkeypatch) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    """Capture save_cookies calls instead of writing the cache."""
     calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     monkeypatch.setattr(
         client_module, "save_cookies", lambda *args, **kwargs: calls.append((args, kwargs))

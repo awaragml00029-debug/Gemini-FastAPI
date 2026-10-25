@@ -155,6 +155,7 @@ class CapturingFrameParser(ORIGINAL_PARSER):
     """StreamingFrameParser that remembers its frames and dumps them on a fallback hit."""
 
     def __init__(self) -> None:
+        """Start with no captured frames and nothing dumped yet."""
         super().__init__()
         self._captured: list[Any] = []
         self._dumped = False
@@ -177,11 +178,13 @@ class CapturingFrameParser(ORIGINAL_PARSER):
             logger.debug(f"Frame capture skipped: {exc}")
 
     def feed(self, content: str) -> list[Any]:
+        """Parse a chunk of the stream and observe the frames it yields."""
         frames = super().feed(content)
         self._observe(frames)
         return frames
 
     def flush(self) -> list[Any]:
+        """Parse what is left of the stream and observe the final frames."""
         frames = super().flush()
         self._observe(frames)
         return frames

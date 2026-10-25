@@ -34,6 +34,7 @@ def test_followup_tag_never_leaks(size: int) -> None:
 
 @pytest.mark.parametrize("size", [1, 4, 11, 64])
 def test_multiple_followups_are_all_dropped(size: int) -> None:
+    """Multiple followups are all dropped."""
     text = f"a{FOLLOWUP}b{FOLLOWUP}c"
     assert _stream(text, size) == "abc"
 

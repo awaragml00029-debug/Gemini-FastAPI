@@ -1,3 +1,5 @@
+"""Gemini Gems CRUD endpoints."""
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from loguru import logger
 
@@ -13,6 +15,7 @@ async def list_gems(
     predefined: bool | None = None,
     api_key: str = Depends(verify_api_key),
 ):
+    """List the account's Gems, optionally only predefined or only custom ones."""
     pool = GeminiClientPool()
     try:
         client = await pool.acquire()
@@ -36,6 +39,7 @@ async def get_gem(
     gem_id: str,
     api_key: str = Depends(verify_api_key),
 ):
+    """Return one Gem by id."""
     pool = GeminiClientPool()
     try:
         client = await pool.acquire()
@@ -62,6 +66,7 @@ async def create_gem(
     body: GemCreateRequest,
     api_key: str = Depends(verify_api_key),
 ):
+    """Create a custom Gem."""
     pool = GeminiClientPool()
     try:
         client = await pool.acquire()
@@ -85,6 +90,7 @@ async def update_gem(
     body: GemUpdateRequest,
     api_key: str = Depends(verify_api_key),
 ):
+    """Update a custom Gem."""
     pool = GeminiClientPool()
     try:
         client = await pool.acquire()
@@ -107,6 +113,7 @@ async def delete_gem(
     gem_id: str,
     api_key: str = Depends(verify_api_key),
 ):
+    """Delete a custom Gem."""
     pool = GeminiClientPool()
     try:
         client = await pool.acquire()

@@ -22,34 +22,46 @@ from app.services.pool import (
 
 
 class FakeClient:
+    """A client whose readiness the test controls."""
+
     def __init__(self, client_id: str, *, ready: bool = False):
+        """Start not ready unless told otherwise, with no restarts."""
         self.id = client_id
         self.ready = ready
         self.restarts = 0
 
     def running(self) -> bool:
+        """Always running; readiness is decided by health alone."""
         return True
 
     def is_healthy(self) -> bool:
+        """Healthy exactly when the test marks it ready."""
         return self.ready
 
     def is_guest(self) -> bool:
+        """An unready client stands in for one whose cookies expired."""
         return not self.ready
 
 
 class FakeClock:
+    """A monotonic clock the test advances by hand."""
+
     def __init__(self):
+        """Start at an arbitrary non-zero time."""
         self.now = 1000.0
 
     def __call__(self) -> float:
+        """Return the current fake time."""
         return self.now
 
     def advance(self, seconds: float) -> None:
+        """Move the clock forward by `seconds`."""
         self.now += seconds
 
 
 @pytest.fixture
 def clock(monkeypatch):
+    """Replace the pool's monotonic clock with a FakeClock."""
     fake = FakeClock()
     monkeypatch.setattr(pool_module.time, "monotonic", fake)
     return fake
@@ -138,6 +150,7 @@ def test_recovery_clears_the_backoff_once_the_client_is_usable(clock):
 
 
 def test_a_restart_that_succeeds_is_reported_and_leaves_no_backoff(clock):
+    """A restart that succeeds is reported and leaves no backoff."""
     client = FakeClient("recovering")
 
     def revive(c):
@@ -188,6 +201,7 @@ def test_a_busy_client_is_neither_counted_nor_deferred(clock):
 
 
 def test_a_healthy_client_is_left_alone(clock):
+    """A healthy client is left alone."""
     client = FakeClient("fine", ready=True)
     pool = build_pool([client], lambda c: None)
     asyncio.run(pool.recover_unavailable_clients())
@@ -206,6 +220,7 @@ def _acquire(pool, **kwargs):
 
 
 def test_a_ready_client_is_returned():
+    """A ready client is returned."""
     ready = FakeClient("ready", ready=True)
     pool = build_pool([FakeClient("guest"), ready], lambda c: None)
     assert _acquire(pool) is ready
@@ -221,6 +236,7 @@ def test_a_guest_is_never_handed_out():
 
 @pytest.mark.parametrize("require_account", [False, True])
 def test_all_cookies_expired_says_so_explicitly(require_account):
+    """All cookies expired says so explicitly."""
     pool = build_pool([FakeClient("g1"), FakeClient("g2")], lambda c: None)
     with pytest.raises(RuntimeError, match="unauthenticated") as caught:
         _acquire(pool, require_account=require_account)
@@ -230,6 +246,7 @@ def test_all_cookies_expired_says_so_explicitly(require_account):
 
 
 def test_all_clients_retired_says_so_explicitly():
+    """All clients retired says so explicitly."""
     clients = [FakeClient("a"), FakeClient("b")]
     pool = build_pool(clients, lambda c: None)
     pool._retired = {"a", "b"}
@@ -250,6 +267,7 @@ def test_a_plain_outage_keeps_the_generic_message():
 
 
 def test_acquire_by_id_still_checks_readiness():
+    """Acquire by id still checks readiness."""
     ready = FakeClient("ready", ready=True)
     pool = build_pool([ready, FakeClient("dead")], lambda c: None)
     assert asyncio.run(pool.acquire("ready")) is ready
@@ -260,6 +278,7 @@ def test_acquire_by_id_still_checks_readiness():
 
 
 def test_round_robin_spreads_load_across_ready_clients():
+    """Round robin spreads load across ready clients."""
     a, b = FakeClient("a", ready=True), FakeClient("b", ready=True)
     pool = build_pool([a, b], lambda c: None)
     picked = [_acquire(pool).id for _ in range(4)]

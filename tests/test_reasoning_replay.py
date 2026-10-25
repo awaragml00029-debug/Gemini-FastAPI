@@ -28,19 +28,23 @@ REAL = (
 
 
 def test_real_captured_shape_is_stripped() -> None:
+    """Real captured shape is stripped."""
     assert strip_reasoning_blocks(REAL) == "你好！我是由 Google 训练的 AI 助手 Gemini。"  # noqa: RUF001
 
 
 @pytest.mark.parametrize("tag", ["think", "thinking", "reasoning"])
 def test_every_known_tag_name(tag: str) -> None:
+    """Every known tag name."""
     assert strip_reasoning_blocks(f"<{tag}>scratch</{tag}>答案") == "答案"
 
 
 def test_uppercase_and_attributes_are_handled() -> None:
+    """Uppercase and attributes are handled."""
     assert strip_reasoning_blocks('<Think type="x">s</Think>答案') == "答案"
 
 
 def test_multiple_blocks_all_go() -> None:
+    """Multiple blocks all go."""
     assert strip_reasoning_blocks("前<think>a</think>中<think>b</think>后") == "前中后"
 
 
@@ -52,6 +56,7 @@ def test_unclosed_tag_is_left_alone() -> None:
 
 @pytest.mark.parametrize("text", ["", "普通回答没有思考块", "讲讲 <thinktank> 这个词"])
 def test_ordinary_text_is_untouched(text: str) -> None:
+    """Ordinary text is untouched."""
     assert strip_reasoning_blocks(text) == text
 
 

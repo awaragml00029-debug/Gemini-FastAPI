@@ -38,6 +38,7 @@ def _requirement(schema: dict) -> StructuredOutputRequirement:
 
 
 def test_a_remote_ref_is_never_fetched_and_leaves_the_reply_unverified(connections):
+    """A remote ref is never fetched and leaves the reply unverified."""
     started = time.monotonic()
 
     assert canonicalize_structured_output('{"a": 1}', _requirement(METADATA_REF)) == '{"a":1}'
@@ -47,6 +48,7 @@ def test_a_remote_ref_is_never_fetched_and_leaves_the_reply_unverified(connectio
 
 
 def test_checking_a_schema_with_a_remote_ref_opens_nothing(connections):
+    """Checking a schema with a remote ref opens nothing."""
     validate_json_schema(METADATA_REF)
 
     assert connections == []

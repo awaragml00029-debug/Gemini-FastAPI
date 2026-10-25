@@ -46,6 +46,7 @@ def resolves_to(monkeypatch):
 
 
 def test_a_resolved_hostname_comes_back_with_the_address_it_was_checked_at(resolves_to):
+    """A resolved hostname comes back with the address it was checked at."""
     resolves_to(PUBLIC_IP)
     url, pinned = _validate_remote_url("https://example.com/a.png")
     assert url == "https://example.com/a.png"
@@ -53,6 +54,7 @@ def test_a_resolved_hostname_comes_back_with_the_address_it_was_checked_at(resol
 
 
 def test_an_address_literal_needs_no_lookup_and_so_pins_nothing(resolves_to):
+    """An address literal needs no lookup and so pins nothing."""
     resolves_to(PRIVATE_IP)  # must not be consulted at all
     _url, pinned = _validate_remote_url(f"https://{PUBLIC_IP}/a.png")
     assert pinned is None
@@ -69,37 +71,44 @@ def test_an_address_literal_needs_no_lookup_and_so_pins_nothing(resolves_to):
     ],
 )
 def test_the_obvious_unsafe_shapes_are_still_refused(url, resolves_to):
+    """The obvious unsafe shapes are still refused."""
     resolves_to(PUBLIC_IP)
     with pytest.raises(ValueError, match="Unsupported or unsafe URL"):
         _validate_remote_url(url)
 
 
 def test_a_hostname_that_resolves_anywhere_private_is_refused(resolves_to):
+    """A hostname that resolves anywhere private is refused."""
     resolves_to(PUBLIC_IP, PRIVATE_IP)
     with pytest.raises(ValueError, match="Unsupported or unsafe URL"):
         _validate_remote_url("https://example.com/a.png")
 
 
 def test_the_connection_is_pinned_to_the_checked_address():
+    """The connection is pinned to the checked address."""
     opts = _pin_options("https://example.com/a.png", PUBLIC_IP, None)
     assert opts == {CurlOpt.RESOLVE: [f"example.com:443:{PUBLIC_IP}"]}
 
 
 def test_the_port_in_the_url_wins_over_the_scheme_default():
+    """The port in the url wins over the scheme default."""
     opts = _pin_options("https://example.com:8443/a.png", PUBLIC_IP, None)
     assert opts == {CurlOpt.RESOLVE: [f"example.com:8443:{PUBLIC_IP}"]}
 
 
 def test_plain_http_pins_at_eighty():
+    """Plain http pins at eighty."""
     opts = _pin_options("http://example.com/a.png", PUBLIC_IP, None)
     assert opts == {CurlOpt.RESOLVE: [f"example.com:80:{PUBLIC_IP}"]}
 
 
 def test_a_proxied_fetch_sets_no_pin_because_the_proxy_would_ignore_it():
+    """A proxied fetch sets no pin because the proxy would ignore it."""
     assert _pin_options("https://example.com/a.png", PUBLIC_IP, "socks5h://127.0.0.1:1080") == {}
 
 
 def test_nothing_to_pin_when_no_lookup_happened():
+    """Nothing to pin when no lookup happened."""
     assert _pin_options("https://example.com/a.png", None, None) == {}
 
 

@@ -38,6 +38,7 @@ def test_replacements_are_rejected(replacement: str) -> None:
 
 
 def test_normal_growth_is_kept() -> None:
+    """Normal growth is kept."""
     assert _delta_continues(SENT + "偏好设定我都会记住。", SENT) is True
 
 
@@ -54,4 +55,5 @@ def test_missing_sides_are_permissive(new: str | None, sent: str) -> None:
 
 
 def test_identical_text_is_kept() -> None:
+    """Identical text is kept."""
     assert _delta_continues(SENT, SENT) is True

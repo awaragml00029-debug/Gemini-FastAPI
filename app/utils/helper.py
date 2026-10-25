@@ -174,10 +174,14 @@ VALID_TAG_ROLES = {"user", "assistant", "system", "tool"}
 # 保留原文以便随时回退对照, 下面这份对齐上游 66dc3f7。
 # TOOL_WRAP_HINT = (
 #     "\n\nSYSTEM: TOOL CALLING PROTOCOL (MANDATORY)\n"
-#     "Either emit the tool-call block alone, or answer in natural language with no protocol tags. Never both.\n\n"
-#     "1. Names MUST match the schemas exactly; every required parameter MUST be present with its declared JSON type.\n"
-#     "2. Each value MUST stand alone between two fences of 3 backticks with no language tag; if it contains a backtick run, both fences MUST be longer.\n"
-#     "3. Every opening tag MUST be closed in reverse order of opening. A fence closes only itself, never a tag. An unclosed tag voids the call.\n"
+#     "Either emit the tool-call block alone, or answer in natural language with no protocol tags. "
+#     "Never both.\n\n"
+#     "1. Names MUST match the schemas exactly; every required parameter MUST be present with its "
+#     "declared JSON type.\n"
+#     "2. Each value MUST stand alone between two fences of 3 backticks with no language tag; "
+#     "if it contains a backtick run, both fences MUST be longer.\n"
+#     "3. Every opening tag MUST be closed in reverse order of opening. A fence closes only "
+#     "itself, never a tag. An unclosed tag voids the call.\n"
 #     "4. Emit the block and nothing else. No preamble or commentary.\n\n"
 #     "REQUIRED SYNTAX, reproduce literally:\n"
 #     "[ToolCalls]\n"
@@ -768,7 +772,8 @@ async def save_file_to_tempfile(
         tmp.write(decoded)
         path = Path(tmp.name)
     logger.info(
-        "Saved base64 upload to temp file: filename={}, input_bytes={}, decoded_bytes={}, path={}, elapsed={:.3f}s",
+        "Saved base64 upload to temp file: filename={}, input_bytes={}, decoded_bytes={}, "
+        "path={}, elapsed={:.3f}s",
         file_name or "<none>",
         input_size,
         len(decoded),
@@ -1010,7 +1015,8 @@ async def save_url_to_tempfile(
     write_started = time.perf_counter()
     path = await asyncio.to_thread(_write_bytes_to_tempfile, data, suffix, tempdir)
     logger.info(
-        "Saved URL upload to temp file: source={}, suffix={}, bytes={}, path={}, write_elapsed={:.3f}s,total_elapsed={:.3f}s",
+        "Saved URL upload to temp file: source={}, suffix={}, bytes={}, path={}, "
+        "write_elapsed={:.3f}s,total_elapsed={:.3f}s",
         source,
         suffix,
         len(data),

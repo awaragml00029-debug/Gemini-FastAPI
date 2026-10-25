@@ -109,8 +109,7 @@ async def _run_retention_cleanup(stop_event: asyncio.Event) -> None:
 
 
 async def _run_client_recovery(pool: GeminiClientPool, stop_event: asyncio.Event) -> None:
-    """
-    Periodically revive Gemini clients that dropped out of rotation, until the stop_event is set.
+    """Periodically revive Gemini clients that dropped out of rotation until stop_event is set.
 
     A request is taken off its client on any error and acquire() only ever checks readiness, so
     without this nothing would put a client back. Keeping the revival here means the auth retries

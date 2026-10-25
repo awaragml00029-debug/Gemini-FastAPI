@@ -23,16 +23,19 @@ if API_KEY:
 
 
 def read_base64(path: str) -> str:
+    """Return the file at `path` as a base64 string."""
     return base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
 def post_json(path: str, payload: dict) -> dict:
+    """POST `payload` to the server and return the decoded JSON response."""
     response = requests.post(f"{BASE_URL}{path}", headers=HEADERS, json=payload, timeout=120)
     response.raise_for_status()
     return response.json()
 
 
 def chat_with_image_url() -> dict:
+    """Chat Completions request with an image passed by URL."""
     return post_json(
         "/v1/chat/completions",
         {
@@ -54,6 +57,7 @@ def chat_with_image_url() -> dict:
 
 
 def chat_with_image_data_url(image_path: str) -> dict:
+    """Chat Completions request with an image inlined as a data URL."""
     data_url = f"data:image/png;base64,{read_base64(image_path)}"
     return post_json(
         "/v1/chat/completions",
@@ -73,6 +77,7 @@ def chat_with_image_data_url(image_path: str) -> dict:
 
 
 def chat_with_file_base64(file_path: str) -> dict:
+    """Chat Completions request with a file sent as base64 `file_data`."""
     return post_json(
         "/v1/chat/completions",
         {
@@ -97,6 +102,7 @@ def chat_with_file_base64(file_path: str) -> dict:
 
 
 def chat_with_audio_base64(audio_path: str) -> dict:
+    """Chat Completions request with an audio clip sent as `input_audio`."""
     return post_json(
         "/v1/chat/completions",
         {
@@ -121,6 +127,7 @@ def chat_with_audio_base64(audio_path: str) -> dict:
 
 
 def responses_with_file_base64(file_path: str) -> dict:
+    """Responses API request with a file sent as base64 `file_data`."""
     return post_json(
         "/v1/responses",
         {
@@ -144,6 +151,7 @@ def responses_with_file_base64(file_path: str) -> dict:
 
 
 def responses_with_file_url() -> dict:
+    """Responses API request with a file passed by URL."""
     return post_json(
         "/v1/responses",
         {

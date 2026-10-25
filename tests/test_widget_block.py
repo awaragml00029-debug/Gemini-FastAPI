@@ -34,13 +34,17 @@ def _stream(text: str, size: int) -> str:
 
 @pytest.mark.parametrize("size", [1, 2, 3, 5, 7, 13, 29, 64, 500])
 def test_block_collapses_at_every_chunk_boundary(size: int) -> None:
+    """Block collapses at every chunk boundary."""
     assert _stream(BEFORE + WIDGET + AFTER, size) == BEFORE + WIDGET_PLACEHOLDER + AFTER
 
 
 @pytest.mark.parametrize("size", [1, 3, 7, 100])
 def test_longer_name_starting_the_same_way_is_untouched(size: int) -> None:
-    """Regression: `<GenerateWidgetX>` once matched the opening marker and the filter then
-    swallowed the rest of the stream looking for a close tag that never came."""
+    """A longer tag name that starts the same way is not the widget marker.
+
+    Regression: `<GenerateWidgetX>` once matched the opening marker and the filter then
+    swallowed the rest of the stream looking for a close tag that never came.
+    """
     text = "这里讲 <GenerateWidgetX> 不是真标签"
     assert _stream(text, size) == text
 
@@ -54,21 +58,25 @@ def test_unclosed_block_still_yields_a_placeholder(size: int) -> None:
 
 @pytest.mark.parametrize("size", [1, 4, 50])
 def test_ordinary_text_is_untouched(size: int) -> None:
+    """Ordinary text is untouched."""
     text = "无标签的普通中文回答，含 < 和 > 符号。"  # noqa: RUF001
     assert _stream(text, size) == text
 
 
 def test_two_blocks_both_collapse() -> None:
+    """Two blocks both collapse."""
     assert _stream(f"a{WIDGET}b{WIDGET}c", 9) == f"a{WIDGET_PLACEHOLDER}b{WIDGET_PLACEHOLDER}c"
 
 
 def test_non_streaming_regex_replaces_the_block() -> None:
+    """Non streaming regex replaces the block."""
     assert WIDGET_BLOCK_RE.sub(WIDGET_PLACEHOLDER, BEFORE + WIDGET + AFTER) == (
         BEFORE + WIDGET_PLACEHOLDER + AFTER
     )
 
 
 def test_non_streaming_regex_ignores_a_longer_name() -> None:
+    """Non streaming regex ignores a longer name."""
     text = "<GenerateWidgetX>foo</GenerateWidget>"
     assert WIDGET_BLOCK_RE.sub(WIDGET_PLACEHOLDER, text) == text
 

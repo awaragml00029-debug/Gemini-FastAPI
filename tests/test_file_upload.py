@@ -102,6 +102,7 @@ IMAGE_B64 = base64.b64encode(IMAGE).decode()
     ],
 )
 def test_image_data_url_accepts_what_clients_actually_send(label, payload):
+    """Image data url accepts what clients actually send."""
     data, suffix = asyncio.run(_decode_data_url(f"data:image/png;base64,{payload}"))
     assert data == IMAGE, label
     assert suffix == ".png"
@@ -116,11 +117,13 @@ def test_image_data_url_accepts_what_clients_actually_send(label, payload):
     ],
 )
 def test_image_data_url_still_rejects_malformed_input(url):
+    """Image data url still rejects malformed input."""
     with pytest.raises(ValueError, match="Invalid data URL"):
         asyncio.run(_decode_data_url(url))
 
 
 def test_image_data_url_still_enforces_the_size_cap():
+    """Image data url still enforces the size cap."""
     oversized = base64.b64encode(b"\x00" * (MAX_REMOTE_MEDIA_BYTES + 1)).decode()
     with pytest.raises(ValueError, match="too large"):
         asyncio.run(_decode_data_url(f"data:image/png;base64,{oversized}"))
@@ -194,6 +197,7 @@ def test_undecodable_attachment_is_a_400_not_a_503(bad_payload, tmp_path):
 
 
 def test_a_good_attachment_still_goes_through(tmp_path):
+    """A good attachment still goes through."""
     model_input, files = asyncio.run(
         _process_conversation_for_client(
             _client_that_never_fetches(),
@@ -244,6 +248,7 @@ def test_a_good_attachment_still_goes_through(tmp_path):
     ],
 )
 def test_sniffed_suffix(label, data, expected):
+    """Sniffed suffix."""
     assert _sniff_suffix(data) == expected, label
 
 

@@ -1263,7 +1263,8 @@ async def _log_stream_timing(
             yield chunk
     except Exception:
         logger.exception(
-            "Gemini stream request failed: text_chars={}, files={}, large_text_attachment={}, elapsed={:.3f}s",
+            "Gemini stream request failed: text_chars={}, files={}, "
+            "large_text_attachment={}, elapsed={:.3f}s",
             text_chars,
             file_count,
             large_text_attachment,
@@ -1272,7 +1273,8 @@ async def _log_stream_timing(
         raise
     finally:
         logger.info(
-            "Gemini stream request finished: text_chars={}, files={}, large_text_attachment={}, elapsed={:.3f}s",
+            "Gemini stream request finished: text_chars={}, files={}, "
+            "large_text_attachment={}, elapsed={:.3f}s",
             text_chars,
             file_count,
             large_text_attachment,

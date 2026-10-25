@@ -74,6 +74,7 @@ def test_retired_clients_are_reported_without_changing_ok(
     expected_ok: bool,
     expected_retired: list[str] | None,
 ):
+    """Retired clients are reported without changing ok."""
     monkeypatch.setattr(health, "GeminiClientPool", lambda: _Pool(client_status, retired))
     monkeypatch.setattr(health, "LMDBConversationStore", _Store)
     monkeypatch.setattr(health.g_config.gemini, "guest_mode", GuestMode.ADAPTIVE)

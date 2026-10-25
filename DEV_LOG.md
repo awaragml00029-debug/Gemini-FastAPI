@@ -61,9 +61,9 @@
 媒体处理比生成还慢。根因在 `gemini_webapi/types/image.py`，`full_size=True` 的路径：
 
 ```python
-original_url = await self.client_ref._get_full_size_image(...)   # ① 请求
-response = await req_client.get(f"{original_url}=d-I?alr=yes")   # ② 请求
-response = await req_client.get(response.text)                   # ③ 请求
+original_url = await self.client_ref._get_full_size_image(...)  # ① 请求
+response = await req_client.get(f"{original_url}=d-I?alr=yes")  # ② 请求
+response = await req_client.get(response.text)  # ③ 请求
 # 然后 ④ 才下载图片本体
 ```
 
@@ -182,11 +182,12 @@ resending 次数 : 0
 那 1 个真孤儿是上游残留：
 
 ```python
-async def _init_one(self, client) -> bool:      # 零调用者
+async def _init_one(self, client) -> bool:  # 零调用者
     return await self._init_attempt(client)
 
+
 async def _init_attempt(self, client) -> bool:  # 零调用者（除上面那个）
-    await client.init()                          # 裸调用，没有 wait_for
+    await client.init()  # 裸调用，没有 wait_for
 ```
 
 正是 09-03 记录里写的「上游的 `_init_attempt` 三样都没有」那个版本。**当时没有危害（没人调用），但是陷阱**：谁顺手用 `_init_one` 就绕过超时，直接踩回「死账号重启卡在请求路径」那个延迟根因。已删除，删前核过全项目零引用、守卫零断言、实际路径不经过。

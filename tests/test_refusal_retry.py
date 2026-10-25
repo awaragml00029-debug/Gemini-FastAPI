@@ -10,17 +10,18 @@ usually wins. Confirmed by the user retrying by hand.
 Every sample below was seen in production on 2026-09-09.
 """
 
+from types import SimpleNamespace
+from typing import cast
+
 import pytest
+from gemini_webapi import ModelOutput
 
 from app.server.chat import _looks_like_refusal
 
 
-class _Output:
+def _Output(text: str, thoughts: str) -> ModelOutput:  # noqa: N802
     """Stands in for ModelOutput; only text and thoughts are read."""
-
-    def __init__(self, text: str, thoughts: str) -> None:
-        self.text = text
-        self.thoughts = thoughts
+    return cast(ModelOutput, SimpleNamespace(text=text, thoughts=thoughts))
 
 
 REFUSALS = [
@@ -35,12 +36,13 @@ REFUSALS = [
 
 @pytest.mark.parametrize("text", REFUSALS)
 def test_real_refusals_are_retried(text: str) -> None:
+    """Real refusals are retried."""
     assert _looks_like_refusal(_Output(text, "reasoned at length" * 40)) is True
 
 
 @pytest.mark.parametrize("text", REFUSALS)
 def test_refusal_without_reasoning_is_not_retried(text: str) -> None:
-    """thoughts == 0 is the other failure: refused before generating. Those refuse again."""
+    """`thoughts == 0` is the other failure: refused before generating. Those refuse again."""
     assert _looks_like_refusal(_Output(text, "")) is False
 
 
@@ -54,6 +56,7 @@ def test_self_introduction_is_not_a_refusal() -> None:
 
 
 def test_structured_output_is_not_a_refusal() -> None:
+    """Structured output is not a refusal."""
     text = '{"follow_ups": ["你能帮我处理哪些具体的任务？", "你刚才的回答能再详细点吗？"]}'  # noqa: RUF001
     assert _looks_like_refusal(_Output(text, "x" * 902)) is False
 
@@ -67,6 +70,7 @@ def test_structured_output_is_not_a_refusal() -> None:
     ],
 )
 def test_ordinary_answers_are_not_retried(text: str) -> None:
+    """Ordinary answers are not retried."""
     assert _looks_like_refusal(_Output(text, "x" * 500)) is False
 
 

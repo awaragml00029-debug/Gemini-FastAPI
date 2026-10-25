@@ -525,6 +525,8 @@ class HealthCheckResponse(BaseModel):
 
 
 class GemModel(BaseModel):
+    """A Gem as returned by the Gems endpoints."""
+
     id: str
     name: str
     description: str | None = None
@@ -533,17 +535,23 @@ class GemModel(BaseModel):
 
 
 class GemListResponse(BaseModel):
+    """List envelope for the Gems endpoints."""
+
     object: str = "list"
     data: list[GemModel]
 
 
 class GemCreateRequest(BaseModel):
+    """Body for creating a custom Gem."""
+
     name: str
     prompt: str
     description: str = ""
 
 
 class GemUpdateRequest(BaseModel):
+    """Body for replacing a custom Gem's name, prompt and description."""
+
     name: str
     prompt: str
     description: str = ""

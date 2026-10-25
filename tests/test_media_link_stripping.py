@@ -25,10 +25,12 @@ VIDEO = f"[![Video]({HOST}media/img_a.jpg?token=1)]({HOST}media/vid_b.mp4?token=
 
 
 def test_untitled_image_becomes_a_marker() -> None:
+    """Untitled image becomes a marker."""
     assert strip_local_media_links(f"这是图\n\n{IMG}") == "这是图\n\n[generated image]"
 
 
 def test_title_is_kept_because_it_carries_meaning() -> None:
+    """Title is kept because it carries meaning."""
     assert strip_local_media_links(TITLED) == "[generated image: 奔跑的小鸡]"
 
 
@@ -45,6 +47,7 @@ def test_external_images_are_left_alone() -> None:
 
 @pytest.mark.parametrize("text", ["", "普通文本没有链接", "裸的 /media/ 两个字不该触发什么"])
 def test_text_without_our_links_is_unchanged(text: str) -> None:
+    """Text without our links is unchanged."""
     assert strip_local_media_links(text) == text
 
 

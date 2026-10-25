@@ -20,17 +20,22 @@ from gemini_webapi.exceptions import APIError
 from app.server import chat as chat_module
 from app.server.chat import _TRANSIENT_RETRY_ATTEMPTS, _transient_api_error_code
 
-STREAM_ERROR = "Failed to generate contents (stream). Unknown API error code: {}. This might be a temporary Google service issue."
+STREAM_ERROR = (
+    "Failed to generate contents (stream). Unknown API error code: {}. "
+    "This might be a temporary Google service issue."
+)
 
 
 class FakeClient:
     """Only request_scope() is reached on the paths under test."""
 
     def __init__(self) -> None:
+        """Start with no scopes entered."""
         self.scopes = 0
 
     @asynccontextmanager
     async def request_scope(self):
+        """Count each scope entered."""
         self.scopes += 1
         yield
 
@@ -99,6 +104,7 @@ def test_unknown_code_is_not_resent(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_unrelated_api_error_is_not_resent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unrelated api error is not resent."""
     outcomes = [APIError("Something else went wrong"), "OK"]
     with pytest.raises(APIError):
         _run(monkeypatch, outcomes)
@@ -118,4 +124,5 @@ def test_unrelated_api_error_is_not_resent(monkeypatch: pytest.MonkeyPatch) -> N
     ],
 )
 def test_error_code_extraction(message: str, expected: int | None) -> None:
+    """Error code extraction."""
     assert _transient_api_error_code(APIError(message)) == expected

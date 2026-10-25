@@ -15,7 +15,10 @@ from app.services.pool import GeminiClientPool
 
 
 class FakeClient:
+    """A client that records each deletion and whether it ran inside request_scope()."""
+
     def __init__(self, client_id: str, *, ready: bool = True):
+        """Ready unless told otherwise, with nothing deleted yet."""
         self.id = client_id
         self.ready = ready
         self.in_scope = False
@@ -23,16 +26,20 @@ class FakeClient:
         self.latest_chat_cid: str | None = None
 
     def running(self) -> bool:
+        """Running exactly when ready."""
         return self.ready
 
     def is_healthy(self) -> bool:
+        """Healthy exactly when ready."""
         return self.ready
 
     def is_guest(self) -> bool:
+        """Never a guest; guest handling is not under test."""
         return False
 
     @asynccontextmanager
     async def request_scope(self):
+        """Mark the client as held for the length of the block."""
         self.in_scope = True
         try:
             yield
@@ -40,10 +47,13 @@ class FakeClient:
             self.in_scope = False
 
     async def delete_chat(self, cid: str) -> None:
+        """Record the deletion and whether it ran inside a request scope."""
         self.deleted.append((cid, self.in_scope))
 
 
 class NoRestartPool(GeminiClientPool):
+    """A pool that counts restart attempts instead of making them."""
+
     restarts = 0
 
     async def _restart_client(self, client) -> None:
@@ -51,6 +61,7 @@ class NoRestartPool(GeminiClientPool):
 
 
 def build_pool(*clients) -> NoRestartPool:
+    """A pool wired to `clients`, bypassing config-driven construction."""
     pool = object.__new__(NoRestartPool)
     pool._clients = list(clients)
     pool._id_map = {c.id: c for c in clients}
@@ -72,6 +83,7 @@ def test_a_ready_client_deletes_inside_a_request_scope():
 
 
 def test_an_unready_client_costs_one_attempt_and_is_never_restarted_inline():
+    """An unready client costs one attempt and is never restarted inline."""
     client = FakeClient("acc-1", ready=False)
     pool = build_pool(client)
 
@@ -81,6 +93,7 @@ def test_an_unready_client_costs_one_attempt_and_is_never_restarted_inline():
 
 
 def test_a_retired_client_is_not_used_for_deletion():
+    """A retired client is not used for deletion."""
     client = FakeClient("acc-1")
     pool = build_pool(client)
     pool._retired.add("acc-1")

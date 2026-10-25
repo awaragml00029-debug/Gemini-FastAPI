@@ -21,6 +21,7 @@ CLEAN = ["wrb.fr", None, '[1,2,{"text":"量子计算是一种新型计算方式�
 
 @pytest.fixture
 def dump_dir(tmp_path, monkeypatch):
+    """Send capture dumps to a temporary directory."""
     monkeypatch.setattr(raw_capture, "DUMP_DIR", tmp_path)
     return tmp_path
 
@@ -30,6 +31,7 @@ def _files(d):
 
 
 def test_clean_reply_writes_nothing(dump_dir) -> None:
+    """Clean reply writes nothing."""
     p = CapturingFrameParser()
     p._observe([THOUGHT])
     p._observe([CLEAN])
@@ -53,6 +55,7 @@ def test_fallback_dumps_every_frame_so_far(dump_dir) -> None:
 
 
 def test_only_one_dump_per_request(dump_dir) -> None:
+    """Only one dump per request."""
     p = CapturingFrameParser()
     for _ in range(4):
         p._observe([FALLBACK])
@@ -60,6 +63,7 @@ def test_only_one_dump_per_request(dump_dir) -> None:
 
 
 def test_dump_cap_is_honoured(dump_dir, monkeypatch) -> None:
+    """Dump cap is honoured."""
     monkeypatch.setattr(raw_capture, "MAX_DUMPS", 2)
     monkeypatch.setattr(raw_capture, "_quota_warned", set())
     for _ in range(5):
@@ -93,6 +97,7 @@ def test_capture_failure_never_breaks_the_stream(dump_dir, monkeypatch) -> None:
     ],
 )
 def test_marker_precision(text: str, hit: bool) -> None:
+    """Marker precision."""
     assert bool(raw_capture.FALLBACK_MARKERS.search(text)) is hit
 
 

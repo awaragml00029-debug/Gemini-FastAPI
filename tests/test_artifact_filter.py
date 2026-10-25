@@ -31,6 +31,7 @@ def test_artifact_url_never_leaks(size: int) -> None:
 
 @pytest.mark.parametrize("size", [1, 4, 11, 64])
 def test_multiple_artifacts_are_all_dropped(size: int) -> None:
+    """Multiple artifacts are all dropped."""
     text = f"a\n{ARTIFACT}\nb\n{LEGACY_ARTIFACT}\nc"
     assert _stream(text, size) == "a\nb\nc"
 
@@ -69,10 +70,10 @@ def test_non_streaming_path_strips_artifact() -> None:
 
 
 def test_library_pattern_is_replaced_at_source() -> None:
-    """The library strips artifacts before our code runs, so its pattern must be ours.
+    r"""The library strips artifacts before our code runs, so its pattern must be ours.
 
     gemini_webapi cleans the text inside _parse_candidate. Its own pattern ends in
-    `\\d+`, which against `.../0_452` consumes `0` and hands us an orphaned `_452`
+    `\d+`, which against `.../0_452` consumes `0` and hands us an orphaned `_452`
     with no URL left to recognise. Patching only our side cannot fix that -- verified
     in production, where the leak survived a filter that looked correct in isolation.
     """

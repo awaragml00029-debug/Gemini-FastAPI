@@ -3,7 +3,7 @@
 import asyncio
 import io
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -80,6 +80,7 @@ class GeminiClientWrapper(GeminiClient):
 
     @property
     def active_requests(self) -> int:
+        """Number of requests currently holding this client through request_scope()."""
         return self._active_requests
 
     @property
@@ -99,7 +100,8 @@ class GeminiClientWrapper(GeminiClient):
         }
 
     @asynccontextmanager
-    async def request_scope(self) -> AsyncIterator[None]:
+    async def request_scope(self) -> AsyncGenerator[None]:
+        """Hold the client for the length of a request, cancelling any pending auto-close."""
         async with self._active_requests_changed:
             self._active_requests += 1
             if self.close_task and not self.close_task.done():
@@ -114,6 +116,7 @@ class GeminiClientWrapper(GeminiClient):
                 self._active_requests_changed.notify_all()
 
     async def close(self, delay: float = 0) -> None:
+        """Close the session and cache its cookies; a delayed close waits out in-flight requests."""
         if delay:
             await asyncio.sleep(delay)
             async with self._active_requests_changed:
@@ -191,6 +194,7 @@ class GeminiClientWrapper(GeminiClient):
             logger.warning(f"Failed to save cookies to cache file: {e}")
 
     def mark_unavailable(self) -> None:
+        """Take the client out of rotation until the pool restarts it."""
         self._needs_restart = True
 
     def is_healthy(self) -> bool:
@@ -503,7 +507,8 @@ class GeminiClientWrapper(GeminiClient):
             dump_prompt(model_input, len(messages))
 
         logger.info(
-            "Processed conversation for Gemini: messages={}, input_chars={}, files={}, elapsed={:.3f}s",
+            "Processed conversation for Gemini: messages={}, input_chars={}, files={}, "
+            "elapsed={:.3f}s",
             len(messages),
             len(model_input),
             len(files),
