@@ -350,9 +350,15 @@ def test_stream_disconnect_cancels_pending_media_tasks(db, monkeypatch):
 
     async def infinite_stream():
         yield first
+        # Cumulative, like the library: `.text` is everything so far, `.text_delta` the new
+        # part. A chunk whose text does not extend what was sent reads as Google replacing
+        # the reply, and _delta_continues rightly drops it -- so a fixture yielding a bare
+        # "more" produces no frames at all and the test waits forever.
+        text = first.text
         while True:
             await asyncio.sleep(0.1)
-            yield _output("more")
+            text += "more"
+            yield _output(text, delta="more")
 
     client = cast(
         Any,
@@ -400,9 +406,15 @@ def test_responses_disconnect_cancels_pending_media_tasks(db, monkeypatch):
 
     async def infinite_stream():
         yield first
+        # Cumulative, like the library: `.text` is everything so far, `.text_delta` the new
+        # part. A chunk whose text does not extend what was sent reads as Google replacing
+        # the reply, and _delta_continues rightly drops it -- so a fixture yielding a bare
+        # "more" produces no frames at all and the test waits forever.
+        text = first.text
         while True:
             await asyncio.sleep(0.1)
-            yield _output("more")
+            text += "more"
+            yield _output(text, delta="more")
 
     client = cast(
         Any,
