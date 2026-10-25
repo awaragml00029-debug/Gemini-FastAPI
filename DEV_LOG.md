@@ -2,7 +2,7 @@
 
 ## 2026-10-26 同步上游 66dc3f7 → 86e192a（Python 3.14、gemini-webapi 42f89a7、auto_delete）
 
-分支 `migrate/upstream-20261025`，在 `main`（`583948e`）之上 4 个提交。**未推送、未合 main、未上线。**
+分支 `migrate/upstream-20261025`，在 `583948e` 之上 4 个提交 + 开启 auto_delete，**已 fast-forward 合入 `main`（`99f4d1e`）并推送；镜像已推 ghcr；上线待本人在 Portainer 操作**（见本节「镜像与发布」）。
 
 ### 上游改了什么（13 个提交，真正动代码的 3 个）
 
@@ -60,21 +60,40 @@
 | 新库 `save_cookies` 签名 | `(cookies, base_psid=None, verbose=False)` | 实测 |
 | 与真实 Google 的交互（新库重试、auto_delete 远程删除） | **未验证** | 需上线后看日志 |
 
-### 镜像
+### 开启 auto_delete（本人决定，`99f4d1e`）
 
-`ghcr.io/awaragml00029-debug/clean:20261026-001902`（`--no-cache --pull`，只打时间戳标签、不打 `latest` —— 本机有 watchtower）
-image id `sha256:d1b0c2845e4a3413fbc8600dbf771f10c00d07bce0820ed55df56535569cfc72`，213MB，label `revision=e4185c5`。**仅本地构建，未推 ghcr。**
+`config.yaml` 的 `chat_mode` 改为 `"auto_delete"`，TTL 保持默认 86400s。生产容器没有 `CONFIG_GEMINI__CHAT_MODE` 环境变量，所以镜像里的 `config.yaml` 生效。读代码确认的行为：
 
-镜像内核对：Python 3.14.9、gemini-webapi 0.0.post268（= 42f89a7）、fastapi 0.143.3、uvicorn 0.54.0；三处修复（`base_psid=`、`delete_chat` 不重启、schema `registry=`）都在。
-冒烟（`--network none`、无挂载、跑完即删）：清理任务 → 恢复任务 → ready → Uvicorn 监听，`/health` 与 `/v1/health` 均有响应（无网无 cookie，503「No usable Gemini client」符合预期），日志无 Traceback/ERROR。
+- 新会话仍是普通 Google 会话。最后一次活动 24h 后从 LMDB 删除并排队删 Google 端；清理每 6h 一轮，实际 24~30h；删除失败最多重试 5 次
+- **只有以 `auto_delete` 存下的记录才会删 Google 端**（`lmdb.py` `cleanup_with_remote`），开启前的 `normal` 记录仍只按 14 天做本地清理
+- 远程删除要求 `chat_scope is None`；我们的 `chat_scope()` 与上游一致，普通会话返回 `None`，条件成立
+- 副作用：生成的图片/媒体保留期从 14 天变成 24h，旧对话里的图片链接一天后失效
 
-回滚锚点：`clean:20260909-142425`（本机仍在）。
+### 镜像与发布
 
-### 下一步（需要本人决定）
+`ghcr.io/awaragml00029-debug/clean:20261026-064147`（`--no-cache --pull`，只打时间戳标签 —— 本机有 watchtower），`revision=99f4d1e`，**已推 ghcr**，digest `sha256:202d062b4343992b301abd6ad3be1b02498c4af9b3a6f1cd088edb509cb1803b`。
+（`20261026-001902` 是开 auto_delete 之前的构建，作废，未推。）
 
-- 推送分支 / 合入 main / 推 ghcr / 上线 —— 均未做
-- `Sync Upstream` 的 PAT 问题
-- 要不要开 `auto_delete`（默认关）
+镜像内核对：Python 3.14.9、gemini-webapi 0.0.post268（= 42f89a7）、`chat_mode=auto_delete`、TTL 86400、`url_fetch_timeout=30`，三处修复都在。冒烟（`--network none`、跑完即删）：`retention cleanup task (retention=14 day(s), auto_delete_ttl=86400s, interval=21600s)` → 恢复任务 → ready，无 Traceback/ERROR。
+
+Git：`main` fast-forward 到 `99f4d1e` 并推送，分支同步推送。HTTPS 推送被拒（gh 的 OAuth token 没有 `workflow` 权限，而上游提交改了 `.github/workflows/`），改走同账号的 SSH key 推送成功，remote 配置未改。**`main` 上 CI 转绿**（09-09 以来第一次）。
+
+**上线：未完成。** 生产是 Portainer stack（`gemini_rev`，stack 文件在 `portainer_data` 卷 `compose/6/docker-compose.yml`，环境变量全部内联、无 `${VAR}`）。改镜像行 + `docker compose up -d` 这一步被 Claude Code 的权限分类器拦下，stack 文件与容器均未改动。需要本人在 Portainer 把第 8 行镜像改成 `clean:20261026-064147` 后 Update the stack。
+
+回滚锚点：`clean:20260909-142425`。注意两点：新库会把旧的明文缓存文件名 `.cached_cookies_<PSID>.json` 迁移成哈希文件名并删掉旧文件，回滚后旧库找不到缓存，会退回用环境变量里的 cookie；新代码写入的 pending-delete 键，旧代码的清理扫描会当成坏记录打一条 warning，无害。
+
+### 生产现状（10-26 实测，与本次更新无关）
+
+容器 `unhealthy` 已约 23h（健康检查连续失败 2718 次），`/health` 503「No usable Gemini client」：
+
+- client 0（无代理）：`Account status: UNAUTHENTICATED`，**cookie 已过期**
+- client 1、2（SOCKS5 代理）：`curl: (97) User was rejected by the SOCKS5 server`，**代理认证被拒**，启动重试 3 次后退役
+
+新镜像不会修好这些，需要更新 cookie 和代理凭据。
+
+### 待办
+
+- `Sync Upstream` 的 PAT 问题（本人决定暂不处理）
 
 ---
 
