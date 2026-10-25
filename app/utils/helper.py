@@ -28,6 +28,7 @@ from jsonschema import SchemaError, ValidationError, validators
 from jsonschema.validators import validator_for
 from loguru import logger
 from pydantic import BaseModel
+from referencing import Registry
 
 from app.models import (
     AppContentItem,
@@ -471,6 +472,13 @@ class SchemaEvaluationTimeoutError(ValueError):
 SCHEMA_REGEX_BUDGET_SECONDS: float = g_config.server.schema_validation_budget_seconds
 _schema_regex_deadline: ContextVar[float | None] = ContextVar("schema_regex_deadline", default=None)
 _bounded_validator_classes: dict[type[Any], type[Any]] = {}
+# Client-supplied schemas are resolved against themselves and nothing else. Without an
+# explicit registry jsonschema falls back to fetching any remote `$ref` with a bare urlopen
+# -- no timeout, no address check -- so a response_format of
+# {"$ref": "http://169.254.169.254/..."} made this server call that address, and stall the
+# request for as long as the connect hung. An empty Registry never retrieves: local refs
+# still resolve, a remote one fails at once and leaves the reply unverified.
+_LOCAL_ONLY_SCHEMA_REGISTRY: Registry = Registry()
 
 
 def _bounded_regex_search(pattern: str, value: str) -> bool:
@@ -540,7 +548,7 @@ def _bounded_validator_for(schema: dict[str, Any]):
             },
         )
         _bounded_validator_classes[base] = bounded
-    return bounded(schema)
+    return bounded(schema, registry=_LOCAL_ONLY_SCHEMA_REGISTRY)
 
 
 def validate_json_schema(schema: dict[str, Any]) -> None:

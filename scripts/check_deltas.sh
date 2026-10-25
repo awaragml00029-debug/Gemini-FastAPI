@@ -171,6 +171,8 @@ require_symbol '_pin_options' app/utils/helper.py \
     "the SSRF check resolves a name that curl then resolves again, so it guards an address the fetch need never use"
 require_symbol 'client=live_session' app/server/chat.py \
     "video and music downloads open a second connection to Google instead of reusing the account's session"
+require_symbol 'registry=_LOCAL_ONLY_SCHEMA_REGISTRY' app/utils/helper.py \
+    "a response_format schema with a remote \$ref makes the server fetch it: SSRF, and a request that hangs on connect"
 require_symbol 'base_psid=self._base_psid' app/services/client.py \
     "close() passes verbose into save_cookies' base_psid slot and raises on every authenticated shutdown"
 
