@@ -1,3 +1,5 @@
+"""Core message, content item, and tool call models used across the application."""
+
 from __future__ import annotations
 
 import base64
@@ -9,17 +11,23 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class AppToolCallFunction(BaseModel):
+    """Function details including name and arguments for an application tool call."""
+
     name: str
     arguments: str
 
 
 class AppToolCall(BaseModel):
+    """Internal representation of a tool call emitted by a model."""
+
     id: str
     type: Literal["function"] = "function"
     function: AppToolCallFunction
 
 
 class AppContentItem(BaseModel):
+    """Single content item inside an application message (text, media, or file)."""
+
     type: str
     text: str | None = None
     url: str | None = None
@@ -62,6 +70,8 @@ type AppMessageRole = Literal["system", "user", "assistant", "tool"]
 
 
 class AppMessage(BaseModel):
+    """Internal representation of a conversation turn with role, content, and tools."""
+
     role: AppMessageRole
     name: str | None = None
     content: str | list[AppContentItem] | None = None
@@ -88,5 +98,12 @@ class ConversationInStore(BaseModel):
         description=(
             "Identity of the ephemeral window this chat lives in, or None for a normal chat kept "
             "in the account's history. Reusable only while the client still reports this scope"
+        ),
+    )
+    chat_mode: str | None = Field(
+        default=None,
+        description=(
+            "Chat mode under which this conversation was created "
+            "('normal', 'temporary', 'auto_delete')"
         ),
     )

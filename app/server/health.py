@@ -1,3 +1,5 @@
+"""Health check router for monitoring service status."""
+
 from fastapi import APIRouter, Response, status
 from loguru import logger
 
@@ -12,6 +14,7 @@ router = APIRouter()
 @router.get("/health", response_model=HealthCheckResponse)
 @router.get("/v1/health", response_model=HealthCheckResponse)
 async def health_check(response: Response):
+    """Check health status of Gemini clients and LMDB storage."""
     pool = GeminiClientPool()
     db = LMDBConversationStore()
     client_status = pool.status()

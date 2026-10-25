@@ -1,3 +1,5 @@
+"""GeminiClient pool management with round-robin selection and health tracking."""
+
 import asyncio
 import contextlib
 import random
@@ -38,6 +40,7 @@ class GeminiClientPool(metaclass=Singleton):
     """Pool of GeminiClient instances identified by unique ids."""
 
     def __init__(self) -> None:
+        """Initialize client pool from global configuration."""
         self._clients: list[GeminiClientWrapper] = []
         self._id_map: dict[str, GeminiClientWrapper] = {}
         self._round_robin: deque[GeminiClientWrapper] = deque()
@@ -340,3 +343,39 @@ class GeminiClientPool(metaclass=Singleton):
     def status(self) -> dict[str, bool]:
         """Return healthy status for each client."""
         return {client.id: client.is_healthy() for client in self._clients}
+
+    async def delete_chat(self, client_id: str, cid: str) -> bool:
+        """Delete a remote chat from Google for a given client."""
+        client = self._id_map.get(client_id)
+        if not client:
+            logger.warning(
+                f"Cannot delete chat {cid}: client {client_id} not found in pool. "
+                "Dropping pending deletion."
+            )
+            return True
+        if client.is_guest():
+            logger.warning(
+                f"Cannot delete remote chat {cid}: client {client_id} "
+                "is currently unauthenticated (guest session)"
+            )
+            return False
+        # No restart here: reviving a client is the recovery task's job alone, behind its
+        # lock, busy check and retirement (see recover_unavailable_clients). A client that is
+        # not ready just costs this deletion one attempt, and the next cleanup pass retries.
+        if client_id in self._retired or not self._client_ready(client):
+            logger.warning(
+                f"Cannot delete chat {cid}: client {client_id} is not currently available"
+            )
+            return False
+        try:
+            # Held like a request, so a background restart or auto-close cannot tear the
+            # session down mid-delete.
+            async with client.request_scope():
+                await client.delete_chat(cid)
+            if client.latest_chat_cid == cid:
+                client.latest_chat_cid = None
+            logger.info(f"Deleted remote chat {cid} on Google for client {client_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to delete remote chat {cid} for client {client_id}: {e}")
+            return False

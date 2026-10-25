@@ -171,6 +171,17 @@ require_symbol '_pin_options' app/utils/helper.py \
     "the SSRF check resolves a name that curl then resolves again, so it guards an address the fetch need never use"
 require_symbol 'client=live_session' app/server/chat.py \
     "video and music downloads open a second connection to Google instead of reusing the account's session"
+require_symbol 'base_psid=self._base_psid' app/services/client.py \
+    "close() passes verbose into save_cookies' base_psid slot and raises on every authenticated shutdown"
+
+# Upstream's auto_delete revives a stopped client inline through this helper. This
+# fork's pool has no such method -- reviving is the recovery task's job alone -- so a
+# sync that brings the call back merges cleanly and then fails every remote deletion.
+if grep -q '_ensure_client_ready' app/services/pool.py; then
+    fail "pool.py calls _ensure_client_ready -- delete_chat restarts clients inline (or raises AttributeError)"
+else
+    pass "pool.py does not restart clients inline for remote deletion"
+fi
 
 echo
 

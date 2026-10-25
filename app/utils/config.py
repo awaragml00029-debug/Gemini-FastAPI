@@ -1,3 +1,5 @@
+"""Configuration loading and validation via environment variables and YAML."""
+
 import os
 import sys
 from enum import StrEnum
@@ -16,7 +18,7 @@ CONFIG_PATH = "config/config.yaml"
 
 
 class HTTPSConfig(BaseModel):
-    """HTTPS configuration"""
+    """HTTPS configuration."""
 
     enabled: bool = Field(default=False, description="Enable HTTPS")
     key_file: str = Field(default="certs/privkey.pem", description="SSL private key file path")
@@ -24,7 +26,7 @@ class HTTPSConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """Server configuration"""
+    """Server configuration."""
 
     host: str = Field(default="0.0.0.0", description="Server host address")
     port: int = Field(default=8000, ge=1, le=65535, description="Server port number")
@@ -92,6 +94,7 @@ class ChatMode(StrEnum):
 
     NORMAL = "normal"
     TEMPORARY = "temporary"
+    AUTO_DELETE = "auto_delete"
 
 
 class GuestMode(StrEnum):
@@ -173,10 +176,25 @@ class GeminiConfig(BaseModel):
     chat_mode: ChatMode = Field(
         default=ChatMode.NORMAL,
         description=(
-            "Chat mode: 'normal' uses standard chats; 'temporary' sends with Google's temporary "
-            "mode (not saved to the account) and applies a tighter effective input limit. "
-            "Warning: Google may close a temporary window at any time mid-conversation, and the "
-            "reply can then come back without the earlier context instead of erroring"
+            "Chat mode: 'normal' uses standard chats (saved to account history); "
+            "'temporary' sends with Google's temporary mode "
+            "(not saved to account, tighter input limit); "
+            "'auto_delete' uses standard chats for full reliability and context, "
+            "then automatically deletes them from both Google and local storage once expired. "
+            "Warning for 'temporary': Google may close a temporary window at any time "
+            "mid-conversation, and the reply can then come back without the earlier context "
+            "instead of erroring"
+        ),
+    )
+    auto_delete_ttl: int = Field(
+        default=86400,
+        ge=60,
+        description=(
+            "Inactivity TTL in seconds applicable ONLY to conversations created with "
+            "chat_mode='auto_delete'. When expired, the conversation is deleted from "
+            "both Google account history and local LMDB. Does not affect 'normal' conversations "
+            "(which are retained locally according to storage.retention_days and never "
+            "deleted from Google; default: 86400s / 24h)"
         ),
     )
     guest_mode: GuestMode = Field(
@@ -189,7 +207,10 @@ class GeminiConfig(BaseModel):
     )
     allow_private_url_fetch: bool = Field(
         default=False,
-        description="Allow server-side fetching of private/loopback image URLs (SSRF risk; default blocks them)",
+        description=(
+            "Allow server-side fetching of private/loopback image URLs "
+            "(SSRF risk; default blocks them)"
+        ),
     )
     url_fetch_timeout: int = Field(
         # 30 rather than upstream's 15: this is the value this fork has been
@@ -230,7 +251,7 @@ class GeminiConfig(BaseModel):
 
 
 class CORSConfig(BaseModel):
-    """CORS configuration"""
+    """CORS configuration."""
 
     enabled: bool = Field(default=True, description="Enable CORS support")
     allow_origins: list[str] = Field(
@@ -246,7 +267,7 @@ class CORSConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    """LMDB Storage configuration"""
+    """LMDB Storage configuration."""
 
     path: str = Field(
         default="data/lmdb",
@@ -264,12 +285,17 @@ class StorageConfig(BaseModel):
     retention_days: int = Field(
         default=14,
         ge=0,
-        description="Number of days to retain conversations before automatic cleanup (0 disables cleanup)",
+        description=(
+            "Number of days to retain standard conversations in local LMDB before cleanup "
+            "(0 disables cleanup). Only purges local database and media storage; does not delete "
+            "conversations from Google accounts "
+            "(for remote Google deletion, see gemini.auto_delete_ttl)"
+        ),
     )
 
 
 class LoggingConfig(BaseModel):
-    """Logging configuration"""
+    """Logging configuration."""
 
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="DEBUG",
@@ -278,7 +304,7 @@ class LoggingConfig(BaseModel):
 
 
 class Config(BaseSettings):
-    """Application configuration"""
+    """Application configuration."""
 
     # Server configuration
     server: ServerConfig = Field(
@@ -322,7 +348,7 @@ class Config(BaseSettings):
         dotenv_settings,
         file_secret_settings,
     ):
-        """Read settings: env -> yaml -> default"""
+        """Read settings: env -> yaml -> default."""
         return (
             env_settings,
             YamlConfigSettingsSource(settings_cls),
@@ -330,7 +356,7 @@ class Config(BaseSettings):
 
 
 def extract_gemini_clients_env() -> dict[int, dict[str, Any]]:
-    """Extract and remove all Gemini clients related environment variables, return a mapping from index to field dict."""
+    """Extract and remove all Gemini clients related environment variables."""
     prefix = "CONFIG_GEMINI__CLIENTS__"
     env_overrides: dict[int, dict[str, Any]] = {}
     to_delete = []
@@ -372,18 +398,19 @@ def _merge_clients_with_env(
             result_clients.append(new_client)
         else:
             raise IndexError(
-                f"Client index {idx} in env is out of range (current count: {len(result_clients)}). "
+                f"Client index {idx} in env is out of range "
+                f"(current count: {len(result_clients)}). "
                 "Client indices must be contiguous starting from 0."
             )
     return result_clients or base_clients or []
 
 
 def initialize_config() -> Config:
-    """
-    Initialize configuration from environment variables and the YAML settings source.
+    """Initialize configuration from environment variables and the YAML settings source.
 
     Returns:
         Config: Configuration object with Gemini client overrides merged
+
     """
     try:
         env_clients_overrides = extract_gemini_clients_env()

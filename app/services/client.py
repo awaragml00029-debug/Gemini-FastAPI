@@ -1,3 +1,5 @@
+"""GeminiClient wrapper providing connection management and message formatting."""
+
 import asyncio
 import io
 import time
@@ -8,9 +10,9 @@ from typing import Any
 
 import orjson
 from gemini_webapi import GeminiClient
-from gemini_webapi.constants import AccountStatus
+from gemini_webapi.constants import COOKIE_1PSID, AccountStatus
 from gemini_webapi.types import AvailableModel
-from gemini_webapi.utils.rotate_1psidts import save_cookies
+from gemini_webapi.utils.rotate_1psidts import extract_cookie_value, save_cookies
 from loguru import logger
 
 from app.models import AppMessage
@@ -33,6 +35,7 @@ class GeminiClientWrapper(GeminiClient):
     """Gemini client with helper methods."""
 
     def __init__(self, client_id: str, **kwargs):
+        """Initialize client wrapper with client ID and custom configuration options."""
         self._cfg_impersonate: str | None = kwargs.pop("impersonate", None)
         super().__init__(**kwargs)
         self.id = client_id
@@ -47,9 +50,7 @@ class GeminiClientWrapper(GeminiClient):
         self.latest_chat_cid: str | None = None
 
     async def init(self, *args: Any, **kwargs: Any) -> None:
-        """
-        Inject default configuration values from global settings.
-        """
+        """Inject default configuration values from global settings."""
         config = g_config.gemini
         init_kwargs: dict[str, Any] = {
             "timeout": config.timeout,
@@ -74,6 +75,7 @@ class GeminiClientWrapper(GeminiClient):
             raise
 
     def running(self) -> bool:
+        """Return whether the underlying client is currently running."""
         return self._running
 
     @property
@@ -173,8 +175,18 @@ class GeminiClientWrapper(GeminiClient):
             )
             return
 
+        current_psid = extract_cookie_value(self._cookies, COOKIE_1PSID)
+        if not self._base_psid and not current_psid:
+            logger.debug(f"Skipping cookie cache write for {self.id}: __Secure-1PSID not found.")
+            return
+
+        # Keyword-only on purpose: the library inserted `base_psid` as the second parameter,
+        # so passing verbose positionally would hand a bool to the cache-path hasher. The
+        # cache file is pinned to the base PSID so a rotated PSID cannot fork the entry.
         try:
-            await asyncio.to_thread(save_cookies, self._cookies, self.verbose)
+            await asyncio.to_thread(
+                save_cookies, self._cookies, base_psid=self._base_psid, verbose=self.verbose
+            )
         except OSError as e:
             logger.warning(f"Failed to save cookies to cache file: {e}")
 
@@ -182,8 +194,7 @@ class GeminiClientWrapper(GeminiClient):
         self._needs_restart = True
 
     def is_healthy(self) -> bool:
-        """
-        Check if the client is healthy.
+        """Check if the client is healthy.
 
         A client is healthy if it is active (running or initialized with auto-close)
         and the account status is available.
@@ -252,8 +263,8 @@ class GeminiClientWrapper(GeminiClient):
         fetch_proxy: str | None = None,
         fetch_impersonate: str | None = None,
     ) -> tuple[str | None, Path | str | None]:
-        """
-        Process a single content item (text, image_url, file, input_audio).
+        """Process a single content item (text, image_url, file, input_audio).
+
         Returns a tuple of (text_fragment, file_path).
         """
         if item.type == "text":
@@ -329,9 +340,7 @@ class GeminiClientWrapper(GeminiClient):
         fetch_proxy: str | None = None,
         fetch_impersonate: str | None = None,
     ) -> tuple[list[str], list[Path | str]]:
-        """
-        Extract text fragments and files from message content.
-        """
+        """Extract text fragments and files from message content."""
         files: list[Path | str] = []
         text_fragments: list[str] = []
 
@@ -362,9 +371,7 @@ class GeminiClientWrapper(GeminiClient):
     def _format_tool_results(
         text_fragments: list[str], tool_name: str | None, wrap_tool: bool
     ) -> list[str]:
-        """
-        Format tool results into the PascalCase technical protocol blocks.
-        """
+        """Format tool results into the PascalCase technical protocol blocks."""
         tool_name = tool_name or "unknown"
         combined_content = "\n".join(text_fragments).strip()
         res_block = (
@@ -374,9 +381,7 @@ class GeminiClientWrapper(GeminiClient):
 
     @staticmethod
     def _format_tool_calls(message: AppMessage) -> str | None:
-        """
-        Format tool calls into the PascalCase technical protocol blocks.
-        """
+        """Format tool calls into the PascalCase technical protocol blocks."""
         if not message.tool_calls:
             return None
 
@@ -412,8 +417,8 @@ class GeminiClientWrapper(GeminiClient):
         fetch_proxy: str | None = None,
         fetch_impersonate: str | None = None,
     ) -> tuple[str, list[Path | str]]:
-        """
-        Process a Message into Gemini API format using the PascalCase technical protocol.
+        """Process a Message into Gemini API format using the PascalCase technical protocol.
+
         Extracts text, handles files, and appends ToolCalls/ToolResults blocks.
         """
         text_fragments, files = await GeminiClientWrapper._extract_content_and_files(
@@ -447,6 +452,7 @@ class GeminiClientWrapper(GeminiClient):
         fetch_proxy: str | None = None,
         fetch_impersonate: str | None = None,
     ) -> tuple[str, list[str | Path | bytes | io.BytesIO]]:
+        """Convert a list of AppMessages into formatted text and files for Gemini."""
         started = time.perf_counter()
         # A single user turn needs no role framing at all. Sending the text as-is is what a
         # browser session looks like, and it removes the last thing that could read as forged
